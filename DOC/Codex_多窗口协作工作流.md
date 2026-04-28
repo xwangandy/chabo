@@ -304,15 +304,31 @@ git branch -d task/CHB-YYYYMMDD-NN-short-name
 
 这样用户知道哪些任务在跑、哪些已经验收、哪些还没合并。
 
-## 12. 当前建议的第一步
+## 12. 当前建议的第一批任务
 
-先建立 git 基线，然后再开始 worktree 协作。
+git 基线和 GitHub 远程仓库已经建立。当前主工作区是 `/Users/lanjinglive618/ChaBo`，主分支是 `main`，远程仓库是 `https://github.com/xwangandy/chabo`。
+
+下一批任务围绕施工图里的“频道招商金线”推进，先把最短成交路径做顺，再扩展后台和部署。
 
 推荐顺序：
 
-1. 主窗口确认当前项目测试通过。
-2. 用户确认可以初始化 git。
-3. 主窗口或用户运行基线命令。
-4. 主窗口拆出第一个独立任务。
-5. 用户复制任务包到执行窗口。
-6. 执行窗口完成后，主窗口验收合并。
+1. `CHB-001`：频道招商 deep link 首屏。
+   - 目标：用户从频道里的“频道招商”按钮进入 Bot 后，第一屏直接展示“投广告到 <频道名>”、价格、广告库、广告钱包和下单入口。
+   - 主要文件：`src/chabo/bot.py`、`tests/test_chabo_mvp.py`。
+   - 不改履约发布格式，避免和下一任务冲突。
+2. `CHB-002`：标准插播三按钮履约。
+   - 目标：真实发到频道的标准插播包含“频道招商 / 查看详情 / 广告主 CTA”三按钮结构。
+   - 主要文件：`src/chabo/fulfillment.py`、`src/chabo/telegram.py`、`tests/test_chabo_mvp.py`。
+   - 需要兼容现有 FakeGateway 和真实 Telegram inline keyboard。
+3. `CHB-003`：广告库 MVP。
+   - 目标：广告主能在 Bot 内创建、查看、复用轻插播/标准插播/强插播素材。
+   - 主要文件：`src/chabo/db.py`、`src/chabo/services.py`、`src/chabo/bot.py`、`tests/test_chabo_mvp.py`。
+   - 做完后再把下单表单改为“选择广告库素材或新建素材”。
+4. `CHB-004`：频道主自用发布工具。
+   - 目标：频道主可以用插播给自己的频道发布内容/广告，并默认带平台增长入口。
+   - 依赖 `CHB-002` 的三按钮能力。
+5. `CHB-005`：广告钱包增强。
+   - 目标：展示余额、冻结预算、每频道预算、充值入口和低余额引导。
+   - 后续再接真实 Stars/人工入账完整流程。
+
+每个执行窗口只拿一个 `CHB-*` 任务，使用独立 worktree；主窗口验收通过后再合并。

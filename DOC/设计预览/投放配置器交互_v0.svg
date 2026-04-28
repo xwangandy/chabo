@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1680" viewBox="0 0 1280 1680">
+  <defs>
+    <style>
+      .bg { fill: #0e1117; }
+      .shell { fill: #171b22; stroke: #2a313d; stroke-width: 2; }
+      .top { fill: #1b2028; }
+      .bubble { fill: #232832; }
+      .panel { fill: #1d232c; }
+      .panel2 { fill: #151a21; }
+      .btn { fill: #2a313b; stroke: #394453; stroke-width: 1.5; }
+      .btnOn { fill: #214b38; stroke: #4bd681; stroke-width: 2; }
+      .btnBlue { fill: #20446f; stroke: #57a0ff; stroke-width: 2; }
+      .btnWarn { fill: #3d3324; stroke: #f0b752; stroke-width: 2; }
+      .primary { fill: #3f8cff; }
+      .line { stroke: #343c49; stroke-width: 2; }
+      .text { fill: #f2f5f8; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; }
+      .muted { fill: #99a3b1; }
+      .green { fill: #77f2a0; }
+      .yellow { fill: #ffd166; }
+      .small { font-size: 24px; }
+      .body { font-size: 31px; }
+      .title { font-size: 39px; font-weight: 700; }
+      .big { font-size: 52px; font-weight: 800; }
+      .mono { font-family: "SFMono-Regular", Menlo, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1280" height="1680"/>
+  <rect class="shell" x="145" y="45" width="990" height="1590" rx="46"/>
+
+  <rect class="top" x="145" y="45" width="990" height="116" rx="46"/>
+  <circle cx="225" cy="103" r="40" fill="#63b7ff"/>
+  <text class="text title" x="211" y="116">插</text>
+  <text class="text title" x="290" y="96">插播广告</text>
+  <text class="text muted small" x="290" y="132">bot · 投放配置器交互 v0</text>
+
+  <rect class="bubble" x="190" y="205" width="900" height="1230" rx="28"/>
+  <text class="text title" x="235" y="266">频道招商</text>
+  <text class="text muted small" x="235" y="306">你正在给这个频道投放插播广告</text>
+  <text class="text body" x="235" y="356">目标频道：广告投放测试1</text>
+
+  <rect class="panel2" x="235" y="392" width="810" height="278" rx="24"/>
+  <text class="text title" x="270" y="446">当前配置</text>
+  <text class="text body" x="270" y="500">展示：文字 + 标准（置顶）</text>
+  <text class="text body" x="270" y="548">发布：24h/次，持续 7 天</text>
+  <text class="text body" x="270" y="596">时间：每天 16:00</text>
+  <text class="text body" x="270" y="644">素材：未选择</text>
+  <text class="text big green" x="725" y="462">USD 75.60</text>
+  <text class="text muted small" x="725" y="500">预计冻结金额</text>
+  <text class="text small" x="725" y="596">4/28 16:00 - 5/5 16:00</text>
+  <text class="text yellow small" x="725" y="642">下一步：选择广告素材</text>
+
+  <line class="line" x1="235" y1="705" x2="1045" y2="705"/>
+
+  <text class="text title" x="235" y="760">上层导航</text>
+  <rect class="btnOn" x="235" y="790" width="190" height="76" rx="18"/>
+  <text class="text body" x="272" y="838">展示设置</text>
+  <rect class="btnBlue" x="445" y="790" width="190" height="76" rx="18"/>
+  <text class="text body" x="482" y="838">发布设置</text>
+  <rect class="btn" x="655" y="790" width="190" height="76" rx="18"/>
+  <text class="text body" x="692" y="838">广告素材</text>
+  <rect class="btn" x="855" y="790" width="190" height="76" rx="18"/>
+  <text class="text body" x="892" y="838">费用确认</text>
+
+  <text class="text title" x="235" y="930">发布设置面板</text>
+  <text class="text muted small" x="235" y="966">切换导航后，下方按钮整体变成对应参数</text>
+
+  <rect class="btn" x="235" y="995" width="190" height="84" rx="18"/>
+  <text class="text body" x="282" y="1042">发布一次</text>
+  <text class="text muted small" x="287" y="1072">原价</text>
+  <rect class="btnOn" x="445" y="995" width="190" height="84" rx="18"/>
+  <text class="text body" x="503" y="1042">一周</text>
+  <text class="text green small" x="506" y="1072">9 折</text>
+  <rect class="btn" x="655" y="995" width="190" height="84" rx="18"/>
+  <text class="text body" x="704" y="1042">一个月</text>
+  <text class="text muted small" x="710" y="1072">8 折</text>
+  <rect class="btnWarn" x="855" y="995" width="190" height="84" rx="18"/>
+  <text class="text body" x="894" y="1042">连续包月</text>
+  <text class="text yellow small" x="919" y="1072">7 折</text>
+
+  <rect class="btnBlue" x="235" y="1110" width="250" height="84" rx="18"/>
+  <text class="text body" x="280" y="1162">发布时间 16:00</text>
+  <rect class="btn" x="515" y="1110" width="250" height="84" rx="18"/>
+  <text class="text body" x="557" y="1162">开始 4/28 16:00</text>
+  <rect class="btn" x="795" y="1110" width="250" height="84" rx="18"/>
+  <text class="text body" x="842" y="1162">结束 5/5 16:00</text>
+
+  <rect class="panel" x="235" y="1235" width="810" height="150" rx="22"/>
+  <text class="text title" x="270" y="1288">输入态示例：开始日期</text>
+  <text class="text small muted" x="270" y="1326">写下开始投放的日期。示例：</text>
+  <text class="text small mono" x="270" y="1364">2026-04-28 16:00 / 明天 14:00 / 在 10 天后 / 每天 12:00</text>
+
+  <rect class="primary" x="235" y="1460" width="810" height="88" rx="22"/>
+  <text class="text title" x="482" y="1516">继续：选择广告素材</text>
+
+  <text class="text muted small" x="190" y="1585">原则：按钮只修改参数；状态区实时刷新；余额不足时才进入充值</text>
+</svg>

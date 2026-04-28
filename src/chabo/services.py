@@ -163,6 +163,58 @@ class LedgerService:
             ),
         )
 
+    def list_transactions(
+        self,
+        *,
+        telegram_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, type, amount_cents, currency, memo, created_at, order_id, delivery_id
+                FROM ledger_transactions
+                WHERE account_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (account["id"], int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_reserved_orders(
+        self,
+        *,
+        telegram_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT o.id AS order_id, o.status, o.reserved_cents, o.budget_cents, o.spent_cents,
+                       o.currency, c.title AS channel_title
+                FROM ad_orders o
+                LEFT JOIN channels c ON c.id = o.channel_id
+                WHERE o.advertiser_account_id = ? AND o.reserved_cents > 0
+                ORDER BY o.created_at DESC
+                LIMIT ?
+                """,
+                (account["id"], int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def manual_topup(
         self,
         telegram_user_id: str | int,

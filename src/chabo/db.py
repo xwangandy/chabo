@@ -273,12 +273,16 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE TABLE IF NOT EXISTS creatives (
     id TEXT PRIMARY KEY,
     campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    advertiser_account_id TEXT REFERENCES accounts(id),
+    format_type TEXT NOT NULL DEFAULT 'standard_card',
     text TEXT NOT NULL,
     target_url TEXT NOT NULL,
     button_text TEXT NOT NULL DEFAULT '查看详情',
     category TEXT NOT NULL DEFAULT 'general',
+    light_short_text TEXT,
     status TEXT NOT NULL DEFAULT 'pending_review',
     content_hash TEXT NOT NULL,
+    archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -480,6 +484,10 @@ class Database:
             "ALTER TABLE deliveries ADD COLUMN platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE accounts ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
             "ALTER TABLE accounts ADD COLUMN timezone_confirmed_at TEXT",
+            "ALTER TABLE creatives ADD COLUMN advertiser_account_id TEXT REFERENCES accounts(id)",
+            "ALTER TABLE creatives ADD COLUMN format_type TEXT NOT NULL DEFAULT 'standard_card'",
+            "ALTER TABLE creatives ADD COLUMN light_short_text TEXT",
+            "ALTER TABLE creatives ADD COLUMN archived_at TEXT",
         ]
         for statement in statements:
             try:
@@ -487,6 +495,41 @@ class Database:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        self._backfill_creative_library(conn)
+
+    def _backfill_creative_library(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE creatives
+            SET advertiser_account_id = (
+                SELECT advertiser_account_id FROM campaigns
+                WHERE campaigns.id = creatives.campaign_id
+            )
+            WHERE advertiser_account_id IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE creatives
+            SET format_type = COALESCE((
+                SELECT ad_slots.slot_type FROM ad_orders
+                JOIN ad_slots ON ad_slots.id = ad_orders.slot_id
+                WHERE ad_orders.creative_id = creatives.id
+                ORDER BY ad_orders.created_at ASC
+                LIMIT 1
+            ), 'standard_card')
+            WHERE format_type = 'standard_card'
+              AND EXISTS (
+                SELECT 1 FROM ad_orders WHERE ad_orders.creative_id = creatives.id
+              )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creatives_advertiser ON creatives(advertiser_account_id, archived_at, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creatives_format ON creatives(advertiser_account_id, format_type, archived_at)"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

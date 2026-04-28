@@ -2228,6 +2228,130 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
 
+    def test_publisher_self_promo_panel_lists_publishable_materials(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # publisher (20001) creates a standard_card material via the merged advertiser identity
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用频道运营内容",
+            target_url="https://owner.example/post",
+            button_text="去看看",
+            display_name="频道主",
+        )
+        # light_tail materials are filtered out
+        self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="light_tail",
+            text="文字插播详情",
+            target_url="https://owner.example/light",
+            light_short_text="去看看",
+        )
+
+        result = self._publisher_callback(f"pub:self:{channel['ref_token']}", cb_id="cb_self_open")
+        self.assertEqual(result["type"], "callback_publisher_self_promo")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("自用发布", message["text"])
+        button_callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn(f"pub:self:pick:{channel['ref_token']}:{material['id']}", button_callbacks)
+        # light_tail material should not appear
+        self.assertNotIn(
+            any(material["id"] in (b.get("callback_data") or "") for row in message["inline_keyboard"] for b in row if "light" in (b.get("text") or "")),
+            [True],
+        )
+
+    def test_publisher_self_promo_publishes_and_records_row(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用标准插播文案",
+            target_url="https://owner.example/landing",
+            button_text="立即购买",
+        )
+
+        result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+            cb_id="cb_self_publish",
+        )
+        self.assertEqual(result["type"], "callback_self_promo_published")
+
+        sent = self.gateway.sent_ads[-1]
+        self.assertEqual(sent["chat_id"], str(channel["telegram_chat_id"]))
+        self.assertEqual(sent["text"], "自用标准插播文案")
+        keyboard = sent["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", keyboard[0][0]["url"])
+        self.assertIn(f"sp_{result['self_promo_id']}", keyboard[0][1]["url"])
+        self.assertEqual(keyboard[1], [{"text": "立即购买", "url": "https://owner.example/landing"}])
+
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?",
+                (result["self_promo_id"],),
+            ).fetchone()
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual(row["channel_id"], channel["id"])
+        self.assertEqual(row["creative_id"], material["id"])
+        self.assertEqual(row["message_id"], sent["message_id"])
+
+    def test_self_promo_deep_link_renders_detail_page(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用文案",
+            target_url="https://owner.example/landing",
+            button_text="立即查看",
+        )
+        publish = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+            cb_id="cb_self_publish_for_detail",
+        )
+
+        self.confirm_timezone(444, display_name="点击用户")
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 88,
+                    "from": {"id": 444, "first_name": "点击用户"},
+                    "chat": {"id": 444},
+                    "text": f"/start sp_{publish['self_promo_id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "self_promo_start")
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        self.assertIn(channel["title"], detail["text"])
+        flat = [b for row in detail["inline_keyboard"] for b in row]
+        self.assertTrue(any("立即查看" == b.get("text") and b.get("url") == "https://owner.example/landing" for b in flat))
+        self.assertTrue(any(b.get("callback_data") == f"channel:order:{channel['id']}" for b in flat))
+
+    def test_publisher_self_promo_rejects_foreign_channel(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Material owned by a different user
+        foreign_material = self.app.materials.create_material(
+            advertiser_telegram_user_id=99999,
+            format_type="standard_card",
+            text="外部素材",
+            target_url="https://other.example",
+        )
+        result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{foreign_material['id']}",
+            cb_id="cb_self_foreign",
+        )
+        self.assertEqual(result["type"], "callback_self_promo_failed")
+        self.assertEqual(self.gateway.sent_ads, [])
+
     def test_publisher_channel_dashboard_renders_status_card_and_grid(self) -> None:
         channel = self.bind_channel()
         self.confirm_timezone(20001, role="publisher", display_name="频道主")

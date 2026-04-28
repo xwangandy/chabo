@@ -9,7 +9,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, StarsPaymentService
+from .services import AccountService, ChaboError, ChannelService, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 
 
@@ -97,6 +97,7 @@ class UpdateHandler:
         self.light_probes = LightProbeService(db, settings)
         self.materials = MaterialService(db, settings)
         self.orders = OrderService(db, settings)
+        self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +197,28 @@ class UpdateHandler:
                     else:
                         self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
                     return {"handled": True, "type": "ad_start", "delivery_id": delivery_id}
+            if payload.startswith("sp_"):
+                self_promo_id = payload.removeprefix("sp_")
+                row = conn.execute(
+                    "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+                ).fetchone()
+                if row:
+                    creative = conn.execute(
+                        "SELECT * FROM creatives WHERE id = ?", (row["creative_id"],)
+                    ).fetchone()
+                    source_channel = conn.execute(
+                        "SELECT * FROM channels WHERE id = ?", (row["channel_id"],)
+                    ).fetchone()
+                    if creative and source_channel:
+                        text, keyboard = self._build_ad_detail_view(creative, source_channel)
+                        self.gateway.send_private_message(
+                            chat_id=chat.get("id", user_id),
+                            text=text,
+                            inline_keyboard=keyboard,
+                        )
+                    else:
+                        self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
+                    return {"handled": True, "type": "self_promo_start", "self_promo_id": self_promo_id}
             if payload.startswith("probe_"):
                 probe_id = payload.removeprefix("probe_")
                 probe = conn.execute("SELECT * FROM light_probes WHERE id = ?", (probe_id,)).fetchone()
@@ -367,6 +390,10 @@ class UpdateHandler:
             channel_identifier = data.removeprefix("pub:limit:")
             self._send_publisher_limit_panel(chat_id, user, channel_identifier, message)
             return {"handled": True, "type": "callback_publisher_limit_panel", "channel": channel_identifier}
+        if data.startswith("pub:self:pick:"):
+            rest = data.removeprefix("pub:self:pick:")
+            channel_identifier, material_id = rest.rsplit(":", 1)
+            return self._publish_self_promo(chat_id, user, channel_identifier, material_id, message)
         if data.startswith("pub:self:"):
             channel_identifier = data.removeprefix("pub:self:")
             self._send_publisher_self_promo_panel(chat_id, user, channel_identifier, message)
@@ -2252,17 +2279,120 @@ class UpdateHandler:
         channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
         if not channel:
             return
+        user_id = user.get("id") or chat_id
+        materials = self.self_promos.list_publishable_materials(
+            publisher_telegram_user_id=user_id
+        )
+        lines = [
+            f"🪧 自用发布\n\n频道：{channel['title']}",
+            "",
+            "给自己的频道发布运营内容或广告。",
+            "自用发布不扣广告费，但会保留插播增长入口。",
+        ]
+        keyboard: list[list[dict[str, str]]] = []
+        if materials:
+            lines.append("")
+            lines.append("选择一条素材发布：")
+            for material in materials:
+                preview = self._short_title((material["text"] or "").replace("\n", " "), 18)
+                label = f"{self._slot_name(material['format_type'])}｜{preview}"
+                keyboard.append(
+                    [
+                        {
+                            "text": f"📤 {label}",
+                            "callback_data": f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+                        }
+                    ]
+                )
+        else:
+            lines.append("")
+            lines.append("还没有可用的标准/定制插播素材。")
+            lines.append("先去【🎯 频道招商】或 CLI 创建一条素材，再回到这里发布。")
+        keyboard.append([{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _publish_self_promo(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        material_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return {"handled": True, "type": "callback_self_promo_unauthorized"}
+        user_id = user.get("id") or chat_id
+        try:
+            prepared = self.self_promos.prepare_publish(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                material_id=material_id,
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 自用发布失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}]],
+            )
+            return {"handled": True, "type": "callback_self_promo_failed", "error": str(exc)}
+
+        material = prepared["material"]
+        self_promo_id = prepared["self_promo_id"]
+        sales_url = f"https://t.me/{self.settings.bot_username}?start=ch_{channel['ref_token']}"
+        track_url = f"https://t.me/{self.settings.bot_username}?start=sp_{self_promo_id}"
+        cta_text = (material["button_text"] or "").strip() or "查看详情"
+        keyboard = [
+            [
+                {"text": "📣 频道招商", "url": sales_url},
+                {"text": "🔍 查看详情", "url": track_url},
+            ],
+            [{"text": cta_text, "url": material["target_url"]}],
+        ]
+        from .telegram import TelegramError as _TelegramError  # local import to avoid top-level cycle
+        try:
+            message_id = self.gateway.send_ad(
+                chat_id=channel["telegram_chat_id"],
+                text=material["text"],
+                inline_keyboard=keyboard,
+            )
+        except _TelegramError as exc:
+            self.self_promos.mark_failed(self_promo_id, error=str(exc))
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 自用发布失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}]],
+            )
+            return {"handled": True, "type": "callback_self_promo_failed", "error": str(exc)}
+
+        self.self_promos.mark_sent(self_promo_id, message_id=message_id)
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                f"🪧 自用发布\n\n频道：{channel['title']}\n\n"
-                "用插播给自己的频道发运营内容或自用广告。\n"
-                "自用发布不扣广告费，但会保留插播增长入口。\n\n"
-                "（即将上线，先在 Bot 投放配置器里走标准插播流程。）"
+                f"✅ 自用发布成功\n\n频道：{channel['title']}\n"
+                f"素材：{self._short_title((material['text'] or '').replace(chr(10), ' '), 24)}\n"
+                f"消息：{message_id}\n\n"
+                "已附带频道招商 + 查看详情 + 广告主 CTA 三按钮。"
             ),
-            inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+            inline_keyboard=[
+                [{"text": "🔁 再发一条", "callback_data": f"pub:self:{channel['ref_token']}"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
         )
+        return {
+            "handled": True,
+            "type": "callback_self_promo_published",
+            "self_promo_id": self_promo_id,
+            "message_id": message_id,
+        }
 
     def _send_publisher_channel_stats(
         self,

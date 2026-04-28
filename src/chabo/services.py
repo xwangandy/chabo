@@ -1712,6 +1712,46 @@ class OrderService:
             self._snapshot(conn, order_id, None, "channel", channel)
             return self.get_order(conn, order_id)
 
+    def approve_order_for_operator(
+        self,
+        *,
+        order_id: str,
+        operator_telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        return self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id))
+
+    def reject_order_for_operator(
+        self,
+        *,
+        order_id: str,
+        reason: str,
+        operator_telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        return self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id))
+
+    def refund_delivery_for_operator(
+        self,
+        *,
+        delivery_id: str,
+        reason: str,
+        operator_telegram_user_id: str | int,
+        amount_cents: int | None = None,
+    ) -> dict[str, Any]:
+        actor = self._operator_account_id(operator_telegram_user_id)
+        if amount_cents is None:
+            return self.refund_delivery(delivery_id, reason, actor)
+        return self.refund_delivery_partial(delivery_id, amount_cents, reason, actor)
+
+    def _operator_account_id(self, telegram_user_id: str | int) -> str:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"操作员账号不存在：{telegram_user_id}")
+            return row["id"]
+
     def approve_order(self, order_id: str, actor_account_id: str | None = None) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
@@ -2650,6 +2690,114 @@ class AdvertiserSubscriptionService:
             """,
             (advertiser_account_id, iso()),
         )
+
+
+class ToolCallLogService:
+    """Audit log for AI tool calls and operator actions.
+
+    Designed as a single sink that any AI-callable service method or
+    Bot/Admin action can write to. Records who initiated the call (by
+    telegram_user_id when available), what tool was invoked, the
+    arguments summary, and the result status / error type. The log is
+    append-only; callers are expected to redact sensitive fields from
+    `arguments` before passing them in.
+    """
+
+    ACTOR_KINDS = ("human", "ai", "admin", "system")
+    RESULT_STATUSES = ("success", "error")
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+
+    def log_call(
+        self,
+        *,
+        tool_name: str,
+        result_status: str = "success",
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        result_summary: str | None = None,
+        error_type: str | None = None,
+    ) -> dict[str, Any]:
+        if actor_kind not in self.ACTOR_KINDS:
+            raise InvalidState(f"非法 actor_kind：{actor_kind}")
+        if result_status not in self.RESULT_STATUSES:
+            raise InvalidState(f"非法 result_status：{result_status}")
+        log_id = new_id("tool")
+        with self.db.transaction() as conn:
+            actor_account_id: str | None = None
+            if actor_telegram_user_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(actor_telegram_user_id),),
+                ).fetchone()
+                if row:
+                    actor_account_id = row["id"]
+            conn.execute(
+                """
+                INSERT INTO tool_call_logs (
+                    id, actor_account_id, actor_telegram_user_id, actor_kind,
+                    session_id, tool_name, arguments_json,
+                    result_status, result_summary, error_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    log_id,
+                    actor_account_id,
+                    str(actor_telegram_user_id) if actor_telegram_user_id is not None else None,
+                    actor_kind,
+                    session_id,
+                    tool_name,
+                    json.dumps(arguments or {}, ensure_ascii=False),
+                    result_status,
+                    result_summary,
+                    error_type,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tool_call_logs WHERE id = ?", (log_id,)
+            ).fetchone()
+            return dict(row)
+
+    def list_calls(
+        self,
+        *,
+        actor_telegram_user_id: str | int | None = None,
+        tool_name: str | None = None,
+        result_status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM tool_call_logs WHERE 1 = 1"
+        params: list[Any] = []
+        if actor_telegram_user_id is not None:
+            sql += " AND actor_telegram_user_id = ?"
+            params.append(str(actor_telegram_user_id))
+        if tool_name is not None:
+            sql += " AND tool_name = ?"
+            params.append(tool_name)
+        if result_status is not None:
+            if result_status not in self.RESULT_STATUSES:
+                raise InvalidState(f"非法 result_status：{result_status}")
+            sql += " AND result_status = ?"
+            params.append(result_status)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        with self.db.transaction() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_call(self, log_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tool_call_logs WHERE id = ?", (log_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"工具调用日志不存在：{log_id}")
+            return dict(row)
 
 
 class SelfPromoService:

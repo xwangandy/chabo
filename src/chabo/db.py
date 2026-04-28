@@ -421,6 +421,26 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS tool_call_logs (
+    id TEXT PRIMARY KEY,
+    actor_account_id TEXT REFERENCES accounts(id),
+    actor_telegram_user_id TEXT,
+    actor_kind TEXT NOT NULL DEFAULT 'human',
+    session_id TEXT,
+    tool_name TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    result_status TEXT NOT NULL,
+    result_summary TEXT,
+    error_type TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (actor_kind IN ('human', 'ai', 'admin', 'system')),
+    CHECK (result_status IN ('success', 'error'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_actor ON tool_call_logs(actor_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_telegram ON tool_call_logs(actor_telegram_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_tool ON tool_call_logs(tool_name, created_at);
+
 CREATE TABLE IF NOT EXISTS self_promo_publishes (
     id TEXT PRIMARY KEY,
     channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,

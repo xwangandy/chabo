@@ -2230,6 +2230,94 @@ class ChaboMvpTest(unittest.TestCase):
 
     # ---------- AI-callable service-layer surface ----------
 
+    def test_tool_call_log_service_records_and_filters(self) -> None:
+        # No actor → still recorded with NULL actor_account_id
+        log_a = self.app.tool_call_logs.log_call(
+            tool_name="create_material",
+            actor_telegram_user_id=10001,
+            actor_kind="ai",
+            session_id="sess_1",
+            arguments={"format_type": "standard_card", "text_preview": "..."},
+            result_status="success",
+            result_summary="created cre_xxx",
+        )
+        log_b = self.app.tool_call_logs.log_call(
+            tool_name="approve_order",
+            actor_telegram_user_id=99999,
+            actor_kind="admin",
+            arguments={"order_id": "ord_xxx"},
+            result_status="error",
+            error_type="InvalidState",
+            result_summary="order already approved",
+        )
+        self.assertIsNone(log_a["actor_account_id"])  # 10001 has no account yet
+        self.assertEqual(log_a["actor_kind"], "ai")
+        self.assertEqual(log_b["result_status"], "error")
+        self.assertEqual(log_b["error_type"], "InvalidState")
+
+        # Filter by actor
+        rows = self.app.tool_call_logs.list_calls(actor_telegram_user_id=10001)
+        self.assertEqual({row["id"] for row in rows}, {log_a["id"]})
+
+        # Filter by tool_name
+        rows = self.app.tool_call_logs.list_calls(tool_name="approve_order")
+        self.assertEqual({row["id"] for row in rows}, {log_b["id"]})
+
+        # Filter by result_status
+        rows = self.app.tool_call_logs.list_calls(result_status="error")
+        self.assertEqual({row["id"] for row in rows}, {log_b["id"]})
+
+        # Validation
+        with self.assertRaises(InvalidState):
+            self.app.tool_call_logs.log_call(tool_name="bad", actor_kind="robot")
+        with self.assertRaises(InvalidState):
+            self.app.tool_call_logs.log_call(tool_name="bad", result_status="maybe")
+
+    def test_order_service_operator_wrappers_route_through_actor_account(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        # Make sure the operator has a real account (so the wrapper can resolve it)
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="运营员")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="审核测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+
+        approved = self.app.orders.approve_order_for_operator(
+            order_id=order["id"],
+            operator_telegram_user_id=33333,
+        )
+        self.assertEqual(approved["status"], "approved")
+
+        # audit_logs should record actor_account_id pointing at the operator's account
+        with self.app.db.transaction() as conn:
+            operator = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = '33333'"
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT * FROM audit_logs WHERE entity_type = 'ad_order' AND entity_id = ? "
+                "AND action = 'order_approved'",
+                (order["id"],),
+            ).fetchone()
+        self.assertEqual(audit["actor_account_id"], operator["id"])
+
+        # Unknown operator must NotFound rather than fall through to None actor
+        with self.assertRaises(NotFound):
+            self.app.orders.reject_order_for_operator(
+                order_id=order["id"],
+                reason="x",
+                operator_telegram_user_id=8888888,
+            )
+
     def test_channel_service_publisher_write_apis_enforce_ownership(self) -> None:
         channel = self.bind_channel()
         # Owner (20001) can change band

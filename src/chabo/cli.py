@@ -437,6 +437,35 @@ def cmd_archive_material(args: argparse.Namespace) -> None:
     print_json(material)
 
 
+def cmd_list_tool_calls(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.tool_call_logs.list_calls(
+            actor_telegram_user_id=args.actor_telegram_user_id,
+            tool_name=args.tool_name,
+            result_status=args.result_status,
+            limit=args.limit,
+        )
+    )
+
+
+def cmd_log_tool_call(args: argparse.Namespace) -> None:
+    app = create_app()
+    arguments = json.loads(args.arguments) if args.arguments else {}
+    print_json(
+        app.tool_call_logs.log_call(
+            tool_name=args.tool_name,
+            actor_telegram_user_id=args.actor_telegram_user_id,
+            actor_kind=args.actor_kind,
+            session_id=args.session_id,
+            arguments=arguments,
+            result_status=args.result_status,
+            result_summary=args.result_summary,
+            error_type=args.error_type,
+        )
+    )
+
+
 def cmd_approve_order(args: argparse.Namespace) -> None:
     app = create_app()
     print_json(app.orders.approve_order(args.order_id))
@@ -846,6 +875,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--material-id", required=True)
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.set_defaults(func=cmd_archive_material)
+
+    p = sub.add_parser("list-tool-calls", help="查看 AI / 运营工具调用审计日志")
+    p.add_argument("--actor-telegram-user-id", help="按操作者 Telegram 用户 ID 过滤")
+    p.add_argument("--tool-name", help="按工具名过滤，例如 create_material / approve_order")
+    p.add_argument("--result-status", choices=["success", "error"])
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_tool_calls)
+
+    p = sub.add_parser("log-tool-call", help="手动记录一条工具调用日志（测试或外部 AI 调用回写）")
+    p.add_argument("--tool-name", required=True)
+    p.add_argument("--actor-telegram-user-id")
+    p.add_argument("--actor-kind", choices=["human", "ai", "admin", "system"], default="human")
+    p.add_argument("--session-id")
+    p.add_argument("--arguments", help="JSON 字符串，调用参数摘要")
+    p.add_argument("--result-status", choices=["success", "error"], default="success")
+    p.add_argument("--result-summary")
+    p.add_argument("--error-type")
+    p.set_defaults(func=cmd_log_tool_call)
 
     p = sub.add_parser("approve-order", help="审核通过订单并创建首个投放任务")
     p.add_argument("--order-id", required=True)

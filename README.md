@@ -32,6 +32,7 @@
 - 广告主高级服务：优质频道发现、频道收藏、新频道提醒、批量投放、投放报表、套餐权限和到期限制。
 - 同一 Telegram 用户可同时作为广告主和频道主，账户角色会合并为 `mixed`。
 - 真实频道联测已验证：频道帖自动追加入口、deep link 归因、自助下单、审核、发布、扣费、低预算提醒、广告详情点击归因、争议和退款。
+- 广告库服务层：广告素材（creatives）按广告主独立归属、按形态（文字/标准/定制）分类、可归档；`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都自带归属校验。下单、批量下单、砍价成交都已经走同一套素材创建路径。
 
 ## 快速开始
 
@@ -175,9 +176,41 @@ chabo show-stars-payment-intent <intent_id_or_payload>
 
 Stars 支付会先创建 `stars_payment_intents`，再发送 `currency=XTR` 的发票；Bot 收到 `pre_checkout_query` 时校验用户、金额和状态，收到 `successful_payment` 后按支付意图充值余额或开通订阅。`CHABO_STAR_CREDIT_CENTS` 用于配置 1 Star 折算多少内部余额 cents，默认 1。
 
+把素材保存到广告库并复用：
+
+```bash
+chabo create-material \
+  --advertiser-telegram-user-id 10001 \
+  --format-type standard_card \
+  --text "标准插播文案 v1" \
+  --target-url "https://example.com"
+
+chabo create-material \
+  --advertiser-telegram-user-id 10001 \
+  --format-type light_tail \
+  --light-short-text "想投这里？" \
+  --text "完整文字插播详情文案" \
+  --target-url "https://example.com"
+
+chabo list-materials --advertiser-telegram-user-id 10001
+chabo show-material --material-id <material_id> --advertiser-telegram-user-id 10001
+chabo archive-material --material-id <material_id> --advertiser-telegram-user-id 10001
+```
+
+`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都按 `advertiser_telegram_user_id` 校验归属。文字插播必须配 2-15 字短入口；标准/定制插播不带短入口。归档后的素材不能再用于新订单，但仍能通过 `--include-archived` 看到。
+
 创建订单、审核并调度：
 
 ```bash
+# 直接复用广告库素材
+chabo create-order \
+  --advertiser-telegram-user-id 10001 \
+  --channel-token <ref_token> \
+  --slot-type standard_card \
+  --material-id <material_id> \
+  --budget 20
+
+# 仍兼容内联文案路径；新建的素材会自动进入广告库
 chabo create-order \
   --advertiser-telegram-user-id 10001 \
   --channel-token <ref_token> \

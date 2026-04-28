@@ -33,6 +33,8 @@
 - 同一 Telegram 用户可同时作为广告主和频道主，账户角色会合并为 `mixed`。
 - 真实频道联测已验证：频道帖自动追加入口、deep link 归因、自助下单、审核、发布、扣费、低预算提醒、广告详情点击归因、争议和退款。
 - 广告库服务层：广告素材（creatives）按广告主独立归属、按形态（文字/标准/定制）分类、可归档；`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都自带归属校验。下单、批量下单、砍价成交都已经走同一套素材创建路径。
+- 人工入账双人复核：`request-topup` 写一行 pending 不动账本；`approve-topup` 必须由不同账号执行才会调 `manual_topup` 入账；`reject-topup` 不动钱。`/admin` 顶部"待审入账"一栏、CLI 列表都能看到全部待审请求；所有动作都进 `tool_call_logs` 审计。
+- 生产部署样例：`DOC/部署/systemd-chabo.service`、`DOC/部署/nginx-chabo.conf`、`DOC/部署/token-rotation.md` 给出 systemd 服务 / nginx 反向代理 / admin & webhook secret 轮换的完整样板和应急清单。
 
 ## 快速开始
 
@@ -53,10 +55,34 @@ chabo backup-db
 chabo backup-db --target /var/backups/chabo/snapshot.sqlite3
 ```
 
-创建广告主并人工入账：
+创建广告主并人工入账（开发 / 单人入账走 `topup`；生产推荐走双人复核）：
 
 ```bash
 chabo topup --telegram-user-id 10001 --display-name "广告主A" --amount 100
+```
+
+生产环境的人工入账走双人复核，运营 A 提交、运营 B 审批：
+
+```bash
+chabo request-topup \
+  --recipient-telegram-user-id 10001 \
+  --amount 100 \
+  --reason "OTC 收到 100 USDT，转入插播余额" \
+  --requester-telegram-user-id <运营A_TG_ID> \
+  --evidence-url "https://evidence.example/screenshot.png"
+
+chabo list-topup-requests --status pending
+
+chabo approve-topup \
+  --request-id <treq_id> \
+  --approver-telegram-user-id <运营B_TG_ID> \
+  --note "对账已核"
+# approve 调用必须由不同的运营员执行；同一账号 approve 会被服务层拒绝。
+
+chabo reject-topup \
+  --request-id <treq_id> \
+  --approver-telegram-user-id <运营B_TG_ID> \
+  --note "金额对不上凭证"
 ```
 
 绑定频道并查看插播入口：

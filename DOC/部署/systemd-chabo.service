@@ -1,0 +1,44 @@
+# 插播 systemd 服务样例
+#
+# 用法：
+#   sudo cp DOC/部署/systemd-chabo.service /etc/systemd/system/chabo.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now chabo
+#   sudo systemctl status chabo
+#
+# 注意：
+# - 改 ExecStart 里的虚拟环境路径为你机器上的实际路径。
+# - CHABO_ADMIN_TOKEN / CHABO_WEBHOOK_SECRET / CHABO_BOT_TOKEN 不要写在这里；
+#   改用 EnvironmentFile 指向 /etc/chabo/env，文件权限 0640，owner root:chabo。
+# - 文件创建后跑一次 `chabo run-web` 看启动日志里 `check_token_strength`
+#   有无告警；有告警就别上线。
+
+[Unit]
+Description=ChaBo (插播) HTTP service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chabo
+Group=chabo
+WorkingDirectory=/opt/chabo
+EnvironmentFile=/etc/chabo/env
+ExecStart=/opt/chabo/.venv/bin/chabo run-web --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+# 写文件目录限制：DB / backups / logs
+ReadWritePaths=/var/lib/chabo /var/log/chabo
+
+# 安全收紧
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

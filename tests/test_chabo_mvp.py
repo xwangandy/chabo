@@ -891,8 +891,10 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
         self.assertEqual(result["type"], "ad_start")
-        self.assertIn("完整广告详情", self.gateway.private_messages[-1]["text"])
-        self.assertIn("https://light.example", self.gateway.private_messages[-1]["text"])
+        last_message = self.gateway.private_messages[-1]
+        self.assertIn("完整广告详情", last_message["text"])
+        keyboard_urls = [b.get("url") for row in last_message["inline_keyboard"] for b in row]
+        self.assertIn("https://light.example", keyboard_urls)
 
     def test_account_becomes_mixed_when_same_user_is_advertiser_and_publisher(self) -> None:
         with self.app.db.transaction() as conn:
@@ -1260,7 +1262,9 @@ class ChaboMvpTest(unittest.TestCase):
         with self.app.db.transaction() as conn:
             metric = conn.execute("SELECT * FROM metric_snapshots WHERE delivery_id = ?", (delivery["id"],)).fetchone()
         self.assertEqual(metric["metric_type"], "bot_start")
-        self.assertIn("https://example.com", self.gateway.private_messages[-1]["text"])
+        last_message = self.gateway.private_messages[-1]
+        keyboard_urls = [b.get("url") for row in last_message["inline_keyboard"] for b in row]
+        self.assertIn("https://example.com", keyboard_urls)
 
     def test_send_failure_pauses_order_and_releases_budget(self) -> None:
         self.gateway.fail_send = True
@@ -2202,6 +2206,65 @@ class ChaboMvpTest(unittest.TestCase):
         payload_after = json.loads(state_after["payload_json"])
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
+
+    def test_view_detail_deep_link_renders_full_ad_page(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播完整文案，点击查看详情后展示。",
+            target_url="https://advertiser.example/landing",
+            button_text="立即购买",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+
+        self.confirm_timezone(333, display_name="点击用户")
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 77,
+                    "from": {"id": 333, "first_name": "点击用户"},
+                    "chat": {"id": 333},
+                    "text": f"/start ad_{delivery['id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "ad_start")
+
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        self.assertIn("标准插播完整文案", detail["text"])
+        self.assertIn(channel["title"], detail["text"])
+
+        keyboard = detail["inline_keyboard"]
+        flat = [b for row in keyboard for b in row]
+        cta = next((b for b in flat if b.get("text") == "立即购买"), None)
+        self.assertIsNotNone(cta)
+        self.assertEqual(cta["url"], "https://advertiser.example/landing")
+
+        sales = next((b for b in flat if "想在这个频道投广告" in b.get("text", "")), None)
+        self.assertIsNotNone(sales)
+        self.assertEqual(sales["callback_data"], f"channel:order:{channel['id']}")
+
+        with self.app.db.transaction() as conn:
+            metric = conn.execute(
+                "SELECT * FROM metric_snapshots WHERE delivery_id = ? AND metric_type = 'bot_start'",
+                (delivery["id"],),
+            ).fetchone()
+        self.assertIsNotNone(metric)
 
     def test_standard_placement_publishes_three_button_keyboard(self) -> None:
         channel = self.bind_channel()

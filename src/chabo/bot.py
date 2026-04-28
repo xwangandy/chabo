@@ -183,11 +183,15 @@ class UpdateHandler:
                         (new_id("met"), delivery_id, json.dumps({"telegram_user_id": str(user_id)}, ensure_ascii=False)),
                     )
                     creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (delivery["creative_id"],)).fetchone()
-                    if creative:
+                    source_channel = conn.execute(
+                        "SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)
+                    ).fetchone()
+                    if creative and source_channel:
+                        text, keyboard = self._build_ad_detail_view(creative, source_channel)
                         self.gateway.send_private_message(
                             chat_id=chat.get("id", user_id),
-                            text="\n".join(["📄 插播广告详情", "", creative["text"], "", f"🔗 {creative['target_url']}"]),
-                            inline_keyboard=[[{"text": "🔗 打开链接", "url": creative["target_url"]}]],
+                            text=text,
+                            inline_keyboard=keyboard,
                         )
                     else:
                         self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
@@ -2209,6 +2213,31 @@ class UpdateHandler:
 
     def _short_title(self, title: str, limit: int) -> str:
         return title if len(title) <= limit else title[:limit] + "..."
+
+    def _build_ad_detail_view(
+        self,
+        creative: sqlite3.Row,
+        source_channel: sqlite3.Row,
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        title = source_channel["title"] or "未命名频道"
+        username = source_channel["username"]
+        channel_label = f"@{username}" if username else title
+        text = "\n".join(
+            [
+                "📄 插播广告详情",
+                "",
+                creative["text"],
+                "",
+                f"📺 来源频道：{title}（{channel_label}）",
+            ]
+        )
+        cta_text = (creative["button_text"] or "").strip() or "查看链接"
+        keyboard = [
+            [{"text": cta_text, "url": creative["target_url"]}],
+            [{"text": "📣 我也想在这个频道投广告", "callback_data": f"channel:order:{source_channel['id']}"}],
+            [{"text": "🏠 工作台", "callback_data": "menu:home"}],
+        ]
+        return text, keyboard
 
     def _creative_status_label(self, status: str) -> str:
         labels = {

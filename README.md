@@ -15,20 +15,20 @@
 - 频道 `ref_token` 与按钮链接：`https://t.me/<bot>?start=<channel_token>`。
 - 自动给频道新帖追加“在本频道插播广告”按钮，并保留原有 inline buttons。
 - 广告主从 deep link 进入后建立来源归因 session。
-- 固定刊例价订单：普通插播、定时插播、置顶 24h、循环插播。
+- 固定刊例价订单；旧版广告位仍兼容，v1 交互以“文字/标准/定制 + 置顶/发布周期”的投放矩阵为准。
 - 预算预冻结，发布成功后扣费；发布或置顶失败会暂停订单并释放剩余预算。
 - 运营 Admin 最小闭环：审核通过、审核拒绝释放预算、已扣费投放全额退款、争议列表和人工裁决。
 - 平台服务费按规则生效：保留推广按钮或开通频道高级订阅可免服务费，否则可收默认 5%；默认 10%/7 天收益保留金参数已入库。
 - 证据链：素材快照、频道配置快照、价格快照、发送日志、账务流水。
 - Stars 发票、pre-checkout 校验、`successful_payment` 幂等履约，以及人工入账 CLI。
 - Bot polling 运行器：支持真实 `getUpdates`、offset 持久化、callback query 和菜单按钮。
-- Bot 自助下单表单：从频道 deep link 选择广告形态、提交文案/链接、设置预算，并创建待审核订单、冻结预算。
-- Bot 频道主接入向导：频道主转发频道消息后，系统检查频道主/Bot 权限，绑定频道，展示插播入口、默认报价和广告形态开关。
-- 三种广告形态：`light_tail`、`standard_card`、`strong_post`，并保留 `pin24h`、`loop_daily`。
+- Bot 旧版自助下单表单：从频道 deep link 选择展示形态、提交文案/链接、设置预算，并创建待审核订单、冻结预算；后续需按 v1 投放配置器重构。
+- Bot 频道主接入向导：频道主转发频道消息后，系统检查频道主/Bot 权限，绑定频道，展示插播入口、默认报价和展示形态开关。
+- 内部三种展示形态字段：`light_tail`、`standard_card`、`strong_post`；用户界面应显示“文字插播、标准插播、定制插播”，`pin24h`、`loop_daily` 只作为投放设置兼容字段。
 - 频道定价评估、低/中/高价格档、广告主砍价报价。
 - 频道主高级订阅：按频道订阅人数计算月费，控制关闭推广按钮/自定义价格等高级功能。
 - 频道主接受砍价后，系统自动创建待审核订单并冻结广告主预算。
-- 轻插播探针：频道新帖自动追加低打扰探针按钮，统计点击和独立点击用户。
+- 文字插播探针：频道新帖自动追加低打扰探针按钮，统计点击和独立点击用户。
 - 广告主高级服务：优质频道发现、频道收藏、新频道提醒、批量投放、投放报表、套餐权限和到期限制。
 - 同一 Telegram 用户可同时作为广告主和频道主，账户角色会合并为 `mixed`。
 - 真实频道联测已验证：频道帖自动追加入口、deep link 归因、自助下单、审核、发布、扣费、低预算提醒、广告详情点击归因、争议和退款。
@@ -55,7 +55,7 @@ chabo topup --telegram-user-id 10001 --display-name "广告主A" --amount 100
 chabo bind-channel --telegram-chat-id -100123456 --title "示例频道" --username example_channel --owner-telegram-user-id 20001
 ```
 
-生成频道定价评估，并把三种插播广告形态的报价写入刊例价：
+生成频道定价评估，并把三种展示形态的报价写入刊例价：
 
 ```bash
 chabo assess-channel \
@@ -70,7 +70,7 @@ chabo quote-channel --channel <ref_token> --slot-type standard_card
 chabo apply-pricing --channel <ref_token>
 ```
 
-频道主可开关广告形态，或选择低/中/高档：
+频道主可开关展示形态，或选择低/中/高档：
 
 ```bash
 chabo set-format-policy --channel <ref_token> --format-type strong_post --no-enabled
@@ -106,13 +106,13 @@ chabo show-subscription --channel <ref_token>
 
 `activate-subscription` 保留为运营后台手动开通入口；正式购买路径使用 `purchase-subscription`，会从频道主余额扣款并把收入写入平台账本。
 
-创建轻插播探针并查看点击统计：
+创建文字插播探针并查看点击统计：
 
 ```bash
 chabo create-probe \
   --channel <ref_token> \
   --short-text "想在这个频道投广告？" \
-  --detail-text "这里是轻插播详情页文案" \
+  --detail-text "这里是文字插播详情页文案" \
   --target-url "https://example.com" \
   --button-text "想投广告？"
 
@@ -254,11 +254,11 @@ CHABO_BOT_USERNAME=ChaBoADBot \
 chabo run-polling --once --timeout 1
 ```
 
-Bot 支持 `/menu`，会展示双身份“📌 插播工作台”：顶部是“➕ 添加频道”，下面是“📺 频道管理 / 📣 我的广告”“💸 我的收益 / 💰 广告钱包”“💵 定价规则 / 🌐 时区”。核心菜单使用短文案和 emoji 引导；主动作整行展示，次级动作两列并排。点击 inline 按钮后会先返回“处理中...”，并优先原地更新当前 Bot 消息，减少刷屏。频道 deep link 进入后会展示“🧾 创建订单 / 💵 价格 / 💰 广告钱包”等按钮；点击“🧾 创建订单”后可在 Bot 内选择广告形态、发送文案、发送目标链接、设置预算，提交后生成 `pending_review` 订单并冻结预算。
+Bot 支持 `/menu`，会展示双身份“📌 插播工作台”：顶部是“➕ 添加频道”，下面是“📺 频道管理 / 📣 我的广告”“💸 我的收益 / 💰 广告钱包”“💵 定价规则 / 🌐 时区”。核心菜单使用短文案和 emoji 引导；主动作整行展示，次级动作两列并排。点击 inline 按钮后会先返回“处理中...”，并优先原地更新当前 Bot 消息，减少刷屏。频道 deep link 进入后，v1 目标是直接进入“投放配置器”，先完成“给当前频道投广告”：展示设置、发布设置、广告素材、费用确认。钱包和广告库不应抢在第一屏，只有选择素材或余额不足时才进入对应流程。
 
-频道主点击“🔌 手动接入”后会进入接入向导：先把 Bot 加为频道管理员并授予发消息、编辑消息权限，再从频道转发任意消息给 Bot。Bot 会识别频道、检查频道主与 Bot 权限，成功后绑定频道并展示广告形态配置入口。
+频道主点击“🔌 手动接入”后会进入接入向导：先把 Bot 加为频道管理员并授予发消息、编辑消息权限，再从频道转发任意消息给 Bot。Bot 会识别频道、检查频道主与 Bot 权限，成功后绑定频道并展示“展示形态”配置入口。
 
-首次 `/start` 会先确认时区，默认 `Asia/Shanghai`；用户可输入北京、Manila、Asia/Tokyo、Europe/Rome 等城市或 IANA 时区名。频道主资产识别：Bot 的 polling/webhook 会接收 `my_chat_member` 和 `chat_member` update。Bot 被加入频道或升为管理员后，会自动绑定频道资产、同步频道管理员列表，并尝试通知已经能私聊 Bot 的管理员。频道主无参数 `/start` 时，如果当前账号是已接入频道管理员，会直接进入“📺 频道管理”并列出频道资产；点击频道可查看入口链接、中文广告位价格、权限状态和广告形态配置。
+首次 `/start` 会先确认时区，默认 `Asia/Shanghai`；用户可输入北京、Manila、Asia/Tokyo、Europe/Rome 等城市或 IANA 时区名。频道主资产识别：Bot 的 polling/webhook 会接收 `my_chat_member` 和 `chat_member` update。Bot 被加入频道或升为管理员后，会自动绑定频道资产、同步频道管理员列表，并尝试通知已经能私聊 Bot 的管理员。频道主无参数 `/start` 时，如果当前账号是已接入频道管理员，会直接进入“📺 频道管理”并列出频道资产；点击频道可查看入口链接、中文展示形态价格、权限状态和展示形态配置。
 
 `CHABO_TELEGRAM_HTTP_BACKEND=auto` 会优先使用 Python `urllib`，遇到本机证书链问题时自动退回系统 `curl`。
 

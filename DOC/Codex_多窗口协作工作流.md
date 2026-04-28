@@ -312,10 +312,10 @@ git 基线和 GitHub 远程仓库已经建立。当前主工作区是 `/Users/la
 
 推荐顺序：
 
-1. `CHB-001`：频道招商 deep link 首屏。
+1. `CHB-001`：频道招商 deep link 首屏。状态：主工作区已完成初版。
    - 目标：用户从频道里的“频道招商”按钮进入 Bot 后，第一屏直接展示“投广告到 <频道名>”、价格、广告库、广告钱包和下单入口。
    - 主要文件：`src/chabo/bot.py`、`tests/test_chabo_mvp.py`。
-   - 不改履约发布格式，避免和下一任务冲突。
+   - 已实现 `ch_<ref_token>` payload、频道招商首屏和广告库入口；后续只做体验补强，不再作为第一执行窗口任务。
 2. `CHB-002`：标准插播三按钮履约。
    - 目标：真实发到频道的标准插播包含“频道招商 / 查看详情 / 广告主 CTA”三按钮结构。
    - 主要文件：`src/chabo/fulfillment.py`、`src/chabo/telegram.py`、`tests/test_chabo_mvp.py`。

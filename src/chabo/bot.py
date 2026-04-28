@@ -189,7 +189,11 @@ class UpdateHandler:
                         text=f"{probe['detail_text']}\n\n{probe['target_url']}",
                     )
                     return {"handled": True, "type": "light_probe_start", "probe_id": probe_id, "channel_id": probe["channel_id"]}
-            channel = self.channels.get_by_token(conn, payload) if payload else None
+            channel = None
+            for channel_token in self._channel_tokens_from_start_payload(payload):
+                channel = self.channels.get_by_token(conn, channel_token)
+                if channel:
+                    break
             session_id = new_id("sess")
             conn.execute(
                 """
@@ -209,25 +213,7 @@ class UpdateHandler:
                     """,
                     (channel["id"],),
                 ).fetchall()
-                lines = [
-                    "插播频道投放",
-                    f"频道：{channel['title']}",
-                    "",
-                    "当前可购买的插播广告位：",
-                ]
-                lines.extend(self._rate_lines(rates))
-                lines.extend(
-                    [
-                        "",
-                        "下单后预算会先冻结，审核通过并发布成功后才扣费。",
-                        "你可以直接创建订单，也可以先查看价格和余额。",
-                    ]
-                )
-                self.gateway.send_private_message(
-                    chat_id=chat.get("id", user_id),
-                    text="\n".join(["📣 插播频道", f"📺 {channel['title']}", "", "💵 价格：", *self._rate_lines(rates), "", "✅ 发布成功才扣费"]),
-                    inline_keyboard=self._channel_keyboard(channel["id"]),
-                )
+                self._send_channel_sales_landing(chat.get("id", user_id), channel, rates)
                 return {"handled": True, "type": "channel_start", "channel_id": channel["id"], "session_id": session_id}
             organic_session_id = session_id
         publisher_channels = self._publisher_channels_for_user(user_id, display_name)
@@ -286,6 +272,9 @@ class UpdateHandler:
         if data == "advertiser:balance":
             self._send_advertiser_balance(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_balance"}
+        if data == "advertiser:library":
+            self._send_advertiser_library(chat_id, user, message)
+            return {"handled": True, "type": "callback_advertiser_library"}
         if data == "advertiser:orders":
             self._send_advertiser_orders(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_orders"}
@@ -295,7 +284,7 @@ class UpdateHandler:
                 source_message=message,
                 text=(
                     "🧾 创建订单\n\n"
-                    "从频道里的「在本频道插播广告」进入。\n\n"
+                    "从频道里的「频道招商」进入。\n\n"
                     "1 选广告位\n"
                     "2 发文案和链接\n"
                     "3 设置预算\n\n"
@@ -509,6 +498,75 @@ class UpdateHandler:
                 f"💰 可用：USD {balance:.2f}\n"
                 f"🔒 冻结：USD {reserved:.2f}"
             ),
+            inline_keyboard=[
+                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
+                [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
+                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    def _send_channel_sales_landing(
+        self,
+        chat_id: str | int,
+        channel: dict[str, Any],
+        rates: list[Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel_title = channel["title"]
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(
+                [
+                    "📣 频道招商",
+                    f"📺 {channel_title}",
+                    "",
+                    f"投广告到 {channel_title}",
+                    "",
+                    "💵 当前价",
+                    *self._rate_lines(rates),
+                    "",
+                    "✅ 发布成功才扣费",
+                ]
+            ),
+            inline_keyboard=self._channel_sales_keyboard(channel),
+        )
+
+    def _send_advertiser_library(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            creatives = conn.execute(
+                """
+                SELECT cr.*, ca.name AS campaign_name
+                FROM creatives cr
+                JOIN campaigns ca ON ca.id = cr.campaign_id
+                WHERE ca.advertiser_account_id = ?
+                ORDER BY cr.updated_at DESC, cr.created_at DESC
+                LIMIT 5
+                """,
+                (account["id"],),
+            ).fetchall()
+        lines = ["🗂 广告库", ""]
+        if creatives:
+            for index, creative in enumerate(creatives, start=1):
+                text = (creative["text"] or "").replace("\n", " ")
+                if len(text) > 28:
+                    text = text[:28] + "..."
+                lines.append(f"{index}. {text}")
+                lines.append(f"   {self._creative_status_label(creative['status'])} · {creative['button_text']}")
+        else:
+            lines.extend(
+                [
+                    "还没有可复用广告。",
+                    "先从频道里的“频道招商”进入，创建第一条插播。",
+                ]
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
             inline_keyboard=[
                 [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
                 [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
@@ -1431,6 +1489,21 @@ class UpdateHandler:
             [{"text": "💵 价格", "callback_data": f"channel:quote:{channel_id}"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
         ]
 
+    def _channel_sales_keyboard(self, channel: dict[str, Any]) -> list[list[dict[str, str]]]:
+        title = self._short_title(channel["title"], 12)
+        return [
+            [{"text": f"🧾 投广告到{title}", "callback_data": f"channel:order:{channel['id']}"}],
+            [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
+            [{"text": "💵 价格说明", "callback_data": f"channel:quote:{channel['id']}"}, {"text": "🏠 工作台", "callback_data": "menu:home"}],
+        ]
+
+    def _channel_tokens_from_start_payload(self, payload: str) -> list[str]:
+        if not payload:
+            return []
+        if payload.startswith("ch_"):
+            return [payload.removeprefix("ch_"), payload]
+        return [payload]
+
     def _rate_lines(self, rates: list[Any]) -> list[str]:
         return [f"• {self._slot_label(rate['slot_type'])}：{rate['currency']} {rate['unit_price_cents'] / 100:.2f}" for rate in rates]
 
@@ -1442,6 +1515,17 @@ class UpdateHandler:
         normalized = self.channels.normalize_slot_type(slot_type)
         emoji = SLOT_EMOJIS.get(normalized, "📍")
         return f"{emoji} {SLOT_DISPLAY_NAMES.get(normalized, slot_type)}"
+
+    def _short_title(self, title: str, limit: int) -> str:
+        return title if len(title) <= limit else title[:limit] + "..."
+
+    def _creative_status_label(self, status: str) -> str:
+        labels = {
+            "pending_review": "⏳ 待审",
+            "approved": "✅ 已审",
+            "rejected": "⛔ 拒绝",
+        }
+        return labels.get(status, status)
 
     def _button_grid(self, buttons: list[dict[str, str]], width: int) -> list[list[dict[str, str]]]:
         return [buttons[index : index + width] for index in range(0, len(buttons), width)]
@@ -1497,7 +1581,7 @@ class UpdateHandler:
             probe_button = {"text": probe["button_text"], "url": probe_url}
             if not any(button.get("url") == probe_url for row in keyboard for button in row):
                 keyboard.append([probe_button])
-        promo_button = {"text": "在本频道插播广告", "url": promo_url}
+        promo_button = {"text": "📣 频道招商", "url": promo_url}
         if not any(button.get("url") == promo_url for row in keyboard for button in row):
             keyboard.append([promo_button])
         return keyboard

@@ -251,8 +251,9 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertTrue(result["handled"])
         keyboard = self.gateway.edits[0]["inline_keyboard"]
         self.assertEqual(keyboard[0][0]["text"], "原按钮")
-        self.assertEqual(keyboard[-1][0]["text"], "在本频道插播广告")
+        self.assertEqual(keyboard[-1][0]["text"], "📣 频道招商")
         self.assertIn(channel["ref_token"], keyboard[-1][0]["url"])
+        self.assertIn("start=ch_", keyboard[-1][0]["url"])
 
         start = self.app.update_handler.handle(
             {
@@ -260,14 +261,16 @@ class ChaboMvpTest(unittest.TestCase):
                     "message_id": 1,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": f"/start {channel['ref_token']}",
+                    "text": f"/start ch_{channel['ref_token']}",
                 }
             }
         )
         self.assertEqual(start["type"], "channel_start")
         self.assertEqual(start["channel_id"], channel["id"])
-        self.assertIn("💵 价格", self.gateway.private_messages[-1]["text"])
-        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][0][0]["text"], "🧾 创建订单")
+        self.assertIn("频道招商", self.gateway.private_messages[-1]["text"])
+        self.assertIn("投广告到 测试频道", self.gateway.private_messages[-1]["text"])
+        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][0][0]["text"], "🧾 投广告到测试频道")
+        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][1][0]["text"], "🗂 广告库")
 
         with self.app.db.transaction() as conn:
             session = conn.execute("SELECT * FROM advertiser_sessions").fetchone()
@@ -324,6 +327,16 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
+        library = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "advertiser:library",
+                }
+            }
+        )
 
         self.assertEqual(first_start["type"], "timezone_prompt")
         self.assertIn("时区确认", self.gateway.private_messages[0]["text"])
@@ -336,8 +349,9 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertTrue(any(message["inline_keyboard"] and message["inline_keyboard"][0][0]["text"] == "➕ 添加频道" for message in self.gateway.private_messages))
         self.assertEqual(advertiser_menu["type"], "callback_advertiser_menu")
         self.assertEqual(balance["type"], "callback_advertiser_balance")
-        self.assertEqual(len(self.gateway.callback_answers), 3)
-        self.assertIn("广告钱包", self.gateway.private_messages[-1]["text"])
+        self.assertEqual(library["type"], "callback_advertiser_library")
+        self.assertEqual(len(self.gateway.callback_answers), 4)
+        self.assertIn("广告库", self.gateway.private_messages[-1]["text"])
 
     def test_timezone_setup_accepts_city_input(self) -> None:
         self.app.update_handler.handle(
@@ -574,7 +588,7 @@ class ChaboMvpTest(unittest.TestCase):
             },
         )
         self.assertTrue(webhook["ok"])
-        self.assertEqual(self.gateway.edits[-1]["inline_keyboard"][-1][0]["text"], "在本频道插播广告")
+        self.assertEqual(self.gateway.edits[-1]["inline_keyboard"][-1][0]["text"], "📣 频道招商")
 
         self.topup_advertiser("20")
         order = self.app.orders.create_order(
@@ -811,7 +825,7 @@ class ChaboMvpTest(unittest.TestCase):
         keyboard = self.gateway.edits[-1]["inline_keyboard"]
         self.assertEqual(keyboard[-2][0]["text"], "想投广告？")
         self.assertIn(f"probe_{probe['id']}", keyboard[-2][0]["url"])
-        self.assertEqual(keyboard[-1][0]["text"], "在本频道插播广告")
+        self.assertEqual(keyboard[-1][0]["text"], "📣 频道招商")
 
         for user_id in [333, 444]:
             self.confirm_timezone(user_id, display_name="点击用户")

@@ -938,7 +938,7 @@ class ChannelService:
         return dict(row)
 
     def start_url(self, channel: dict[str, Any]) -> str:
-        return f"https://t.me/{self.settings.bot_username}?start={channel['ref_token']}"
+        return f"https://t.me/{self.settings.bot_username}?start=ch_{channel['ref_token']}"
 
     def _audit(
         self,

@@ -76,11 +76,17 @@ class FulfillmentService:
             return {"delivery_id": delivery["id"], "status": "budget_exhausted"}
 
         track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery['id']}"
+        ad_text = creative["text"]
+        button_text = creative["button_text"]
+        if slot["slot_type"] == "light_tail":
+            short_text = creative["button_text"] or "查看详情"
+            ad_text = f"🔖 {short_text}"
+            button_text = "查看完整广告"
         try:
             message_id = self.gateway.send_ad(
                 chat_id=channel["telegram_chat_id"],
-                text=creative["text"],
-                button_text=creative["button_text"],
+                text=ad_text,
+                button_text=button_text,
                 button_url=track_url,
             )
             pinned = 0

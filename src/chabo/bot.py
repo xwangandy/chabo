@@ -171,8 +171,14 @@ class UpdateHandler:
                         (new_id("met"), delivery_id, json.dumps({"telegram_user_id": str(user_id)}, ensure_ascii=False)),
                     )
                     creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (delivery["creative_id"],)).fetchone()
-                    target_url = creative["target_url"] if creative else "广告详情暂不可用"
-                    self.gateway.send_private_message(chat_id=chat.get("id", user_id), text=f"插播广告详情：{target_url}")
+                    if creative:
+                        self.gateway.send_private_message(
+                            chat_id=chat.get("id", user_id),
+                            text="\n".join(["📄 插播广告详情", "", creative["text"], "", f"🔗 {creative['target_url']}"]),
+                            inline_keyboard=[[{"text": "🔗 打开链接", "url": creative["target_url"]}]],
+                        )
+                    else:
+                        self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
                     return {"handled": True, "type": "ad_start", "delivery_id": delivery_id}
             if payload.startswith("probe_"):
                 probe_id = payload.removeprefix("probe_")
@@ -732,6 +738,43 @@ class UpdateHandler:
         payload = json.loads(state["payload_json"] or "{}")
         step = state["step"]
         clean_text = text.strip()
+        if step == "light_short_text":
+            if len(clean_text) < 2:
+                self.gateway.send_private_message(chat_id=chat_id, text="轻插播短入口太短了，请输入 2-15 个字。", inline_keyboard=self._cancel_keyboard())
+                return {"handled": True, "type": "order_form_invalid_light_short_text"}
+            if len(clean_text) > 15:
+                self.gateway.send_private_message(chat_id=chat_id, text="轻插播短入口最多 15 个字，请重新发送。", inline_keyboard=self._cancel_keyboard())
+                return {"handled": True, "type": "order_form_invalid_light_short_text"}
+            payload["light_short_text"] = clean_text
+            payload["button_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "create_order", "light_detail_text", payload)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text=(
+                    "✅ 短入口已保存\n\n"
+                    "请发送完整广告详情。\n"
+                    "用户点击轻插播后，会在 Bot 里看到这段完整内容。"
+                ),
+                inline_keyboard=self._cancel_keyboard(),
+            )
+            return {"handled": True, "type": "order_form_light_short_text_saved"}
+
+        if step == "light_detail_text":
+            if len(clean_text) < 4:
+                self.gateway.send_private_message(chat_id=chat_id, text="广告详情太短了，请至少输入 4 个字。", inline_keyboard=self._cancel_keyboard())
+                return {"handled": True, "type": "order_form_invalid_light_detail"}
+            if len(clean_text) > 1000:
+                self.gateway.send_private_message(chat_id=chat_id, text="广告详情太长了，请控制在 1000 字以内。", inline_keyboard=self._cancel_keyboard())
+                return {"handled": True, "type": "order_form_invalid_light_detail"}
+            payload["creative_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "create_order", "target_url", payload)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="请发送广告目标链接，用户看完完整广告后可继续打开。必须以 http:// 或 https:// 开头。",
+                inline_keyboard=self._cancel_keyboard(),
+            )
+            return {"handled": True, "type": "order_form_light_detail_saved"}
+
         if step == "creative_text":
             if len(clean_text) < 4:
                 self.gateway.send_private_message(chat_id=chat_id, text="广告文案太短了，请至少输入 4 个字。", inline_keyboard=self._cancel_keyboard())
@@ -781,9 +824,12 @@ class UpdateHandler:
                     slot_type=payload["slot_type"],
                     text=payload["creative_text"],
                     target_url=payload["target_url"],
+                    button_text=payload.get("button_text", "查看详情"),
                     budget_cents=budget_cents,
-                    campaign_name="Bot 自助插播广告",
+                    campaign_name="Bot 自助轻插播广告" if payload["slot_type"] == "light_tail" else "Bot 自助插播广告",
                 )
+                if self.settings.bot_auto_approve_orders:
+                    order = self.orders.approve_order(order["id"])
             except ChaboError as exc:
                 self.gateway.send_private_message(
                     chat_id=chat_id,
@@ -795,6 +841,7 @@ class UpdateHandler:
                 )
                 return {"handled": True, "type": "order_form_create_failed", "error": str(exc)}
             self._clear_conversation(chat_id)
+            review_text = "✅ 已自动通过审核\n🚀 已进入排期" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
             self.gateway.send_private_message(
                 chat_id=chat_id,
                 text=(
@@ -802,7 +849,7 @@ class UpdateHandler:
                     f"订单：{order['id']}\n"
                     f"广告位：{self._slot_label(payload['slot_type'])}\n"
                     f"预算：USD {cents_to_money(budget_cents)}\n\n"
-                    "⏳ 等待审核"
+                    f"{review_text}"
                 ),
                 inline_keyboard=[
                     [{"text": "📋 订单", "callback_data": "advertiser:orders"}],
@@ -1407,21 +1454,34 @@ class UpdateHandler:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "advertiser", user.get("first_name") or user.get("username"))
             channel = self.channels.get_channel(conn, channel_id)
             rate = self.channels.get_rate(conn, channel_id, slot_type)
+        normalized_slot = self.channels.normalize_slot_type(slot_type)
+        first_step = "light_short_text" if normalized_slot == "light_tail" else "creative_text"
         self._set_conversation(
             chat_id,
             account["id"],
             "create_order",
-            "creative_text",
-            {"channel_id": channel_id, "slot_type": slot_type},
+            first_step,
+            {"channel_id": channel_id, "slot_type": normalized_slot},
         )
-        self._reply_or_edit(
-            chat_id=chat_id,
-            source_message=source_message,
-            text=(
+        if normalized_slot == "light_tail":
+            text = (
+                f"✅ 已选 {self._slot_label(slot_type)}\n"
+                f"💵 USD {cents_to_money(rate['unit_price_cents'])}\n\n"
+                "轻插播会在频道最新帖子底部放一行短入口，尽量不打扰阅读。\n"
+                "用户点击后，会打开 Bot 里的完整广告详情。\n\n"
+                "第一步：请发送 15 个字以内的短入口。\n"
+                "例如：领资料、点我下单、限时福利"
+            )
+        else:
+            text = (
                 f"✅ 已选 {self._slot_label(slot_type)}\n"
                 f"💵 USD {cents_to_money(rate['unit_price_cents'])}\n\n"
                 "请直接发送广告文案。"
-            ),
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
             inline_keyboard=self._cancel_keyboard(),
         )
 

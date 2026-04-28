@@ -521,6 +521,7 @@ class ChaboMvpTest(unittest.TestCase):
         with self.app.db.transaction() as conn:
             order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (budget["order_id"],)).fetchone()
             creative_row = conn.execute("SELECT * FROM creatives WHERE id = ?", (order["creative_id"],)).fetchone()
+            delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
             advertiser = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
             state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = '10001'").fetchone()
 
@@ -529,13 +530,115 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(creative["type"], "order_form_creative_saved")
         self.assertEqual(url["type"], "order_form_url_saved")
         self.assertEqual(budget["type"], "order_form_order_created")
-        self.assertEqual(order["status"], "pending_review")
+        self.assertEqual(order["status"], "approved")
         self.assertEqual(order["reserved_cents"], 1200)
         self.assertEqual(order["unit_price_cents"], 1000)
         self.assertEqual(creative_row["target_url"], "https://selfserve.example")
+        self.assertIsNotNone(delivery)
         self.assertEqual(advertiser["available_balance_cents"], 800)
         self.assertEqual(advertiser["reserved_balance_cents"], 1200)
         self.assertIsNone(state)
+
+    def test_light_tail_order_collects_short_entry_and_full_detail(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("5")
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_light_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        slot = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_light_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"order:slot:{channel['id']}:light_tail",
+                }
+            }
+        )
+        short_text = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 30,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "领资料",
+                }
+            }
+        )
+        detail = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 31,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "这里是轻插播点击后展示的完整广告详情。",
+                }
+            }
+        )
+        url = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 32,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://light.example",
+                }
+            }
+        )
+        budget = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 33,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "3",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (budget["order_id"],)).fetchone()
+            creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (order["creative_id"],)).fetchone()
+
+        self.assertEqual(slot["type"], "callback_order_slot_selected")
+        self.assertTrue(any("15 个字以内" in message["text"] for message in self.gateway.private_messages))
+        self.assertEqual(short_text["type"], "order_form_light_short_text_saved")
+        self.assertEqual(detail["type"], "order_form_light_detail_saved")
+        self.assertEqual(url["type"], "order_form_url_saved")
+        self.assertEqual(order["status"], "approved")
+        self.assertEqual(order["unit_price_cents"], 300)
+        self.assertEqual(creative["button_text"], "领资料")
+        self.assertEqual(creative["text"], "这里是轻插播点击后展示的完整广告详情。")
+
+        dispatched = self.app.fulfillment.dispatch_due()
+        self.assertEqual(dispatched[0]["status"], "sent")
+        self.assertEqual(self.gateway.sent_ads[-1]["text"], "🔖 领资料")
+        self.assertEqual(self.gateway.sent_ads[-1]["button_text"], "查看完整广告")
+
+        self.confirm_timezone(333, display_name="点击用户")
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 34,
+                    "from": {"id": 333, "first_name": "点击用户"},
+                    "chat": {"id": 333},
+                    "text": f"/start ad_{delivery['id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "ad_start")
+        self.assertIn("完整广告详情", self.gateway.private_messages[-1]["text"])
+        self.assertIn("https://light.example", self.gateway.private_messages[-1]["text"])
 
     def test_account_becomes_mixed_when_same_user_is_advertiser_and_publisher(self) -> None:
         with self.app.db.transaction() as conn:

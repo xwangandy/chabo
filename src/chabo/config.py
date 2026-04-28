@@ -19,9 +19,11 @@ class Settings:
     web_port: int = 8080
     admin_token: str | None = None
     webhook_secret: str | None = None
+    bot_auto_approve_orders: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
+        auto_approve = os.getenv("CHABO_BOT_AUTO_APPROVE_ORDERS", "1").strip().lower() not in {"0", "false", "no", "off"}
         return cls(
             db_path=os.getenv("CHABO_DB_PATH", cls.db_path),
             bot_token=os.getenv("CHABO_BOT_TOKEN"),
@@ -36,4 +38,5 @@ class Settings:
             web_port=int(os.getenv("CHABO_WEB_PORT", cls.web_port)),
             admin_token=os.getenv("CHABO_ADMIN_TOKEN"),
             webhook_secret=os.getenv("CHABO_WEBHOOK_SECRET"),
+            bot_auto_approve_orders=auto_approve,
         )

@@ -44,6 +44,19 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _audit_payload_with_note(base: dict[str, Any], note: str | None) -> dict[str, Any]:
+    """Merge an operator note into an audit payload.
+
+    Notes are written into ``audit_logs.payload_json["note"]`` so detail
+    pages and exports can render them on the same timeline as the rest of
+    the action's payload. Empty / whitespace-only notes are dropped.
+    """
+    cleaned = (note or "").strip()
+    if not cleaned:
+        return base
+    return {**base, "note": cleaned}
+
+
 class AccountService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -1927,12 +1940,13 @@ class OrderService:
         *,
         order_id: str,
         operator_telegram_user_id: str | int,
+        note: str | None = None,
         actor_kind: str = "admin",
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        audit_args = {"order_id": order_id}
+        audit_args = {"order_id": order_id, "has_note": bool((note or "").strip())}
         try:
-            order = self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id))
+            order = self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id), note=note)
         except ChaboError as exc:
             self.tool_calls.log_failure(
                 tool_name="approve_order_for_operator",
@@ -1959,12 +1973,17 @@ class OrderService:
         order_id: str,
         reason: str,
         operator_telegram_user_id: str | int,
+        note: str | None = None,
         actor_kind: str = "admin",
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        audit_args = {"order_id": order_id, "reason_preview": (reason or "")[:80]}
+        audit_args = {
+            "order_id": order_id,
+            "reason_preview": (reason or "")[:80],
+            "has_note": bool((note or "").strip()),
+        }
         try:
-            order = self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id))
+            order = self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id), note=note)
         except ChaboError as exc:
             self.tool_calls.log_failure(
                 tool_name="reject_order_for_operator",
@@ -1992,6 +2011,7 @@ class OrderService:
         reason: str,
         operator_telegram_user_id: str | int,
         amount_cents: int | None = None,
+        note: str | None = None,
         actor_kind: str = "admin",
         session_id: str | None = None,
     ) -> dict[str, Any]:
@@ -1999,13 +2019,14 @@ class OrderService:
             "delivery_id": delivery_id,
             "amount_cents": amount_cents,
             "reason_preview": (reason or "")[:80],
+            "has_note": bool((note or "").strip()),
         }
         try:
             actor = self._operator_account_id(operator_telegram_user_id)
             if amount_cents is None:
-                delivery = self.refund_delivery(delivery_id, reason, actor)
+                delivery = self.refund_delivery(delivery_id, reason, actor, note=note)
             else:
-                delivery = self.refund_delivery_partial(delivery_id, amount_cents, reason, actor)
+                delivery = self.refund_delivery_partial(delivery_id, amount_cents, reason, actor, note=note)
         except ChaboError as exc:
             self.tool_calls.log_failure(
                 tool_name="refund_delivery_for_operator",
@@ -2037,7 +2058,13 @@ class OrderService:
                 raise NotFound(f"操作员账号不存在：{telegram_user_id}")
             return row["id"]
 
-    def approve_order(self, order_id: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def approve_order(
+        self,
+        order_id: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
             if order["status"] not in {"pending_review", "paused"}:
@@ -2052,10 +2079,18 @@ class OrderService:
                 (order_id,),
             )
             self._ensure_delivery(conn, order_id, order["scheduled_at"])
-            self._audit(conn, actor_account_id, "order_approved", "ad_order", order_id, {})
+            payload = _audit_payload_with_note({}, note)
+            self._audit(conn, actor_account_id, "order_approved", "ad_order", order_id, payload)
             return self.get_order(conn, order_id)
 
-    def reject_order(self, order_id: str, reason: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def reject_order(
+        self,
+        order_id: str,
+        reason: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
             if order["spent_cents"] > 0:
@@ -2082,14 +2117,22 @@ class OrderService:
                 (order_id,),
             )
             self._snapshot(conn, order_id, None, "order_rejected", {"reason": reason})
-            self._audit(conn, actor_account_id, "order_rejected", "ad_order", order_id, {"reason": reason})
+            payload = _audit_payload_with_note({"reason": reason}, note)
+            self._audit(conn, actor_account_id, "order_rejected", "ad_order", order_id, payload)
             return self.get_order(conn, order_id)
 
-    def refund_delivery(self, delivery_id: str, reason: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def refund_delivery(
+        self,
+        delivery_id: str,
+        reason: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             delivery = self._refundable_delivery(conn, delivery_id)
             refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
-            return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id)
+            return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id, note=note)
 
     def refund_delivery_partial(
         self,
@@ -2097,6 +2140,8 @@ class OrderService:
         amount_cents: int,
         reason: str,
         actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
     ) -> dict[str, Any]:
         if amount_cents <= 0:
             raise InvalidState("退款金额必须大于 0")
@@ -2105,7 +2150,7 @@ class OrderService:
             refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
             if amount_cents > refundable_cents:
                 raise InvalidState("退款金额超过该投放可退款余额")
-            return self._refund_delivery_locked(conn, delivery, reason, amount_cents, actor_account_id)
+            return self._refund_delivery_locked(conn, delivery, reason, amount_cents, actor_account_id, note=note)
 
     def _refundable_delivery(self, conn: sqlite3.Connection, delivery_id: str) -> sqlite3.Row:
         delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
@@ -2126,6 +2171,8 @@ class OrderService:
         reason: str,
         amount_cents: int,
         actor_account_id: str | None,
+        *,
+        note: str | None = None,
     ) -> dict[str, Any]:
         order = self.get_order(conn, delivery["order_id"])
         channel = conn.execute("SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)).fetchone()
@@ -2212,7 +2259,10 @@ class OrderService:
             "delivery_refunded" if full_refund else "delivery_partially_refunded",
             "delivery",
             delivery["id"],
-            {"reason": reason, "refund_cents": amount_cents, "full_refund": full_refund},
+            _audit_payload_with_note(
+                {"reason": reason, "refund_cents": amount_cents, "full_refund": full_refund},
+                note,
+            ),
         )
         return {
             "order": self.get_order(conn, order["id"]),
@@ -2519,6 +2569,7 @@ class DisputeService:
         dispute_id: str,
         resolution: str,
         actor_account_id: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             dispute = conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone()
@@ -2539,12 +2590,13 @@ class DisputeService:
                     "UPDATE deliveries SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'disputed'",
                     (dispute["delivery_id"],),
                 )
+            payload = _audit_payload_with_note({"resolution": resolution}, note)
             conn.execute(
                 """
                 INSERT INTO audit_logs (id, actor_account_id, action, entity_type, entity_id, payload_json)
                 VALUES (?, ?, 'dispute_resolved', 'dispute', ?, ?)
                 """,
-                (new_id("aud"), actor_account_id, dispute_id, json.dumps({"resolution": resolution}, ensure_ascii=False)),
+                (new_id("aud"), actor_account_id, dispute_id, json.dumps(payload, ensure_ascii=False)),
             )
             return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
 

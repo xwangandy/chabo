@@ -286,19 +286,165 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(start["type"], "channel_start")
         self.assertEqual(start["channel_id"], channel["id"])
         landing = self.gateway.private_messages[-1]
-        self.assertIn("频道招商", landing["text"])
-        self.assertIn("目标频道", landing["text"])
-        self.assertIn("📺 测试频道", landing["text"])
-        self.assertIn("先选插播位", landing["text"])
+        self.assertIn("给「测试频道」投放广告", landing["text"])
+        self.assertIn("展示：未选择", landing["text"])
+        self.assertIn("下一步：选择展示设置", landing["text"])
         button_texts = [button["text"] for row in landing["inline_keyboard"] for button in row]
-        self.assertIn("🔖 轻插播", button_texts)
-        self.assertIn("🖼 标准插播", button_texts)
+        self.assertIn("🧩 展示设置", button_texts)
+        self.assertIn("⏱ 发布设置", button_texts)
+        self.assertIn("📁 广告素材", button_texts)
+        self.assertIn("✅ 费用确认", button_texts)
         self.assertNotIn("🗂 广告库", button_texts)
         self.assertNotIn("💰 广告钱包", button_texts)
 
         with self.app.db.transaction() as conn:
             session = conn.execute("SELECT * FROM advertiser_sessions").fetchone()
         self.assertEqual(session["ref_channel_id"], channel["id"])
+
+    def test_channel_sales_entry_uses_placement_configurator(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("30")
+
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 1,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": f"/start ch_{channel['ref_token']}",
+                }
+            }
+        )
+        display = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_display",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:display",
+                }
+            }
+        )
+        slot = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_slot",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        pinned = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_pin",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:pin",
+                }
+            }
+        )
+        weekly = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_week",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:period:week",
+                }
+            }
+        )
+
+        self.assertEqual(display["type"], "callback_placement_display")
+        self.assertEqual(slot["type"], "callback_placement_slot")
+        self.assertEqual(pinned["type"], "callback_placement_pin")
+        self.assertEqual(weekly["type"], "callback_placement_period")
+        self.assertIn("展示：标准插播 + 置顶", self.gateway.private_messages[-1]["text"])
+        self.assertIn("发布：7 天循环", self.gateway.private_messages[-1]["text"])
+        self.assertIn("费用：预计 USD 126.00", self.gateway.private_messages[-1]["text"])
+
+    def test_placement_configurator_creates_order_without_manual_budget_step(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_create_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_create_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        new_creative = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_create_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:new:auto",
+                }
+            }
+        )
+        creative = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 51,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "这是通过投放配置器创建的标准插播广告",
+                }
+            }
+        )
+        url = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 52,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://placement.example",
+                }
+            }
+        )
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:submit",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (submit["order_id"],)).fetchone()
+            creative_row = conn.execute("SELECT * FROM creatives WHERE id = ?", (order["creative_id"],)).fetchone()
+            state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = '10001'").fetchone()
+
+        self.assertEqual(new_creative["type"], "callback_placement_new_creative")
+        self.assertEqual(creative["type"], "placement_creative_saved")
+        self.assertEqual(url["type"], "placement_url_saved")
+        self.assertEqual(submit["type"], "callback_placement_order_created")
+        self.assertEqual(order["status"], "approved")
+        self.assertEqual(order["budget_cents"], 1000)
+        self.assertEqual(order["unit_price_cents"], 1000)
+        self.assertEqual(creative_row["target_url"], "https://placement.example")
+        self.assertIsNone(state)
 
     def test_channel_management_syncs_latest_title_from_telegram(self) -> None:
         channel = self.bind_channel()
@@ -925,7 +1071,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(formats["type"], "callback_publisher_formats")
         self.assertEqual(toggled["type"], "callback_publisher_format_toggled")
         self.assertEqual(strong_policy["enabled"], 0)
-        self.assertIn("强插播", self.gateway.private_messages[-1]["text"])
+        self.assertIn("定制插播", self.gateway.private_messages[-1]["text"])
         self.assertNotIn("strong_post", self.gateway.private_messages[-1]["text"])
 
     def test_admin_reject_order_releases_reserved_budget(self) -> None:

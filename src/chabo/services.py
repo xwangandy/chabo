@@ -1337,7 +1337,7 @@ class OrderService:
                 (order_id,),
             )
             return
-        if slot["slot_type"] != "loop_daily":
+        if slot["slot_type"] != "loop_daily" and not order["end_at"]:
             return
         next_at = parse_iso(order["scheduled_at"]) + timedelta(days=1)
         if order["end_at"] and next_at > parse_iso(order["end_at"]):

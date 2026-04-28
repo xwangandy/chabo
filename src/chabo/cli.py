@@ -37,6 +37,17 @@ def cmd_init_db(args: argparse.Namespace) -> None:
     print(f"插播数据库已初始化：{settings.db_path}")
 
 
+def cmd_backup_db(args: argparse.Namespace) -> None:
+    settings = Settings.from_env()
+    target = args.target
+    if not target:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backups_dir = Path(settings.db_path).parent / "backups"
+        target = str(backups_dir / f"chabo-{timestamp}.sqlite3")
+    written_to = Database(settings.db_path).backup_to(target)
+    print_json({"source": settings.db_path, "backup": written_to})
+
+
 def cmd_topup(args: argparse.Namespace) -> None:
     app = create_app()
     account = app.ledger.manual_topup(
@@ -608,6 +619,10 @@ def _account_view(account: dict[str, Any]) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chabo", description="插播 Telegram 广告插播 MVP 管理工具")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("backup-db", help="把 SQLite 数据库备份到文件；不传 --target 时自动写到 <db_dir>/backups/chabo-YYYYMMDD-HHMMSS.sqlite3")
+    p.add_argument("--target", help="备份输出路径")
+    p.set_defaults(func=cmd_backup_db)
 
     p = sub.add_parser("init-db", help="初始化 SQLite 数据库")
     p.set_defaults(func=cmd_init_db)

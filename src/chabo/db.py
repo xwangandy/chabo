@@ -503,6 +503,22 @@ class Database:
             conn.executescript(SCHEMA)
             self._migrate(conn)
 
+    def backup_to(self, target_path: str) -> str:
+        """Dump the live SQLite DB to target_path using the online backup API.
+
+        Returns the absolute path of the written file. Safe to run while the
+        primary process is serving — SQLite holds locks long enough to
+        get a consistent snapshot but does not block writers for the full
+        duration of the copy.
+        """
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target.unlink()
+        with self.connect() as source, sqlite3.connect(str(target)) as backup:
+            source.backup(backup)
+        return str(target.resolve())
+
     def _migrate(self, conn: sqlite3.Connection) -> None:
         statements = [
             "ALTER TABLE price_offers ADD COLUMN budget_cents INTEGER",

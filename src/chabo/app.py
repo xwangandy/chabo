@@ -13,6 +13,7 @@ from .services import (
     DisputeService,
     LedgerService,
     LightProbeService,
+    MaterialService,
     OrderService,
     PriceOfferService,
     PricingService,
@@ -29,6 +30,7 @@ class ChaboApp:
     gateway: MessageGateway
     channels: ChannelService
     ledger: LedgerService
+    materials: MaterialService
     orders: OrderService
     disputes: DisputeService
     pricing: PricingService
@@ -54,6 +56,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         gateway=gateway,
         channels=ChannelService(db, settings),
         ledger=LedgerService(db, settings),
+        materials=MaterialService(db, settings),
         orders=OrderService(db, settings),
         disputes=DisputeService(db, settings),
         pricing=PricingService(db, settings),

@@ -340,16 +340,29 @@ def cmd_advertiser_report(args: argparse.Namespace) -> None:
 def cmd_batch_orders(args: argparse.Namespace) -> None:
     app = create_app()
     tokens = [token.strip() for token in args.channel_tokens.split(",") if token.strip()]
+    text = args.text
+    target_url = args.target_url
+    button_text = args.button_text
+    category = args.category
+    if args.material_id:
+        material = app.materials.get_material(
+            args.material_id,
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        )
+        text = material["text"]
+        target_url = material["target_url"]
+        button_text = material["button_text"]
+        category = material["category"]
     print_json(
         app.advertisers.create_batch_orders(
             advertiser_telegram_user_id=args.advertiser_telegram_user_id,
             channel_tokens=tokens,
             slot_type=args.slot_type,
-            text=args.text,
-            target_url=args.target_url,
+            text=text,
+            target_url=target_url,
             budget_cents=money_to_cents(args.budget),
-            button_text=args.button_text,
-            category=args.category,
+            button_text=button_text,
+            category=category,
         )
     )
 
@@ -370,12 +383,58 @@ def cmd_create_order(args: argparse.Namespace) -> None:
         budget_cents=money_to_cents(args.budget),
         button_text=args.button_text,
         category=args.category,
+        light_short_text=args.light_short_text,
+        material_id=args.material_id,
         scheduled_at=datetime.fromisoformat(args.scheduled_at) if args.scheduled_at else None,
         end_at=datetime.fromisoformat(args.end_at) if args.end_at else None,
         frequency_per_day=args.frequency_per_day,
         campaign_name=args.campaign_name,
     )
     print_json(order)
+
+
+def cmd_create_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.create_material(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        format_type=args.format_type,
+        text=args.text,
+        target_url=args.target_url,
+        button_text=args.button_text,
+        category=args.category,
+        light_short_text=args.light_short_text,
+        display_name=args.display_name,
+    )
+    print_json(material)
+
+
+def cmd_list_materials(args: argparse.Namespace) -> None:
+    app = create_app()
+    items = app.materials.list_materials(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        format_type=args.format_type,
+        include_archived=args.include_archived,
+        limit=args.limit,
+    )
+    print_json(items)
+
+
+def cmd_show_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.get_material(
+        args.material_id,
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+    )
+    print_json(material)
+
+
+def cmd_archive_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.archive_material(
+        args.material_id,
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+    )
+    print_json(material)
 
 
 def cmd_approve_order(args: argparse.Namespace) -> None:
@@ -720,8 +779,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-tokens", required=True, help="多个 ref_token，用逗号分隔")
     p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
-    p.add_argument("--text", required=True)
-    p.add_argument("--target-url", required=True)
+    p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
+    p.add_argument("--text", help="提供 --material-id 时无需传入")
+    p.add_argument("--target-url", help="提供 --material-id 时无需传入")
     p.add_argument("--budget", required=True, help="每个频道的预算")
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
@@ -738,16 +798,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-token", required=True)
     p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
-    p.add_argument("--text", required=True)
-    p.add_argument("--target-url", required=True)
+    p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
+    p.add_argument("--text", help="标准/定制插播文案；提供 --material-id 时无需传入")
+    p.add_argument("--target-url", help="提供 --material-id 时无需传入")
     p.add_argument("--budget", required=True)
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
+    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字），仅 light_tail 形态需要")
     p.add_argument("--scheduled-at", help="ISO 时间，默认立即")
     p.add_argument("--end-at", help="ISO 时间，循环插播可用")
     p.add_argument("--frequency-per-day", type=int, default=1)
     p.add_argument("--campaign-name", default="插播广告")
     p.set_defaults(func=cmd_create_order)
+
+    p = sub.add_parser("create-material", help="把广告素材保存到广告库")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument(
+        "--format-type",
+        required=True,
+        choices=["light_tail", "standard_card", "strong_post"],
+        help="文字插播=light_tail / 标准插播=standard_card / 定制插播=strong_post",
+    )
+    p.add_argument("--text", required=True, help="完整广告文案；文字插播时为详情页内容")
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--button-text", default="查看详情")
+    p.add_argument("--category", default="general")
+    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字）")
+    p.add_argument("--display-name", help="第一次出现广告主时使用的展示名")
+    p.set_defaults(func=cmd_create_material)
+
+    p = sub.add_parser("list-materials", help="列出广告主广告库里的素材")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--format-type", choices=["light_tail", "standard_card", "strong_post"])
+    p.add_argument("--include-archived", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_materials)
+
+    p = sub.add_parser("show-material", help="查看单条广告库素材")
+    p.add_argument("--material-id", required=True)
+    p.add_argument(
+        "--advertiser-telegram-user-id",
+        help="提供后会校验素材归属，避免越权读取",
+    )
+    p.set_defaults(func=cmd_show_material)
+
+    p = sub.add_parser("archive-material", help="把广告库里的素材归档；归档后不可再用于新订单")
+    p.add_argument("--material-id", required=True)
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.set_defaults(func=cmd_archive_material)
 
     p = sub.add_parser("approve-order", help="审核通过订单并创建首个投放任务")
     p.add_argument("--order-id", required=True)

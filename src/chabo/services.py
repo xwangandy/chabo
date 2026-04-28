@@ -1138,6 +1138,47 @@ class MaterialService:
             campaign_id=campaign_id,
         )
 
+    def list_materials_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str | None = None,
+        include_archived: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM creatives WHERE advertiser_account_id = ?"
+        params: list[Any] = [advertiser_account_id]
+        if format_type is not None:
+            sql += " AND format_type = ?"
+            params.append(self._normalize_format(format_type))
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
+        sql += " ORDER BY updated_at DESC, created_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def archive_material_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        material_id: str,
+        advertiser_account_id: str,
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            "SELECT * FROM creatives WHERE id = ?", (material_id,)
+        ).fetchone()
+        if not row or row["advertiser_account_id"] != advertiser_account_id:
+            raise NotFound(f"广告素材不存在：{material_id}")
+        if row["archived_at"]:
+            return dict(row)
+        conn.execute(
+            "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (iso(), material_id),
+        )
+        return self._fetch_material(conn, material_id)
+
     def ensure_library_campaign(
         self, conn: sqlite3.Connection, advertiser_account_id: str
     ) -> str:

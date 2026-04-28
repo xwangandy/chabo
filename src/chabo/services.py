@@ -2294,6 +2294,134 @@ class AdvertiserSubscriptionService:
         )
 
 
+class SelfPromoService:
+    """Channel owners' free self-publishing entry — same 3-button layout as
+    paid placements, but no money moves and no advertiser/order is created.
+
+    Each publish is recorded so the 查看详情 deep link (start=sp_<id>) can
+    render the full ad page later, and so dashboards can audit the channel's
+    self-promo history.
+    """
+
+    PUBLISHABLE_FORMATS = {"standard_card", "strong_post"}
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+        self.channels = ChannelService(db, settings)
+
+    def list_publishable_materials(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT * FROM creatives
+                WHERE advertiser_account_id = ?
+                  AND archived_at IS NULL
+                  AND format_type IN ('standard_card', 'strong_post')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 20
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_self_promo(self, self_promo_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"自用发布记录不存在：{self_promo_id}")
+            return dict(row)
+
+    def prepare_publish(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        material_id: str,
+    ) -> dict[str, Any]:
+        """Create a pending self-promo row and return all data needed to send.
+
+        The actual `gateway.send_ad` call happens outside the DB transaction;
+        the caller writes the resulting message_id back via mark_sent /
+        mark_failed.
+        """
+        with self.db.transaction() as conn:
+            channel = self.channels.get_channel(conn, channel_id)
+            publisher = conn.execute(
+                "SELECT * FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not publisher or publisher["id"] != channel["owner_account_id"]:
+                raise NotFound(f"频道不属于该用户：{channel_id}")
+            material = conn.execute(
+                "SELECT * FROM creatives WHERE id = ?", (material_id,)
+            ).fetchone()
+            if not material or material["advertiser_account_id"] != publisher["id"]:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            if material["archived_at"]:
+                raise InvalidState("广告素材已归档，无法用于自用发布")
+            if material["format_type"] not in self.PUBLISHABLE_FORMATS:
+                raise InvalidState("自用发布暂只支持标准插播或定制插播素材")
+            self_promo_id = new_id("sp")
+            conn.execute(
+                """
+                INSERT INTO self_promo_publishes (
+                    id, channel_id, creative_id, publisher_account_id, status
+                )
+                VALUES (?, ?, ?, ?, 'pending')
+                """,
+                (self_promo_id, channel["id"], material["id"], publisher["id"]),
+            )
+            return {
+                "self_promo_id": self_promo_id,
+                "channel": dict(channel),
+                "material": dict(material),
+            }
+
+    def mark_sent(self, self_promo_id: str, *, message_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE self_promo_publishes
+                SET status = 'sent', message_id = ?, sent_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (message_id, iso(), self_promo_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            return dict(row)
+
+    def mark_failed(self, self_promo_id: str, *, error: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE self_promo_publishes
+                SET status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, self_promo_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            return dict(row)
+
+
 class StarsPaymentService:
     CURRENCY = "XTR"
 

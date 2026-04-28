@@ -17,6 +17,7 @@ from .services import (
     OrderService,
     PriceOfferService,
     PricingService,
+    SelfPromoService,
     StarsPaymentService,
     SubscriptionService,
 )
@@ -38,6 +39,7 @@ class ChaboApp:
     subscriptions: SubscriptionService
     stars_payments: StarsPaymentService
     light_probes: LightProbeService
+    self_promos: SelfPromoService
     advertiser_subscriptions: AdvertiserSubscriptionService
     advertisers: AdvertiserService
     fulfillment: FulfillmentService
@@ -64,6 +66,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         subscriptions=SubscriptionService(db, settings),
         stars_payments=StarsPaymentService(db, settings),
         light_probes=LightProbeService(db, settings),
+        self_promos=SelfPromoService(db, settings),
         advertiser_subscriptions=AdvertiserSubscriptionService(db, settings),
         advertisers=AdvertiserService(db, settings),
         fulfillment=FulfillmentService(db, settings, gateway),

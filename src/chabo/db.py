@@ -421,6 +421,22 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS self_promo_publishes (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    creative_id TEXT NOT NULL REFERENCES creatives(id),
+    publisher_account_id TEXT NOT NULL REFERENCES accounts(id),
+    message_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (status IN ('pending', 'sent', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_promo_channel ON self_promo_publishes(channel_id, created_at);
+
 CREATE TABLE IF NOT EXISTS bot_conversation_states (
     chat_id TEXT PRIMARY KEY,
     account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,

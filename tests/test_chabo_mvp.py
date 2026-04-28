@@ -2318,6 +2318,103 @@ class ChaboMvpTest(unittest.TestCase):
         kinds = {event["kind"] for event in timeline}
         self.assertEqual(kinds, {"操作", "证据"})
 
+    def test_topup_approval_two_person_flow_moves_money_only_after_approve(self) -> None:
+        # Make sure two distinct operator accounts exist
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=10001,
+            amount_cents=money_to_cents("12.34"),
+            reason="OTC 收到 USDT 12.34，转入插播余额",
+            requester_telegram_user_id=33333,
+            evidence_url="https://evidence.example/screenshot.png",
+        )
+        # Pending request must NOT have moved money yet
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertIsNone(row)  # recipient account does not exist yet
+
+        # Same-actor approval must be rejected — two-person rule
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.approve_topup(
+                request_id=request["id"],
+                approver_telegram_user_id=33333,
+            )
+        # Approved by a different operator → ledger moves
+        approved = self.app.topup_approvals.approve_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="对账已核",
+        )
+        self.assertEqual(approved["status"], "approved")
+        with self.app.db.transaction() as conn:
+            recipient = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertEqual(recipient["available_balance_cents"], 1234)
+
+        # Re-approving the same request must fail
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.approve_topup(
+                request_id=request["id"],
+                approver_telegram_user_id=44444,
+            )
+
+    def test_topup_approval_reject_path_blocks_money_and_logs(self) -> None:
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=20001,
+            amount_cents=money_to_cents("99.00"),
+            reason="疑似重复入账",
+            requester_telegram_user_id=33333,
+        )
+        rejected = self.app.topup_approvals.reject_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="申请人金额对不上凭证",
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        # Recipient (20001) account was never created — no money moved
+        with self.app.db.transaction() as conn:
+            recipient = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '20001'"
+            ).fetchone()
+        self.assertIsNone(recipient)
+
+        # Reject log lands in tool_call_logs as success (the action succeeded)
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=44444, tool_name="topup_reject"
+        )
+        self.assertEqual(logs[0]["result_status"], "success")
+
+    def test_topup_request_validates_amount_and_reason(self) -> None:
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=0,
+                reason="x",
+                requester_telegram_user_id=33333,
+            )
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=money_to_cents("1.00"),
+                reason="   ",
+                requester_telegram_user_id=33333,
+            )
+        with self.assertRaises(NotFound):
+            # Requester account does not exist
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=money_to_cents("1.00"),
+                reason="ok",
+                requester_telegram_user_id=99999,
+            )
+
     def test_database_backup_writes_a_consistent_snapshot(self) -> None:
         # Seed some state, then back up
         self.bind_channel()

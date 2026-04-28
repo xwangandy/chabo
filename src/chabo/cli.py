@@ -448,6 +448,49 @@ def cmd_archive_material(args: argparse.Namespace) -> None:
     print_json(material)
 
 
+def cmd_request_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.request_topup(
+            recipient_telegram_user_id=args.recipient_telegram_user_id,
+            amount_cents=money_to_cents(args.amount),
+            reason=args.reason,
+            requester_telegram_user_id=args.requester_telegram_user_id,
+            evidence_url=args.evidence_url,
+            request_note=args.note,
+        )
+    )
+
+
+def cmd_approve_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.approve_topup(
+            request_id=args.request_id,
+            approver_telegram_user_id=args.approver_telegram_user_id,
+            approval_note=args.note,
+        )
+    )
+
+
+def cmd_reject_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.reject_topup(
+            request_id=args.request_id,
+            approver_telegram_user_id=args.approver_telegram_user_id,
+            approval_note=args.note,
+        )
+    )
+
+
+def cmd_list_topup_requests(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.list_requests(status=args.status, limit=args.limit)
+    )
+
+
 def cmd_list_tool_calls(args: argparse.Namespace) -> None:
     app = create_app()
     print_json(
@@ -890,6 +933,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--material-id", required=True)
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.set_defaults(func=cmd_archive_material)
+
+    p = sub.add_parser("request-topup", help="提交人工入账请求（双人复核第一步）")
+    p.add_argument("--recipient-telegram-user-id", required=True, help="收款方 Telegram 用户 ID")
+    p.add_argument("--amount", required=True, help="美元金额，例如 50.00")
+    p.add_argument("--reason", required=True, help="入账原因 / 凭证摘要")
+    p.add_argument("--requester-telegram-user-id", required=True, help="申请人 Telegram 用户 ID")
+    p.add_argument("--evidence-url", help="链外凭证 URL（截图、对账单等）")
+    p.add_argument("--note", help="申请备注")
+    p.set_defaults(func=cmd_request_topup)
+
+    p = sub.add_parser("approve-topup", help="审批入账请求；审批人必须与申请人是不同账号")
+    p.add_argument("--request-id", required=True)
+    p.add_argument("--approver-telegram-user-id", required=True)
+    p.add_argument("--note", help="审批备注")
+    p.set_defaults(func=cmd_approve_topup)
+
+    p = sub.add_parser("reject-topup", help="拒绝入账请求；不会动账本")
+    p.add_argument("--request-id", required=True)
+    p.add_argument("--approver-telegram-user-id", required=True)
+    p.add_argument("--note", help="拒绝备注")
+    p.set_defaults(func=cmd_reject_topup)
+
+    p = sub.add_parser("list-topup-requests", help="查看入账请求列表")
+    p.add_argument("--status", choices=["pending", "approved", "rejected"])
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_topup_requests)
 
     p = sub.add_parser("list-tool-calls", help="查看 AI / 运营工具调用审计日志")
     p.add_argument("--actor-telegram-user-id", help="按操作者 Telegram 用户 ID 过滤")

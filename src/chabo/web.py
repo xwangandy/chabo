@@ -170,6 +170,13 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_html(self._render_detail("争议详情", detail, parsed.query))
             return
+        if parsed.path == "/admin/topups":
+            if not self._require_admin(parsed.query):
+                return
+            params = parse_qs(parsed.query)
+            status = params.get("status", [None])[0]
+            self._send_json({"topup_requests": self.server.app.topup_approvals.list_requests(status=status, limit=50)})
+            return
         if parsed.path == "/admin/deliveries":
             if not self._require_admin(parsed.query):
                 return
@@ -256,6 +263,18 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 resolution=_str_value(data, "resolution", "运营裁决通过"),
                 note=note,
             )
+        if len(parts) == 4 and parts[0] == "admin" and parts[1] == "topups" and parts[3] == "approve":
+            return self.server.app.topup_approvals.approve_topup(
+                request_id=parts[2],
+                approver_telegram_user_id=_str_value(data, "approver_telegram_user_id", ""),
+                approval_note=note,
+            )
+        if len(parts) == 4 and parts[0] == "admin" and parts[1] == "topups" and parts[3] == "reject":
+            return self.server.app.topup_approvals.reject_topup(
+                request_id=parts[2],
+                approver_telegram_user_id=_str_value(data, "approver_telegram_user_id", ""),
+                approval_note=note,
+            )
         raise ValueError(f"unknown admin action: {path}")
 
     def _render_admin(self, query: str) -> str:
@@ -265,6 +284,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         orders = self._list_orders(status=order_status, limit=20)
         deliveries = self._list_deliveries(status=None, limit=20)
         disputes = self.server.app.disputes.list_disputes(status=None, limit=20)
+        topup_requests = self.server.app.topup_approvals.list_requests(status="pending", limit=20)
         summary = self._ops_summary()
         rows = [
             "<!doctype html><html><head><meta charset='utf-8'><title>插播运营后台</title>",
@@ -288,6 +308,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             self._summary_card("到期未发", summary["scheduled_due"], alert=summary["scheduled_due"] > 0),
             self._summary_card("Open 争议", summary["open_disputes"], alert=summary["open_disputes"] > 0),
             self._summary_card("近 24h 失败", summary["failed_recent"], alert=summary["failed_recent"] > 0),
+            self._summary_card("待审入账", summary["pending_topups"], alert=summary["pending_topups"] > 0),
             "</div>",
             "<div class='bar'>",
             f"<a href='/admin{token_query}'>全部</a> ",
@@ -296,6 +317,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             self._form("/admin/dispatch-due", token_query, "<input name='limit' value='20' size='4'><button>调度到期插播</button>"),
             self._form("/admin/confirm-earnings", token_query, "<input name='observation_hours' value='24' size='4'><button>确认到期收益</button>"),
             "</div>",
+            "<h2>待审入账</h2>",
+            self._topup_requests_table(topup_requests, token_query),
             "<h2>插播订单</h2>",
             self._orders_table(orders, token_query),
             "<h2>投放记录</h2>",
@@ -361,6 +384,45 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 f"<td>{_e(delivery.get('message_id') or '')}</td>"
                 f"<td>{_money(delivery['charge_cents'])}<br>已退 {_money(delivery['refunded_cents'])}</td>"
                 f"<td>{action_cell}</td>"
+                "</tr>"
+            )
+        return head + "".join(rows) + "</table>"
+
+    def _topup_requests_table(self, requests: list[dict[str, Any]], token_query: str) -> str:
+        if not requests:
+            return "<p class='muted'>没有待审的入账请求。</p>"
+        head = (
+            "<table><tr><th>请求</th><th>收款方</th><th>金额</th><th>原因</th>"
+            "<th>申请人 / 凭证</th><th>动作（审批人 ≠ 申请人）</th></tr>"
+        )
+        rows = []
+        for request in requests:
+            actions = self._form(
+                f"/admin/topups/{request['id']}/approve",
+                token_query,
+                "<input name='approver_telegram_user_id' placeholder='审批人 TG ID' size='12'>"
+                "<input name='note' placeholder='备注（可空）' size='14'>"
+                "<button>通过并入账</button>",
+            )
+            actions += self._form(
+                f"/admin/topups/{request['id']}/reject",
+                token_query,
+                "<input name='approver_telegram_user_id' placeholder='审批人 TG ID' size='12'>"
+                "<input name='note' placeholder='备注（可空）' size='14'>"
+                "<button>拒绝</button>",
+            )
+            evidence_html = (
+                f"<a href='{_e(request['evidence_url'])}' target='_blank'>凭证</a>"
+                if request.get("evidence_url") else "<span class='muted'>无凭证</span>"
+            )
+            rows.append(
+                "<tr>"
+                f"<td>{_e(request['id'])}<br><span class='muted'>{_e(request['created_at'])}</span></td>"
+                f"<td>{_e(request['recipient_telegram_user_id'])}</td>"
+                f"<td>{request['currency']} {_money(request['amount_cents'])}</td>"
+                f"<td>{_e(request['reason'])}</td>"
+                f"<td>{_e(request['requester_account_id'])}<br>{evidence_html}</td>"
+                f"<td>{actions}</td>"
                 "</tr>"
             )
         return head + "".join(rows) + "</table>"
@@ -545,6 +607,9 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'scheduled' "
                 "AND scheduled_at <= datetime('now')"
             ).fetchone()["n"]
+            pending_topups = conn.execute(
+                "SELECT COUNT(*) AS n FROM topup_requests WHERE status = 'pending'"
+            ).fetchone()["n"]
         return {
             "pending_review_orders": pending_review,
             "running_orders": running_orders,
@@ -552,6 +617,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             "open_disputes": open_disputes,
             "failed_recent": failed_recent,
             "scheduled_due": scheduled_due,
+            "pending_topups": pending_topups,
         }
 
     def _build_health_payload(self) -> dict[str, Any]:

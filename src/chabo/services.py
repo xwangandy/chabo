@@ -884,6 +884,25 @@ class ChannelService:
             ).fetchone()
             return dict(row)
 
+    def set_daily_ad_limit(self, channel_id: str, daily_ad_limit: int) -> dict[str, Any]:
+        if daily_ad_limit < 1 or daily_ad_limit > 24:
+            raise InvalidState("每日广告条数需要在 1 到 24 之间")
+        with self.db.transaction() as conn:
+            self.get_channel(conn, channel_id)
+            conn.execute(
+                """
+                UPDATE channel_configs
+                SET daily_ad_limit = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE channel_id = ?
+                """,
+                (daily_ad_limit, channel_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM channel_configs WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            return dict(row)
+
     def update_rate(self, channel_id: str, slot_type: str, unit_price_cents: int) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
         with self.db.transaction() as conn:

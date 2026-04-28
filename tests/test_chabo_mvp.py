@@ -2207,6 +2207,146 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
 
+    def _grant_publisher_access(self, channel: dict, telegram_user_id: int = 20001) -> None:
+        """Wire FakeGateway so the publisher passes the get_chat_member check."""
+        self.gateway.chat_members[(str(channel["telegram_chat_id"]), str(telegram_user_id))] = {
+            "status": "creator",
+            "can_post_messages": True,
+            "can_edit_messages": True,
+            "can_pin_messages": True,
+        }
+
+    def _publisher_callback(self, data: str, *, telegram_user_id: int = 20001, cb_id: str = "cb_pub") -> dict:
+        return self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": cb_id,
+                    "from": {"id": telegram_user_id, "first_name": "频道主"},
+                    "message": {"chat": {"id": telegram_user_id}},
+                    "data": data,
+                }
+            }
+        )
+
+    def test_publisher_channel_dashboard_renders_status_card_and_grid(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Generate one delivery so today_ads = 1 and pending earnings > 0
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="测试投放",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback(f"pub:channel:{channel['ref_token']}")
+        self.assertEqual(result["type"], "callback_publisher_channel")
+        message = self.gateway.private_messages[-1]
+        text = message["text"]
+        self.assertIn("今日广告：1 / 3", text)
+        self.assertIn("可投形态：", text)
+        self.assertIn("当前档位：中档", text)
+        self.assertIn("待确认收益：USD", text)
+
+        button_texts = [b["text"] for row in message["inline_keyboard"] for b in row]
+        for label in [
+            "⚙️ 接广告设置",
+            "💵 价格档位",
+            "🧩 展示形态",
+            "⏱ 频控时间",
+            "🪧 自用发布",
+            "📊 数据",
+            "💸 收益明细",
+        ]:
+            self.assertIn(label, button_texts)
+
+    def test_publisher_band_picker_switches_owner_price_band(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        # Open picker
+        result = self._publisher_callback(f"pub:band:{channel['ref_token']}", cb_id="cb_band_open")
+        self.assertEqual(result["type"], "callback_publisher_band_picker")
+        self.assertIn("中档 1.0x", self.gateway.private_messages[-1]["text"])
+
+        # Switch standard_card to high
+        switch = self._publisher_callback(
+            f"pub:band:set:{channel['ref_token']}:standard_card:high",
+            cb_id="cb_band_high",
+        )
+        self.assertEqual(switch["type"], "callback_publisher_band_set")
+
+        with self.app.db.transaction() as conn:
+            policy = conn.execute(
+                "SELECT owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = 'standard_card'",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(policy["owner_price_band"], "high")
+        self.assertIn("高档 1.25x", self.gateway.private_messages[-1]["text"])
+
+    def test_publisher_limit_panel_adjusts_daily_limit(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        result = self._publisher_callback(f"pub:limit:{channel['ref_token']}", cb_id="cb_limit_open")
+        self.assertEqual(result["type"], "callback_publisher_limit_panel")
+        self.assertIn("每日最多：3 条", self.gateway.private_messages[-1]["text"])
+
+        bumped = self._publisher_callback(f"pub:limit:set:{channel['ref_token']}:5", cb_id="cb_limit_5")
+        self.assertEqual(bumped["type"], "callback_publisher_limit_set")
+        self.assertIn("每日最多：5 条", self.gateway.private_messages[-1]["text"])
+
+        with self.app.db.transaction() as conn:
+            cfg = conn.execute(
+                "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(cfg["daily_ad_limit"], 5)
+
+    def test_publisher_channel_earnings_shows_channel_scoped_total(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="测试投放",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback(f"pub:earnings:{channel['ref_token']}", cb_id="cb_earn")
+        self.assertEqual(result["type"], "callback_publisher_channel_earnings")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("收益明细", text)
+        self.assertIn(channel["title"], text)
+        self.assertIn("待确认", text)
+        self.assertIn("已确认", text)
+        self.assertIn("平台已收", text)
+
     def test_view_detail_deep_link_renders_full_ad_page(self) -> None:
         channel = self.bind_channel()
         self.topup_advertiser("10")

@@ -345,6 +345,40 @@ class UpdateHandler:
             channel_identifier, slot_type = rest.rsplit(":", 1)
             self._toggle_publisher_format(chat_id, user, channel_identifier, slot_type, message)
             return {"handled": True, "type": "callback_publisher_format_toggled", "channel": channel_identifier, "slot_type": slot_type}
+        if data.startswith("pub:approval:"):
+            channel_identifier = data.removeprefix("pub:approval:")
+            self._send_publisher_approval_settings(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_approval", "channel": channel_identifier}
+        if data.startswith("pub:band:set:"):
+            rest = data.removeprefix("pub:band:set:")
+            channel_identifier, format_type, band = rest.rsplit(":", 2)
+            self._set_publisher_band(chat_id, user, channel_identifier, format_type, band, message)
+            return {"handled": True, "type": "callback_publisher_band_set", "channel": channel_identifier, "format_type": format_type, "band": band}
+        if data.startswith("pub:band:"):
+            channel_identifier = data.removeprefix("pub:band:")
+            self._send_publisher_band_picker(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_band_picker", "channel": channel_identifier}
+        if data.startswith("pub:limit:set:"):
+            rest = data.removeprefix("pub:limit:set:")
+            channel_identifier, limit_str = rest.rsplit(":", 1)
+            self._set_publisher_daily_limit(chat_id, user, channel_identifier, int(limit_str), message)
+            return {"handled": True, "type": "callback_publisher_limit_set", "channel": channel_identifier, "limit": int(limit_str)}
+        if data.startswith("pub:limit:"):
+            channel_identifier = data.removeprefix("pub:limit:")
+            self._send_publisher_limit_panel(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_limit_panel", "channel": channel_identifier}
+        if data.startswith("pub:self:"):
+            channel_identifier = data.removeprefix("pub:self:")
+            self._send_publisher_self_promo_panel(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_self_promo", "channel": channel_identifier}
+        if data.startswith("pub:stats:"):
+            channel_identifier = data.removeprefix("pub:stats:")
+            self._send_publisher_channel_stats(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_channel_stats", "channel": channel_identifier}
+        if data.startswith("pub:earnings:"):
+            channel_identifier = data.removeprefix("pub:earnings:")
+            self._send_publisher_channel_earnings(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_channel_earnings", "channel": channel_identifier}
         if data.startswith("channel:quote:"):
             channel_id = data.removeprefix("channel:quote:")
             self._send_channel_quote(chat_id, channel_id, message)
@@ -1167,6 +1201,7 @@ class UpdateHandler:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             channel = self._sync_channel_profile_conn(conn, self._find_channel(conn, channel_identifier))
+            stats = self._channel_dashboard_stats(conn, channel["id"])
         channels = self._publisher_channels_for_user(user_id, self._display_name(user))
         if not any(row["id"] == channel["id"] for row in channels):
             self._reply_or_edit(
@@ -1177,31 +1212,70 @@ class UpdateHandler:
             )
             return
         permission = self._check_channel_permissions(channel["telegram_chat_id"], user_id)
-        rates = self._channel_rates(channel["id"])
-        admin_count = self._channel_admin_count(channel["id"])
-        ready = "✅ 可接广告" if permission["ok"] else "⚠️ 待补权限"
+        ready = "✅ 可接广告" if permission["ok"] and stats["enabled_formats"] else "⚠️ 待补权限/形态"
+        formats_label = "、".join(self._slot_name(f) for f in stats["enabled_formats"]) or "未开启"
         lines = [
             f"📺 {channel['title']}",
             "",
             f"状态：{ready}",
             f"权限：{self._permission_summary(permission)}",
-            f"管理员：{admin_count} 位",
-            "",
-            "💵 当前价",
-            *self._rate_lines(rates),
-            "",
-            f"🔗 {self.channels.start_url(channel)}",
+            f"今日广告：{stats['today_ads']} / {stats['daily_limit']}",
+            f"可投形态：{formats_label}",
+            f"当前档位：{self._price_band_summary(stats['price_bands'])}",
+            f"待确认收益：USD {cents_to_money(stats['pending_earnings_cents'])}",
         ]
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join(lines),
             inline_keyboard=[
-                [{"text": "⚙️ 广告形态", "callback_data": f"pub:formats:{channel['ref_token']}"}],
-                [{"text": "💵 价格", "callback_data": f"channel:quote:{channel['id']}"}, {"text": "🔄 检查权限", "callback_data": f"pub:refresh:{channel['ref_token']}"}],
-                [{"text": "💸 收益", "callback_data": "publisher:earnings"}, {"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}],
+                [{"text": "⚙️ 接广告设置", "callback_data": f"pub:approval:{channel['ref_token']}"}, {"text": "💵 价格档位", "callback_data": f"pub:band:{channel['ref_token']}"}],
+                [{"text": "🧩 展示形态", "callback_data": f"pub:formats:{channel['ref_token']}"}, {"text": "⏱ 频控时间", "callback_data": f"pub:limit:{channel['ref_token']}"}],
+                [{"text": "🪧 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}, {"text": "📊 数据", "callback_data": f"pub:stats:{channel['ref_token']}"}],
+                [{"text": "💸 收益明细", "callback_data": f"pub:earnings:{channel['ref_token']}"}, {"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}],
             ],
         )
+
+    def _channel_dashboard_stats(self, conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
+        config = conn.execute(
+            "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        daily_limit = config["daily_ad_limit"] if config else 3
+        today_ads = conn.execute(
+            "SELECT COUNT(*) AS n FROM deliveries WHERE channel_id = ? AND status IN ('sent', 'confirmed') AND DATE(sent_at) = DATE('now')",
+            (channel_id,),
+        ).fetchone()["n"]
+        policies = conn.execute(
+            "SELECT format_type, enabled, owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? ORDER BY format_type",
+            (channel_id,),
+        ).fetchall()
+        enabled_formats = [row["format_type"] for row in policies if row["enabled"]]
+        price_bands = [row["owner_price_band"] for row in policies if row["enabled"]] or [row["owner_price_band"] for row in policies]
+        pending = conn.execute(
+            """
+            SELECT COALESCE(SUM(d.publisher_net_cents - d.publisher_reversed_cents), 0) AS total
+            FROM deliveries d
+            WHERE d.channel_id = ? AND d.status IN ('sent', 'confirmed')
+            """,
+            (channel_id,),
+        ).fetchone()["total"]
+        return {
+            "daily_limit": daily_limit,
+            "today_ads": today_ads,
+            "enabled_formats": enabled_formats,
+            "price_bands": price_bands,
+            "pending_earnings_cents": pending,
+        }
+
+    def _price_band_summary(self, bands: list[str]) -> str:
+        labels = {"low": "低档", "medium": "中档", "high": "高档", "custom": "自定义"}
+        if not bands:
+            return "未设置"
+        unique = list(dict.fromkeys(bands))
+        if len(unique) == 1:
+            return labels.get(unique[0], unique[0])
+        return "混合（" + " / ".join(labels.get(b, b) for b in unique) + "）"
 
     def _refresh_publisher_channel(
         self,
@@ -1965,6 +2039,306 @@ class UpdateHandler:
             )
             return
         self._send_publisher_formats(chat_id, user, channel["ref_token"], source_message)
+
+    def _resolve_publisher_channel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            channel = self._find_channel(conn, channel_identifier)
+        if not self._user_can_manage_channel(user.get("id") or chat_id, channel):
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 未确认你是该频道管理员。",
+                inline_keyboard=[[{"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}]],
+            )
+            return None
+        return channel
+
+    def _send_publisher_approval_settings(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"⚙️ 接广告设置\n\n频道：{channel['title']}\n\n"
+                "默认：规则内自动接单。\n\n"
+                "需要人工确认的订单：\n"
+                "· 定制插播\n"
+                "· 高风险类目\n"
+                "· 超出当日频控\n\n"
+                "其余订单按当前展示形态、价格档位和频控自动接单。"
+            ),
+            inline_keyboard=[
+                [{"text": "🧩 展示形态", "callback_data": f"pub:formats:{channel['ref_token']}"}, {"text": "💵 价格档位", "callback_data": f"pub:band:{channel['ref_token']}"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
+        )
+
+    def _send_publisher_band_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            policies = conn.execute(
+                """
+                SELECT format_type, owner_price_band, enabled
+                FROM channel_ad_format_policies
+                WHERE channel_id = ?
+                  AND format_type IN ('light_tail', 'standard_card', 'strong_post')
+                ORDER BY format_type
+                """,
+                (channel["id"],),
+            ).fetchall()
+        labels = {"low": "低档 0.85x", "medium": "中档 1.0x", "high": "高档 1.25x"}
+        lines = [f"💵 价格档位\n\n频道：{channel['title']}", ""]
+        keyboard: list[list[dict[str, str]]] = []
+        for policy in policies:
+            current = policy["owner_price_band"] if policy["owner_price_band"] in labels else "medium"
+            status = "✅" if policy["enabled"] else "⛔"
+            lines.append(f"{status} {self._slot_name(policy['format_type'])}：{labels.get(current, current)}")
+            row: list[dict[str, str]] = []
+            for band in ("low", "medium", "high"):
+                marker = "✅ " if current == band else ""
+                row.append(
+                    {
+                        "text": f"{marker}{labels[band].split(' ')[0]}",
+                        "callback_data": f"pub:band:set:{channel['ref_token']}:{policy['format_type']}:{band}",
+                    }
+                )
+            keyboard.append(row)
+        keyboard.append([{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _set_publisher_band(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        format_type: str,
+        band: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        if band not in {"low", "medium", "high"}:
+            self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+            return
+        with self.db.transaction() as conn:
+            policy = conn.execute(
+                "SELECT * FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = ?",
+                (channel["id"], self.channels.normalize_slot_type(format_type)),
+            ).fetchone()
+        if not policy:
+            self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+            return
+        try:
+            self.channels.set_format_policy(
+                channel["id"],
+                format_type,
+                enabled=bool(policy["enabled"]),
+                owner_price_band=band,
+                platform_promo_enabled=bool(policy["platform_promo_enabled"]),
+                custom_multiplier_bps=policy["custom_multiplier_bps"],
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法修改：{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+            )
+            return
+        self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+
+    def _send_publisher_limit_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            config = conn.execute(
+                "SELECT daily_ad_limit, allowed_start_hour, allowed_end_hour FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+        limit = config["daily_ad_limit"] if config else 3
+        start = config["allowed_start_hour"] if config else 9
+        end = config["allowed_end_hour"] if config else 23
+        text = (
+            f"⏱ 频控时间\n\n频道：{channel['title']}\n\n"
+            f"每日最多：{limit} 条\n"
+            f"可投时间：{start:02d}:00 — {end:02d}:00\n\n"
+            "调整每日上限："
+        )
+        adjust_row: list[dict[str, str]] = []
+        for option in (1, 2, 3, 5, 10):
+            marker = "✅ " if option == limit else ""
+            adjust_row.append(
+                {
+                    "text": f"{marker}{option}",
+                    "callback_data": f"pub:limit:set:{channel['ref_token']}:{option}",
+                }
+            )
+        keyboard = [
+            adjust_row,
+            [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+        ]
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=keyboard,
+        )
+
+    def _set_publisher_daily_limit(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        limit: int,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        try:
+            self.channels.set_daily_ad_limit(channel["id"], limit)
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法修改：{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+            )
+            return
+        self._send_publisher_limit_panel(chat_id, user, channel["ref_token"], source_message)
+
+    def _send_publisher_self_promo_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"🪧 自用发布\n\n频道：{channel['title']}\n\n"
+                "用插播给自己的频道发运营内容或自用广告。\n"
+                "自用发布不扣广告费，但会保留插播增长入口。\n\n"
+                "（即将上线，先在 Bot 投放配置器里走标准插播流程。）"
+            ),
+            inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+        )
+
+    def _send_publisher_channel_stats(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            stats = self._channel_dashboard_stats(conn, channel["id"])
+            totals = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS sent_total,
+                    COALESCE(SUM(CASE WHEN sent_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END), 0) AS sent_week,
+                    COALESCE(SUM(charge_cents), 0) AS gross_total
+                FROM deliveries
+                WHERE channel_id = ? AND status IN ('sent', 'confirmed')
+                """,
+                (channel["id"],),
+            ).fetchone()
+        text = (
+            f"📊 数据\n\n频道：{channel['title']}\n\n"
+            f"今日已发：{stats['today_ads']} / {stats['daily_limit']}\n"
+            f"近 7 天发布：{totals['sent_week']} 条\n"
+            f"累计发布：{totals['sent_total']} 条\n"
+            f"累计成交：USD {cents_to_money(totals['gross_total'])}\n"
+            f"待确认收益：USD {cents_to_money(stats['pending_earnings_cents'])}"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+        )
+
+    def _send_publisher_channel_earnings(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'sent' THEN publisher_net_cents - publisher_reversed_cents ELSE 0 END), 0) AS pending,
+                    COALESCE(SUM(CASE WHEN status = 'confirmed' THEN publisher_net_cents - publisher_reversed_cents ELSE 0 END), 0) AS confirmed,
+                    COALESCE(SUM(platform_fee_cents - platform_fee_reversed_cents), 0) AS platform_fee
+                FROM deliveries
+                WHERE channel_id = ?
+                """,
+                (channel["id"],),
+            ).fetchone()
+        text = (
+            f"💸 收益明细\n\n频道：{channel['title']}\n\n"
+            f"⏳ 待确认：USD {cents_to_money(row['pending'])}\n"
+            f"✅ 已确认：USD {cents_to_money(row['confirmed'])}\n"
+            f"📊 平台已收：USD {cents_to_money(row['platform_fee'])}"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[
+                [{"text": "💸 我的全部收益", "callback_data": "publisher:earnings"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
+        )
 
     def _start_order_flow(self, chat_id: str | int, user: dict[str, Any], channel_id: str, source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id

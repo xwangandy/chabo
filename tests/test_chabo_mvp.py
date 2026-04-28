@@ -2012,6 +2012,190 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual([m["id"] for m in listed], [order["creative_id"]])
         self.assertEqual(listed[0]["format_type"], "standard_card")
 
+    def test_placement_creative_panel_filters_by_format_and_skips_archived(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准素材-A",
+            target_url="https://example.com/a",
+        )
+        self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制素材-不该出现",
+            target_url="https://example.com/b",
+        )
+        std_archived = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="已归档-不该出现",
+            target_url="https://example.com/c",
+        )
+        self.app.materials.archive_material(
+            std_archived["id"], advertiser_telegram_user_id=10001
+        )
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:creative",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        payload = json.loads(state["payload_json"])
+        self.assertEqual(payload["creative_ids"], [std["id"]])
+
+    def test_placement_pick_then_submit_reuses_library_material(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="可复用的标准插播文案",
+            target_url="https://example.com",
+        )
+
+        for cb_id, data in [
+            ("cb_pick_1", f"channel:order:{channel['id']}"),
+            ("cb_pick_2", "place:slot:standard_card"),
+            ("cb_pick_3", "place:creative"),
+            ("cb_pick_4", "place:pick:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:submit",
+                }
+            }
+        )
+
+        self.assertEqual(submit["type"], "callback_placement_order_created")
+        with self.app.db.transaction() as conn:
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ?", (submit["order_id"],)
+            ).fetchone()
+        self.assertEqual(order["creative_id"], material["id"])
+
+        # Library should still have only one material — pick reuses, not duplicates
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in items], [material["id"]])
+
+    def test_placement_archive_callback_archives_and_clears_selection(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        first = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="素材-A",
+            target_url="https://example.com/a",
+        )
+        second = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="素材-B",
+            target_url="https://example.com/b",
+        )
+
+        for cb_id, data in [
+            ("cb_arch_1", f"channel:order:{channel['id']}"),
+            ("cb_arch_2", "place:slot:standard_card"),
+            ("cb_arch_3", "place:creative"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        # Whichever order the bot listed, pick index 0 (selection) and then archive index 0
+        with self.app.db.transaction() as conn:
+            state_before = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        ordered_ids = json.loads(state_before["payload_json"])["creative_ids"]
+        self.assertEqual(set(ordered_ids), {first["id"], second["id"]})
+        archive_target_id = ordered_ids[0]
+        keep_id = ordered_ids[1]
+
+        for cb_id, data in [
+            ("cb_arch_pick", "place:pick:0"),
+            ("cb_arch_back", "place:creative"),
+            ("cb_arch_archive", "place:archive:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        active = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in active], [keep_id])
+        archived = self.app.materials.get_material(archive_target_id)
+        self.assertIsNotNone(archived["archived_at"])
+
+        with self.app.db.transaction() as conn:
+            state_after = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        payload_after = json.loads(state_after["payload_json"])
+        self.assertNotIn("material_id", payload_after)
+        self.assertEqual(payload_after["creative_ids"], [keep_id])
+
     def test_offer_acceptance_records_library_material(self) -> None:
         channel = self.bind_channel()
         self.topup_advertiser("20")

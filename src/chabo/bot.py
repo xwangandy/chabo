@@ -9,7 +9,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, LedgerService, LightProbeService, NotFound, OrderService, StarsPaymentService
+from .services import AccountService, ChaboError, ChannelService, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 
 
@@ -95,6 +95,7 @@ class UpdateHandler:
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
         self.light_probes = LightProbeService(db, settings)
+        self.materials = MaterialService(db, settings)
         self.orders = OrderService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
 
@@ -598,19 +599,16 @@ class UpdateHandler:
                     return
                 payload = json.loads(state["payload_json"] or "{}")
             channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, payload["channel_id"]))
-            creatives = []
+            creatives: list[dict[str, Any]] = []
             if panel == "creative":
-                creatives = conn.execute(
-                    """
-                    SELECT cr.*
-                    FROM creatives cr
-                    JOIN campaigns ca ON ca.id = cr.campaign_id
-                    WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
-                    ORDER BY cr.updated_at DESC, cr.created_at DESC
-                    LIMIT 5
-                    """,
-                    (account["id"],),
-                ).fetchall()
+                slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+                format_type = slot_type if slot_type in PLACEMENT_SLOT_TYPES else None
+                creatives = self.materials.list_materials_in_conn(
+                    conn,
+                    advertiser_account_id=account["id"],
+                    format_type=format_type,
+                    limit=5,
+                )
                 payload["creative_ids"] = [row["id"] for row in creatives]
             self._set_conversation_conn(conn, chat_id, account["id"], "placement_config", panel, payload)
 
@@ -643,9 +641,13 @@ class UpdateHandler:
 
         if data.startswith("place:slot:"):
             slot_type = self.channels.normalize_slot_type(data.removeprefix("place:slot:"))
+            previous_slot = self.channels.normalize_slot_type(payload.get("slot_type") or "")
             payload["slot_type"] = slot_type
             if slot_type not in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = False
+            if slot_type != previous_slot:
+                for key in ("material_id", "creative_text", "target_url", "button_text", "light_short_text"):
+                    payload.pop(key, None)
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
             return {"handled": True, "type": "callback_placement_slot", "slot_type": slot_type}
 
@@ -686,19 +688,43 @@ class UpdateHandler:
                 return {"handled": True, "type": "callback_placement_creative_missing"}
             with self.db.transaction() as conn:
                 creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (creative_ids[index],)).fetchone()
-            if not creative:
-                self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 广告素材不存在。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
+            if not creative or creative["archived_at"]:
+                self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 广告素材已不可用。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
                 return {"handled": True, "type": "callback_placement_creative_missing"}
             payload.update(
                 {
+                    "material_id": creative["id"],
                     "creative_text": creative["text"],
                     "target_url": creative["target_url"],
                     "button_text": creative["button_text"],
-                    "selected_creative_id": creative["id"],
+                    "light_short_text": creative["light_short_text"],
                 }
             )
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="home")
-            return {"handled": True, "type": "callback_placement_creative_selected"}
+            return {"handled": True, "type": "callback_placement_creative_selected", "material_id": creative["id"]}
+
+        if data.startswith("place:archive:"):
+            index = int(data.removeprefix("place:archive:"))
+            creative_ids = payload.get("creative_ids") or []
+            if index < 0 or index >= len(creative_ids):
+                self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_placement_archive_missing"}
+            target_id = creative_ids[index]
+            try:
+                with self.db.transaction() as conn:
+                    self.materials.archive_material_in_conn(
+                        conn,
+                        material_id=target_id,
+                        advertiser_account_id=state["account_id"],
+                    )
+            except NotFound:
+                self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_placement_archive_missing"}
+            if payload.get("material_id") == target_id:
+                for key in ("material_id", "creative_text", "target_url", "button_text", "light_short_text"):
+                    payload.pop(key, None)
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+            return {"handled": True, "type": "callback_placement_creative_archived", "material_id": target_id}
 
         if data.startswith("place:new:"):
             requested_slot = data.removeprefix("place:new:")
@@ -775,8 +801,33 @@ class UpdateHandler:
                 self.gateway.send_private_message(chat_id=chat_id, text="链接格式不对。请发送以 http:// 或 https:// 开头的目标链接。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
                 return {"handled": True, "type": "placement_invalid_url"}
             payload["target_url"] = clean_text
+            user_id = user.get("id") or chat_id
+            slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "standard_card")
+            format_type = slot_type if slot_type in PLACEMENT_SLOT_TYPES else "standard_card"
+            try:
+                material = self.materials.create_material(
+                    advertiser_telegram_user_id=user_id,
+                    format_type=format_type,
+                    text=payload["creative_text"],
+                    target_url=clean_text,
+                    button_text=payload.get("button_text") or "查看详情",
+                    light_short_text=payload.get("light_short_text"),
+                    display_name=self._display_name(user) or None,
+                )
+            except (InvalidState, NotFound) as exc:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ 素材保存失败：{exc}",
+                    inline_keyboard=self._cancel_keyboard("取消创建", "place:home"),
+                )
+                return {"handled": True, "type": "placement_create_material_failed", "error": str(exc)}
+            payload["material_id"] = material["id"]
+            payload["creative_text"] = material["text"]
+            payload["target_url"] = material["target_url"]
+            payload["button_text"] = material["button_text"]
+            payload["light_short_text"] = material["light_short_text"]
             self._send_placement_configurator(chat_id, user, None, payload=payload, panel="home")
-            return {"handled": True, "type": "placement_url_saved"}
+            return {"handled": True, "type": "placement_url_saved", "material_id": material["id"]}
 
         return {"handled": False, "reason": "unknown_placement_step"}
 
@@ -827,8 +878,7 @@ class UpdateHandler:
                 advertiser_telegram_user_id=user_id,
                 channel_token=channel["ref_token"],
                 slot_type=order_slot_type,
-                text=payload["creative_text"],
-                target_url=payload["target_url"],
+                material_id=payload["material_id"],
                 button_text=payload.get("button_text") or "打开链接",
                 budget_cents=quote["total_cents"],
                 scheduled_at=scheduled_at,
@@ -922,18 +972,30 @@ class UpdateHandler:
         if panel == "creative":
             keyboard: list[list[dict[str, str]]] = []
             creatives = creatives or []
-            if creatives:
-                for index, creative in enumerate(creatives):
-                    label = self._short_title((creative["text"] or "").replace("\n", " "), 18)
-                    keyboard.append([{"text": f"📄 {label}", "callback_data": f"place:pick:{index}"}])
-                keyboard.append([{"text": "➕ 新建素材", "callback_data": "place:new:auto"}])
-            else:
+            slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            new_target = slot_type if slot_type in PLACEMENT_SLOT_TYPES else "auto"
+            selected_id = payload.get("material_id")
+            for index, creative in enumerate(creatives):
+                preview_text = (creative["light_short_text"] if slot_type == "light_tail" else creative["text"]) or creative["text"] or ""
+                label = self._short_title(preview_text.replace("\n", " "), 18)
+                marker = "✅" if creative["id"] == selected_id else "📄"
+                keyboard.append(
+                    [
+                        {"text": f"{marker} {label}", "callback_data": f"place:pick:{index}"},
+                        {"text": "🗑 归档", "callback_data": f"place:archive:{index}"},
+                    ]
+                )
+            if new_target == "auto":
                 keyboard.extend(
                     [
                         [{"text": "➕ 创建文字插播素材", "callback_data": "place:new:light_tail"}],
                         [{"text": "➕ 创建标准插播素材", "callback_data": "place:new:standard_card"}],
                         [{"text": "➕ 创建定制插播素材", "callback_data": "place:new:strong_post"}],
                     ]
+                )
+            else:
+                keyboard.append(
+                    [{"text": f"➕ 新建{self._slot_name(new_target)}素材", "callback_data": f"place:new:{new_target}"}]
                 )
             keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
             return keyboard
@@ -957,7 +1019,7 @@ class UpdateHandler:
     def _placement_missing_panel(self, payload: dict[str, Any]) -> str | None:
         if not payload.get("slot_type"):
             return "display"
-        if not payload.get("creative_text") or not payload.get("target_url"):
+        if not payload.get("material_id"):
             return "creative"
         return None
 

@@ -240,17 +240,22 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         if parts == ["admin", "confirm-earnings"]:
             count = self.server.app.fulfillment.confirm_due_earnings(_int_value(data, "observation_hours", 24))
             return {"confirmed_deliveries": count}
+        note = _str_value(data, "note", "") or None
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "orders" and parts[3] == "approve":
-            return self.server.app.orders.approve_order(parts[2])
+            return self.server.app.orders.approve_order(parts[2], note=note)
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "orders" and parts[3] == "reject":
-            return self.server.app.orders.reject_order(parts[2], _str_value(data, "reason", "运营审核拒绝"))
+            return self.server.app.orders.reject_order(parts[2], _str_value(data, "reason", "运营审核拒绝"), note=note)
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "deliveries" and parts[3] == "refund":
             amount_cents = _optional_money_cents(data, "amount")
             if amount_cents is None:
-                return self.server.app.orders.refund_delivery(parts[2], _str_value(data, "reason", "运营后台退款"))
-            return self.server.app.orders.refund_delivery_partial(parts[2], amount_cents, _str_value(data, "reason", "运营后台部分退款"))
+                return self.server.app.orders.refund_delivery(parts[2], _str_value(data, "reason", "运营后台退款"), note=note)
+            return self.server.app.orders.refund_delivery_partial(parts[2], amount_cents, _str_value(data, "reason", "运营后台部分退款"), note=note)
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "disputes" and parts[3] == "resolve":
-            return self.server.app.disputes.resolve_dispute(dispute_id=parts[2], resolution=_str_value(data, "resolution", "运营裁决通过"))
+            return self.server.app.disputes.resolve_dispute(
+                dispute_id=parts[2],
+                resolution=_str_value(data, "resolution", "运营裁决通过"),
+                note=note,
+            )
         raise ValueError(f"unknown admin action: {path}")
 
     def _render_admin(self, query: str) -> str:
@@ -308,11 +313,16 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             actions = ""
             detail_link = f"<a href='/admin/orders/{_e(order['id'])}{token_query}'>详情</a>"
             if order["status"] in {"pending_review", "paused"}:
-                actions += self._form(f"/admin/orders/{order['id']}/approve", token_query, "<button>通过</button>")
+                actions += self._form(
+                    f"/admin/orders/{order['id']}/approve",
+                    token_query,
+                    "<input name='note' placeholder='备注（可空）' size='14'><button>通过</button>",
+                )
                 actions += self._form(
                     f"/admin/orders/{order['id']}/reject",
                     token_query,
-                    "<input name='reason' value='素材不符合插播规范'><button>拒绝</button>",
+                    "<input name='reason' value='素材不符合插播规范'>"
+                    "<input name='note' placeholder='备注（可空）' size='14'><button>拒绝</button>",
                 )
             action_cell = detail_link + (actions or "")
             rows.append(
@@ -338,7 +348,9 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 actions = self._form(
                     f"/admin/deliveries/{delivery['id']}/refund",
                     token_query,
-                    "<input name='amount' placeholder='留空全退' size='8'><input name='reason' value='运营退款'><button>退款</button>",
+                    "<input name='amount' placeholder='留空全退' size='8'>"
+                    "<input name='reason' value='运营退款'>"
+                    "<input name='note' placeholder='备注（可空）' size='14'><button>退款</button>",
                 )
             action_cell = detail_link + (actions or "")
             rows.append(
@@ -363,7 +375,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 actions = self._form(
                     f"/admin/disputes/{dispute['id']}/resolve",
                     token_query,
-                    "<input name='resolution' value='运营裁决通过'><button>解决</button>",
+                    "<input name='resolution' value='运营裁决通过'>"
+                    "<input name='note' placeholder='备注（可空）' size='14'><button>解决</button>",
                 )
             action_cell = detail_link + (actions or "")
             rows.append(
@@ -429,6 +442,81 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 pass
         return _e(value)
+
+    def _fetch_audit_rows(
+        self,
+        conn,
+        *,
+        order_ids: list[str] | None = None,
+        delivery_ids: list[str] | None = None,
+        dispute_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if order_ids:
+            placeholders = ",".join("?" * len(order_ids))
+            clauses.append(f"(entity_type = 'ad_order' AND entity_id IN ({placeholders}))")
+            params.extend(order_ids)
+        if delivery_ids:
+            placeholders = ",".join("?" * len(delivery_ids))
+            clauses.append(f"(entity_type = 'delivery' AND entity_id IN ({placeholders}))")
+            params.extend(delivery_ids)
+        if dispute_ids:
+            placeholders = ",".join("?" * len(dispute_ids))
+            clauses.append(f"(entity_type = 'dispute' AND entity_id IN ({placeholders}))")
+            params.extend(dispute_ids)
+        if not clauses:
+            return []
+        rows = conn.execute(
+            f"SELECT * FROM audit_logs WHERE {' OR '.join(clauses)} ORDER BY created_at DESC",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _build_timeline(
+        self,
+        audit_rows: list[dict[str, Any]],
+        evidence_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for row in audit_rows:
+            payload: dict[str, Any] = {}
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except json.JSONDecodeError:
+                payload = {"raw": row.get("payload_json") or ""}
+            note = payload.get("note") or ""
+            summary_bits: list[str] = []
+            for key in ("reason", "resolution"):
+                if payload.get(key):
+                    summary_bits.append(f"{key}={payload[key]}")
+            if "refund_cents" in payload:
+                summary_bits.append(f"refund_cents={payload['refund_cents']}")
+            events.append(
+                {
+                    "kind": "操作",
+                    "at": row.get("created_at") or "",
+                    "title": row.get("action") or "",
+                    "entity": f"{row.get('entity_type')}#{row.get('entity_id')}",
+                    "actor": row.get("actor_account_id") or "(未指定)",
+                    "note": note,
+                    "summary": "；".join(summary_bits),
+                }
+            )
+        for row in evidence_rows:
+            events.append(
+                {
+                    "kind": "证据",
+                    "at": row.get("created_at") or "",
+                    "title": row.get("snapshot_type") or "",
+                    "entity": f"order#{row.get('order_id')}" if row.get("order_id") else f"delivery#{row.get('delivery_id')}",
+                    "actor": "",
+                    "note": "",
+                    "summary": (row.get("payload_json") or "")[:120],
+                }
+            )
+        events.sort(key=lambda e: e["at"], reverse=True)
+        return events
 
     def _summary_card(self, label: str, value: int, *, alert: bool = False) -> str:
         css = "summary-card alert" if alert else "summary-card"
@@ -554,10 +642,13 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             deliveries = conn.execute("SELECT * FROM deliveries WHERE order_id = ? ORDER BY created_at DESC", (order_id,)).fetchall()
             evidence = conn.execute("SELECT * FROM evidence_snapshots WHERE order_id = ? ORDER BY created_at DESC", (order_id,)).fetchall()
             ledger = conn.execute("SELECT * FROM ledger_transactions WHERE order_id = ? ORDER BY created_at DESC", (order_id,)).fetchall()
+            delivery_ids = [row["id"] for row in deliveries]
+            audit_rows = self._fetch_audit_rows(conn, order_ids=[order_id], delivery_ids=delivery_ids)
+            timeline = self._build_timeline(audit_rows, [dict(row) for row in evidence])
             return {
                 "订单": dict(order),
                 "投放": [dict(row) for row in deliveries],
-                "证据链": [dict(row) for row in evidence],
+                "时间线": timeline,
                 "账本流水": [dict(row) for row in ledger],
             }
 
@@ -580,10 +671,16 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             disputes = conn.execute("SELECT * FROM disputes WHERE delivery_id = ? ORDER BY created_at DESC", (delivery_id,)).fetchall()
             evidence = conn.execute("SELECT * FROM evidence_snapshots WHERE delivery_id = ? ORDER BY created_at DESC", (delivery_id,)).fetchall()
             ledger = conn.execute("SELECT * FROM ledger_transactions WHERE delivery_id = ? ORDER BY created_at DESC", (delivery_id,)).fetchall()
+            audit_rows = self._fetch_audit_rows(
+                conn,
+                delivery_ids=[delivery_id],
+                dispute_ids=[row["id"] for row in disputes],
+            )
+            timeline = self._build_timeline(audit_rows, [dict(row) for row in evidence])
             return {
                 "投放": dict(delivery),
                 "争议": [dict(row) for row in disputes],
-                "证据链": [dict(row) for row in evidence],
+                "时间线": timeline,
                 "账本流水": [dict(row) for row in ledger],
             }
 
@@ -616,9 +713,16 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
                 "SELECT * FROM ledger_transactions WHERE order_id = ? ORDER BY created_at DESC",
                 (dispute["order_id"],),
             ).fetchall()
+            audit_rows = self._fetch_audit_rows(
+                conn,
+                order_ids=[dispute["order_id"]] if dispute["order_id"] else None,
+                delivery_ids=[dispute["delivery_id"]] if dispute["delivery_id"] else None,
+                dispute_ids=[dispute_id],
+            )
+            timeline = self._build_timeline(audit_rows, [dict(row) for row in evidence])
             return {
                 "争议": dict(dispute),
-                "证据链": [dict(row) for row in evidence],
+                "时间线": timeline,
                 "账本流水": [dict(row) for row in ledger],
             }
 

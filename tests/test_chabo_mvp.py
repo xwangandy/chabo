@@ -973,7 +973,11 @@ class ChaboMvpTest(unittest.TestCase):
             delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
         order_detail = self.http_json("GET", f"{base_url}/admin/orders/{order['id']}?token=admin-token")
         self.assertEqual(order_detail["order"]["订单"]["id"], order["id"])
-        self.assertGreaterEqual(len(order_detail["order"]["证据链"]), 1)
+        self.assertGreaterEqual(len(order_detail["order"]["时间线"]), 1)
+        # The audit log for the operator approve action should be on the timeline
+        self.assertTrue(
+            any(event["title"] == "order_approved" for event in order_detail["order"]["时间线"])
+        )
         partial = self.http_json(
             "POST",
             f"{base_url}/admin/deliveries/{delivery['id']}/refund?token=admin-token",
@@ -2229,6 +2233,90 @@ class ChaboMvpTest(unittest.TestCase):
         )
 
     # ---------- AI-callable service-layer surface ----------
+
+    def test_review_notes_land_on_audit_log_payload(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="审核备注测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"], note="素材已人工核对，符合插播规范")
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT payload_json FROM audit_logs WHERE entity_type = 'ad_order' "
+                "AND entity_id = ? AND action = 'order_approved'",
+                (order["id"],),
+            ).fetchone()
+        self.assertIsNotNone(audit)
+        self.assertIn("素材已人工核对", audit["payload_json"])
+
+    def test_review_notes_land_on_refund_audit_log(self) -> None:
+        channel, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
+        self.app.orders.refund_delivery_partial(
+            delivery["id"], money_to_cents("3.00"), "频道主提前删除", note="3 美金部分补偿，频道主同意"
+        )
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT payload_json FROM audit_logs WHERE entity_type = 'delivery' "
+                "AND entity_id = ? AND action = 'delivery_partially_refunded'",
+                (delivery["id"],),
+            ).fetchone()
+        self.assertIn("3 美金部分补偿", audit["payload_json"])
+
+    def test_admin_detail_timeline_merges_audit_and_evidence(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="时间线测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        url = self.start_http_server()
+        # Approve with a note via HTTP form body, exercising the same path
+        # the rendered <form> takes
+        body = "note=人工核对通过".encode("utf-8")
+        request = urllib.request.Request(
+            f"{url}/admin/orders/{order['id']}/approve?token=admin-token",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request) as response:
+            response.read()
+        detail_request = urllib.request.Request(
+            f"{url}/admin/orders/{order['id']}?token=admin-token",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(detail_request) as response:
+            detail = json.loads(response.read())
+        timeline = detail["order"]["时间线"]
+        self.assertTrue(any(event["title"] == "order_approved" for event in timeline))
+        approve_events = [event for event in timeline if event["title"] == "order_approved"]
+        self.assertIn("人工核对通过", approve_events[0]["note"])
+        # Evidence and audit kinds both appear on the same timeline
+        kinds = {event["kind"] for event in timeline}
+        self.assertEqual(kinds, {"操作", "证据"})
 
     def test_database_backup_writes_a_consistent_snapshot(self) -> None:
         # Seed some state, then back up

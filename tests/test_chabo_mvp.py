@@ -2240,6 +2240,80 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
 
+    def test_publisher_earnings_page_offers_channel_and_statement_entries(self) -> None:
+        self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        result = self._publisher_callback("publisher:earnings", cb_id="cb_earn_open")
+        self.assertEqual(result["type"], "callback_publisher_earnings")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("我的收益", message["text"])
+        callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn("earnings:channels", callbacks)
+        self.assertIn("earnings:statement", callbacks)
+
+    def test_earnings_channels_lists_per_channel_breakdown(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Create one delivery so the channel has an entry
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="频道分布测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback("earnings:channels", cb_id="cb_earn_channels")
+        self.assertEqual(result["type"], "callback_earnings_channels")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("频道分布", message["text"])
+        self.assertIn(channel["title"], message["text"])
+        self.assertIn("待确认", message["text"])
+        callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn(f"pub:channel:{channel['ref_token']}", callbacks)
+
+    def test_earnings_statement_filters_to_publisher_side_entries(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Mixed user — also takes a manual topup so the wallet-side ledger has entries
+        self.app.ledger.manual_topup(20001, money_to_cents("10"), display_name="频道主")
+        # Generate a delivery so publisher_pending_earning is recorded
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="收益流水测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback("earnings:statement", cb_id="cb_earn_stmt")
+        self.assertEqual(result["type"], "callback_earnings_statement")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("收益流水", text)
+        self.assertIn("频道入账", text)
+        # manual_topup belongs to wallet side and must NOT appear here
+        self.assertNotIn("人工入账", text)
+
     def test_wallet_balance_page_offers_topup_reserved_statement_buttons(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         self.topup_advertiser("20")

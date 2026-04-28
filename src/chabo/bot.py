@@ -310,6 +310,12 @@ class UpdateHandler:
         if data == "publisher:earnings":
             self._send_publisher_earnings(chat_id, user, message)
             return {"handled": True, "type": "callback_publisher_earnings"}
+        if data == "earnings:channels":
+            self._send_earnings_channels(chat_id, user, message)
+            return {"handled": True, "type": "callback_earnings_channels"}
+        if data == "earnings:statement":
+            self._send_earnings_statement(chat_id, user, message)
+            return {"handled": True, "type": "callback_earnings_statement"}
         if data == "advertiser:balance":
             self._send_advertiser_balance(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_balance"}
@@ -1508,21 +1514,34 @@ class UpdateHandler:
             inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
         )
 
-    @staticmethod
-    def _wallet_tx_label(tx_type: str) -> str:
-        labels = {
-            "manual_topup": "人工入账",
-            "stars_topup": "Stars 充值",
-            "reserve_budget": "预算冻结",
-            "release_reserved": "释放冻结",
-            "advertiser_charge": "投放扣费",
-            "advertiser_refund": "投放退款",
-            "publisher_earning": "频道入账",
-            "publisher_earning_confirmed": "收益确认",
-            "publisher_subscription_charge": "频道订阅扣费",
-            "advertiser_subscription_charge": "高级服务扣费",
-        }
-        return labels.get(tx_type, tx_type)
+    LEDGER_TX_LABELS = {
+        "manual_topup": "人工入账",
+        "stars_topup": "Stars 充值",
+        "budget_reserved": "预算冻结",
+        "budget_released": "释放冻结",
+        "delivery_charged": "投放扣费",
+        "delivery_refunded": "投放退款",
+        "advertiser_subscription_charged": "高级服务扣费",
+        "publisher_pending_earning": "频道入账（待确认）",
+        "publisher_earning_confirmed": "收益确认",
+        "publisher_earning_reversed": "收益回滚",
+        "publisher_subscription_charged": "频道订阅扣费",
+        "publisher_subscription_revenue": "频道订阅收入",
+        "advertiser_subscription_revenue": "广告主订阅收入",
+        "platform_service_fee": "平台服务费",
+        "platform_fee_reversed": "服务费回滚",
+    }
+
+    PUBLISHER_TX_TYPES = {
+        "publisher_pending_earning",
+        "publisher_earning_confirmed",
+        "publisher_earning_reversed",
+        "publisher_subscription_charged",
+    }
+
+    @classmethod
+    def _wallet_tx_label(cls, tx_type: str) -> str:
+        return cls.LEDGER_TX_LABELS.get(tx_type, tx_type)
 
     def _send_publisher_earnings(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
@@ -1533,11 +1552,90 @@ class UpdateHandler:
             source_message=source_message,
             text=(
                 "💸 我的收益\n\n"
-                f"⏳ 待确认：USD {account['pending_earnings_cents'] / 100:.2f}\n"
-                f"✅ 已确认：USD {account['confirmed_earnings_cents'] / 100:.2f}\n"
-                f"💵 可结算：USD {account['releasable_earnings_cents'] / 100:.2f}"
+                f"⏳ 待确认：USD {cents_to_money(account['pending_earnings_cents'])}\n"
+                f"✅ 已确认：USD {cents_to_money(account['confirmed_earnings_cents'])}\n"
+                f"💵 可结算：USD {cents_to_money(account['releasable_earnings_cents'])}"
             ),
-            inline_keyboard=[[{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=[
+                [{"text": "📊 频道分布", "callback_data": "earnings:channels"}, {"text": "📜 收益流水", "callback_data": "earnings:statement"}],
+                [{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    def _send_earnings_channels(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            publisher = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id AS channel_id,
+                    c.title AS title,
+                    c.ref_token AS ref_token,
+                    COALESCE(SUM(CASE WHEN d.status = 'sent' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS pending,
+                    COALESCE(SUM(CASE WHEN d.status = 'confirmed' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS confirmed,
+                    COALESCE(SUM(d.platform_fee_cents - d.platform_fee_reversed_cents), 0) AS platform_fee
+                FROM channels c
+                LEFT JOIN deliveries d ON d.channel_id = c.id AND d.status IN ('sent', 'confirmed')
+                WHERE c.owner_account_id = ?
+                GROUP BY c.id, c.title, c.ref_token
+                ORDER BY c.created_at DESC
+                """,
+                (publisher["id"],),
+            ).fetchall()
+        lines = ["📊 频道分布", ""]
+        keyboard: list[list[dict[str, str]]] = []
+        if not rows:
+            lines.append("还没有可结算的频道。")
+        else:
+            for row in rows:
+                lines.append(
+                    f"📺 {row['title']}\n"
+                    f"  ⏳ 待确认 USD {cents_to_money(row['pending'])}｜"
+                    f"✅ 已确认 USD {cents_to_money(row['confirmed'])}｜"
+                    f"📊 平台已收 USD {cents_to_money(row['platform_fee'])}"
+                )
+                keyboard.append(
+                    [{"text": f"📺 {row['title']}", "callback_data": f"pub:channel:{row['ref_token']}"}]
+                )
+        keyboard.append([{"text": "⬅️ 我的收益", "callback_data": "publisher:earnings"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _send_earnings_statement(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_transactions(telegram_user_id=user_id, limit=30)
+        rows = [r for r in rows if r["type"] in self.PUBLISHER_TX_TYPES][:10]
+        lines = ["📜 收益流水（最近 10 条）", ""]
+        if not rows:
+            lines.append("还没有收益记录。")
+        else:
+            for row in rows:
+                sign = "+" if row["amount_cents"] >= 0 else "-"
+                amount = cents_to_money(abs(row["amount_cents"]))
+                kind = self._wallet_tx_label(row["type"])
+                memo = row["memo"] or ""
+                detail = f" — {memo}" if memo else ""
+                lines.append(f"{sign} {row['currency']} {amount}｜{kind}{detail}")
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[[{"text": "⬅️ 我的收益", "callback_data": "publisher:earnings"}]],
         )
 
     def _handle_conversation_message(self, message: dict[str, Any], text: str) -> dict[str, Any]:

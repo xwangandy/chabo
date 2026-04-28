@@ -29,6 +29,7 @@ class FakeGateway:
         self.callback_answers = []
         self.edits = []
         self.text_edits = []
+        self.channel_text_edits = []
         self.pins = []
         self.fail_send = False
         self.fail_pin = False
@@ -141,6 +142,16 @@ class FakeGateway:
         inline_keyboard: list[list[dict[str, str]]] | None = None,
     ) -> None:
         self.text_edits.append({"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "inline_keyboard": inline_keyboard})
+
+    def edit_channel_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        self.channel_text_edits.append({"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "inline_keyboard": inline_keyboard})
 
     def pin_message(self, *, chat_id: str, message_id: str | int) -> None:
         if self.fail_pin:
@@ -618,10 +629,21 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(creative["button_text"], "领资料")
         self.assertEqual(creative["text"], "这里是轻插播点击后展示的完整广告详情。")
 
+        self.app.update_handler.handle(
+            {
+                "channel_post": {
+                    "message_id": 88,
+                    "chat": {"id": -100123, "title": "测试频道"},
+                    "text": "频道最新帖子",
+                }
+            }
+        )
         dispatched = self.app.fulfillment.dispatch_due()
         self.assertEqual(dispatched[0]["status"], "sent")
-        self.assertEqual(self.gateway.sent_ads[-1]["text"], "🔖 领资料")
-        self.assertEqual(self.gateway.sent_ads[-1]["button_text"], "查看完整广告")
+        self.assertEqual(dispatched[0]["message_id"], "88")
+        self.assertEqual(self.gateway.channel_text_edits[-1]["text"], "频道最新帖子\n\n🔖 领资料")
+        self.assertEqual(self.gateway.channel_text_edits[-1]["inline_keyboard"][-1][0]["text"], "查看完整广告")
+        self.assertEqual(self.gateway.sent_ads, [])
 
         self.confirm_timezone(333, display_name="点击用户")
         with self.app.db.transaction() as conn:

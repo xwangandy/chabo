@@ -42,6 +42,16 @@ class MessageGateway(Protocol):
     ) -> None:
         ...
 
+    def edit_channel_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        ...
+
     def send_invoice(
         self,
         *,
@@ -234,6 +244,19 @@ class BotApiClient:
             payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
         self._post("editMessageText", payload)
 
+    def edit_channel_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if inline_keyboard:
+            payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+        self._post("editMessageText", payload)
+
     def send_invoice(
         self,
         *,
@@ -327,6 +350,16 @@ class NullGateway:
         return None
 
     def edit_private_message_text(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        return None
+
+    def edit_channel_message_text(
         self,
         *,
         chat_id: str | int,

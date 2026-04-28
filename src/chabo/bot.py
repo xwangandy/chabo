@@ -456,6 +456,27 @@ class UpdateHandler:
                     (new_id("aud"), channel["id"], json.dumps({"error": str(exc), "message_id": message_id}, ensure_ascii=False)),
                 )
                 return {"handled": False, "reason": "append_button_failed", "error": str(exc)}
+            post_text = post.get("text") or post.get("caption")
+            if post_text:
+                conn.execute(
+                    """
+                    INSERT INTO runtime_state (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        f"channel_latest_post:{channel['id']}",
+                        json.dumps(
+                            {
+                                "chat_id": str(chat_id),
+                                "message_id": str(message_id),
+                                "text": post_text,
+                                "inline_keyboard": keyboard,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
             return {"handled": True, "type": "channel_post_button_appended", "channel_id": channel["id"]}
 
     def _handle_pre_checkout_query(self, query: dict[str, Any]) -> dict[str, Any]:

@@ -78,24 +78,44 @@ class FulfillmentService:
         track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery['id']}"
         ad_text = creative["text"]
         button_text = creative["button_text"]
+        message_id: str
         if slot["slot_type"] == "light_tail":
             short_text = creative["button_text"] or "查看详情"
-            ad_text = f"🔖 {short_text}"
-            button_text = "查看完整广告"
-        try:
-            message_id = self.gateway.send_ad(
-                chat_id=channel["telegram_chat_id"],
-                text=ad_text,
-                button_text=button_text,
-                button_url=track_url,
-            )
-            pinned = 0
-            if slot["slot_type"] == "pin24h":
+            inserted_message_id = self._insert_light_tail_into_latest_post(conn, channel, short_text, track_url)
+            if inserted_message_id:
+                message_id = inserted_message_id
+            else:
+                ad_text = f"🔖 {short_text}"
+                button_text = "查看完整广告"
+                try:
+                    message_id = self.gateway.send_ad(
+                        chat_id=channel["telegram_chat_id"],
+                        text=ad_text,
+                        button_text=button_text,
+                        button_url=track_url,
+                    )
+                except TelegramError as exc:
+                    self._mark_delivery_failed(conn, delivery, order, str(exc))
+                    return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
+        else:
+            try:
+                message_id = self.gateway.send_ad(
+                    chat_id=channel["telegram_chat_id"],
+                    text=ad_text,
+                    button_text=button_text,
+                    button_url=track_url,
+                )
+            except TelegramError as exc:
+                self._mark_delivery_failed(conn, delivery, order, str(exc))
+                return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
+        pinned = 0
+        if slot["slot_type"] == "pin24h":
+            try:
                 self.gateway.pin_message(chat_id=channel["telegram_chat_id"], message_id=message_id)
                 pinned = 1
-        except TelegramError as exc:
-            self._mark_delivery_failed(conn, delivery, order, str(exc))
-            return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
+            except TelegramError as exc:
+                self._mark_delivery_failed(conn, delivery, order, str(exc))
+                return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
 
         publisher_net, fee = self.ledger.charge_delivery(
             conn,
@@ -138,6 +158,60 @@ class FulfillmentService:
         self._maybe_notify_budget(conn, order["id"])
         self.orders.maybe_schedule_next(conn, order["id"])
         return {"delivery_id": delivery["id"], "status": "sent", "message_id": message_id}
+
+    def _insert_light_tail_into_latest_post(
+        self,
+        conn: sqlite3.Connection,
+        channel: sqlite3.Row,
+        short_text: str,
+        track_url: str,
+    ) -> str | None:
+        row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (f"channel_latest_post:{channel['id']}",)).fetchone()
+        if not row:
+            return None
+        try:
+            latest = json.loads(row["value"])
+        except json.JSONDecodeError:
+            return None
+        original_text = str(latest.get("text") or "").strip()
+        if not original_text:
+            return None
+        insertion = f"🔖 {short_text}"
+        updated_text = original_text if insertion in original_text else f"{original_text}\n\n{insertion}"
+        if len(updated_text) > 3900:
+            return None
+        keyboard = latest.get("inline_keyboard") or []
+        detail_button = {"text": "查看完整广告", "url": track_url}
+        if not any(button.get("url") == track_url for row_buttons in keyboard for button in row_buttons):
+            keyboard.append([detail_button])
+        try:
+            self.gateway.edit_channel_message_text(
+                chat_id=latest["chat_id"],
+                message_id=latest["message_id"],
+                text=updated_text,
+                inline_keyboard=keyboard,
+            )
+        except TelegramError:
+            return None
+        conn.execute(
+            """
+            INSERT INTO runtime_state (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                f"channel_latest_post:{channel['id']}",
+                json.dumps(
+                    {
+                        **latest,
+                        "text": updated_text,
+                        "inline_keyboard": keyboard,
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        return str(latest["message_id"])
 
     def _mark_delivery_failed(
         self,

@@ -1354,13 +1354,12 @@ class UpdateHandler:
         prefix: str | None = None,
     ) -> None:
         user_id = user.get("id") or chat_id
-        with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", user.get("first_name") or user.get("username"))
+        summary = self.ledger.get_wallet_summary(telegram_user_id=user_id)
         body = (
             "💰 广告钱包\n\n"
-            f"💵 可用：USD {cents_to_money(account['available_balance_cents'])}\n"
-            f"🔒 冻结：USD {cents_to_money(account['reserved_balance_cents'])}\n"
-            f"📊 已花：USD {cents_to_money(account['spent_balance_cents'])}"
+            f"💵 可用：USD {cents_to_money(summary['available_balance_cents'])}\n"
+            f"🔒 冻结：USD {cents_to_money(summary['reserved_balance_cents'])}\n"
+            f"📊 已花：USD {cents_to_money(summary['spent_balance_cents'])}"
         )
         text = f"{prefix}\n\n{body}" if prefix else body
         self._reply_or_edit(
@@ -1545,16 +1544,15 @@ class UpdateHandler:
 
     def _send_publisher_earnings(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
-        with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+        summary = self.ledger.get_earnings_summary(telegram_user_id=user_id)
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
                 "💸 我的收益\n\n"
-                f"⏳ 待确认：USD {cents_to_money(account['pending_earnings_cents'])}\n"
-                f"✅ 已确认：USD {cents_to_money(account['confirmed_earnings_cents'])}\n"
-                f"💵 可结算：USD {cents_to_money(account['releasable_earnings_cents'])}"
+                f"⏳ 待确认：USD {cents_to_money(summary['pending_earnings_cents'])}\n"
+                f"✅ 已确认：USD {cents_to_money(summary['confirmed_earnings_cents'])}\n"
+                f"💵 可结算：USD {cents_to_money(summary['releasable_earnings_cents'])}"
             ),
             inline_keyboard=[
                 [{"text": "📊 频道分布", "callback_data": "earnings:channels"}, {"text": "📜 收益流水", "callback_data": "earnings:statement"}],
@@ -1569,25 +1567,7 @@ class UpdateHandler:
         source_message: dict[str, Any] | None = None,
     ) -> None:
         user_id = user.get("id") or chat_id
-        with self.db.transaction() as conn:
-            publisher = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
-            rows = conn.execute(
-                """
-                SELECT
-                    c.id AS channel_id,
-                    c.title AS title,
-                    c.ref_token AS ref_token,
-                    COALESCE(SUM(CASE WHEN d.status = 'sent' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS pending,
-                    COALESCE(SUM(CASE WHEN d.status = 'confirmed' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS confirmed,
-                    COALESCE(SUM(d.platform_fee_cents - d.platform_fee_reversed_cents), 0) AS platform_fee
-                FROM channels c
-                LEFT JOIN deliveries d ON d.channel_id = c.id AND d.status IN ('sent', 'confirmed')
-                WHERE c.owner_account_id = ?
-                GROUP BY c.id, c.title, c.ref_token
-                ORDER BY c.created_at DESC
-                """,
-                (publisher["id"],),
-            ).fetchall()
+        rows = self.ledger.list_channel_earnings(publisher_telegram_user_id=user_id)
         lines = ["📊 频道分布", ""]
         keyboard: list[list[dict[str, str]]] = []
         if not rows:
@@ -1596,9 +1576,9 @@ class UpdateHandler:
             for row in rows:
                 lines.append(
                     f"📺 {row['title']}\n"
-                    f"  ⏳ 待确认 USD {cents_to_money(row['pending'])}｜"
-                    f"✅ 已确认 USD {cents_to_money(row['confirmed'])}｜"
-                    f"📊 平台已收 USD {cents_to_money(row['platform_fee'])}"
+                    f"  ⏳ 待确认 USD {cents_to_money(row['pending_cents'])}｜"
+                    f"✅ 已确认 USD {cents_to_money(row['confirmed_cents'])}｜"
+                    f"📊 平台已收 USD {cents_to_money(row['platform_fee_cents'])}"
                 )
                 keyboard.append(
                     [{"text": f"📺 {row['title']}", "callback_data": f"pub:channel:{row['ref_token']}"}]
@@ -2473,10 +2453,12 @@ class UpdateHandler:
         if not policy:
             self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
             return
+        user_id = user.get("id") or chat_id
         try:
-            self.channels.set_format_policy(
-                channel["id"],
-                format_type,
+            self.channels.set_format_policy_for_publisher(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                format_type=format_type,
                 enabled=bool(policy["enabled"]),
                 owner_price_band=band,
                 platform_promo_enabled=bool(policy["platform_promo_enabled"]),
@@ -2547,8 +2529,13 @@ class UpdateHandler:
         channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
         if not channel:
             return
+        user_id = user.get("id") or chat_id
         try:
-            self.channels.set_daily_ad_limit(channel["id"], limit)
+            self.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                daily_ad_limit=limit,
+            )
         except ChaboError as exc:
             self._reply_or_edit(
                 chat_id=chat_id,

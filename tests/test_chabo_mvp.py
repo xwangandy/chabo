@@ -2230,6 +2230,63 @@ class ChaboMvpTest(unittest.TestCase):
 
     # ---------- AI-callable service-layer surface ----------
 
+    def test_channel_service_publisher_write_apis_enforce_ownership(self) -> None:
+        channel = self.bind_channel()
+        # Owner (20001) can change band
+        result = self.app.channels.set_format_policy_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            format_type="standard_card",
+            enabled=True,
+            owner_price_band="high",
+        )
+        self.assertEqual(result["owner_price_band"], "high")
+
+        # Owner (20001) can change daily limit
+        cfg = self.app.channels.set_daily_ad_limit_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            daily_ad_limit=5,
+        )
+        self.assertEqual(cfg["daily_ad_limit"], 5)
+
+        # Foreign user cannot — must raise NotFound (not InvalidState), per the
+        # AI tool boundary contract: never confirm a resource exists to non-owners.
+        with self.assertRaises(NotFound):
+            self.app.channels.set_format_policy_for_publisher(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                format_type="standard_card",
+                enabled=False,
+                owner_price_band="low",
+            )
+        with self.assertRaises(NotFound):
+            self.app.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                daily_ad_limit=1,
+            )
+        # Non-existent telegram_user_id (no account) — same NotFound
+        with self.assertRaises(NotFound):
+            self.app.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=12345678,
+                channel_id=channel["id"],
+                daily_ad_limit=1,
+            )
+
+        # Original limits left intact for the owner
+        with self.app.db.transaction() as conn:
+            cfg_row = conn.execute(
+                "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+            policy_row = conn.execute(
+                "SELECT owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = 'standard_card'",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(cfg_row["daily_ad_limit"], 5)
+        self.assertEqual(policy_row["owner_price_band"], "high")
+
     def test_order_service_list_and_view_enforce_ownership(self) -> None:
         channel = self.bind_channel()
         self.topup_advertiser("20")

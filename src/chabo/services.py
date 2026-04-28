@@ -163,6 +163,92 @@ class LedgerService:
             ),
         )
 
+    def get_wallet_summary(
+        self,
+        *,
+        telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id, available_balance_cents, reserved_balance_cents, "
+                "       spent_balance_cents "
+                "FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return {
+                    "telegram_user_id": str(telegram_user_id),
+                    "available_balance_cents": 0,
+                    "reserved_balance_cents": 0,
+                    "spent_balance_cents": 0,
+                }
+            return {
+                "telegram_user_id": str(telegram_user_id),
+                "account_id": account["id"],
+                "available_balance_cents": account["available_balance_cents"],
+                "reserved_balance_cents": account["reserved_balance_cents"],
+                "spent_balance_cents": account["spent_balance_cents"],
+            }
+
+    def get_earnings_summary(
+        self,
+        *,
+        telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id, pending_earnings_cents, confirmed_earnings_cents, "
+                "       releasable_earnings_cents "
+                "FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return {
+                    "telegram_user_id": str(telegram_user_id),
+                    "pending_earnings_cents": 0,
+                    "confirmed_earnings_cents": 0,
+                    "releasable_earnings_cents": 0,
+                }
+            return {
+                "telegram_user_id": str(telegram_user_id),
+                "account_id": account["id"],
+                "pending_earnings_cents": account["pending_earnings_cents"],
+                "confirmed_earnings_cents": account["confirmed_earnings_cents"],
+                "releasable_earnings_cents": account["releasable_earnings_cents"],
+            }
+
+    def list_channel_earnings(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id AS channel_id,
+                    c.title AS title,
+                    c.ref_token AS ref_token,
+                    COALESCE(SUM(CASE WHEN d.status = 'sent' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS pending_cents,
+                    COALESCE(SUM(CASE WHEN d.status = 'confirmed' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS confirmed_cents,
+                    COALESCE(SUM(d.platform_fee_cents - d.platform_fee_reversed_cents), 0) AS platform_fee_cents,
+                    COUNT(d.id) AS delivery_count
+                FROM channels c
+                LEFT JOIN deliveries d ON d.channel_id = c.id AND d.status IN ('sent', 'confirmed')
+                WHERE c.owner_account_id = ?
+                GROUP BY c.id, c.title, c.ref_token
+                ORDER BY c.created_at DESC
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_transactions(
         self,
         *,
@@ -989,6 +1075,90 @@ class ChannelService:
             raise NotFound(f"channel not found: {channel_id}")
         return dict(row)
 
+    def list_publisher_channels(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, telegram_chat_id, title, username, ref_token, status,
+                       created_at, updated_at
+                FROM channels
+                WHERE owner_account_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_channel_view(
+        self,
+        channel_id: str,
+        *,
+        publisher_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            channel = conn.execute(
+                "SELECT * FROM channels WHERE id = ?", (channel_id,)
+            ).fetchone()
+            if not channel:
+                raise NotFound(f"频道不存在：{channel_id}")
+            channel_dict = dict(channel)
+            if publisher_telegram_user_id is not None:
+                account = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(publisher_telegram_user_id),),
+                ).fetchone()
+                if not account or channel_dict["owner_account_id"] != account["id"]:
+                    raise NotFound(f"频道不存在：{channel_id}")
+            self._ensure_default_rate_cards(conn, channel_id)
+            self._ensure_default_format_policies(conn, channel_id)
+            config = conn.execute(
+                "SELECT * FROM channel_configs WHERE channel_id = ?", (channel_id,)
+            ).fetchone()
+            policies = conn.execute(
+                "SELECT format_type, enabled, owner_price_band, platform_promo_enabled, "
+                "       custom_multiplier_bps "
+                "FROM channel_ad_format_policies WHERE channel_id = ? ORDER BY format_type",
+                (channel_id,),
+            ).fetchall()
+            rates = conn.execute(
+                """
+                SELECT s.slot_type, r.unit_price_cents, r.currency, r.pricing_unit
+                FROM ad_slots s
+                JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+                WHERE s.channel_id = ?
+                ORDER BY s.slot_type
+                """,
+                (channel_id,),
+            ).fetchall()
+            today_ads = conn.execute(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE channel_id = ? "
+                "AND status IN ('sent', 'confirmed') AND DATE(sent_at) = DATE('now')",
+                (channel_id,),
+            ).fetchone()["n"]
+            pending = conn.execute(
+                "SELECT COALESCE(SUM(publisher_net_cents - publisher_reversed_cents), 0) AS n "
+                "FROM deliveries WHERE channel_id = ? AND status IN ('sent', 'confirmed')",
+                (channel_id,),
+            ).fetchone()["n"]
+            return {
+                **channel_dict,
+                "config": dict(config) if config else None,
+                "format_policies": [dict(row) for row in policies],
+                "rate_cards": [dict(row) for row in rates],
+                "today_ads": today_ads,
+                "pending_earnings_cents": pending,
+            }
+
     def get_rate(self, conn: sqlite3.Connection, channel_id: str, slot_type: str) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
         self._ensure_default_rate_cards(conn, channel_id)
@@ -1710,6 +1880,82 @@ class OrderService:
         if not row:
             raise NotFound(f"order not found: {order_id}")
         return dict(row)
+
+    def list_orders(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            sql = (
+                "SELECT o.*, c.title AS channel_title, c.ref_token AS channel_ref_token, "
+                "       cr.format_type AS creative_format, cr.text AS creative_text "
+                "FROM ad_orders o "
+                "LEFT JOIN channels c ON c.id = o.channel_id "
+                "LEFT JOIN creatives cr ON cr.id = o.creative_id "
+                "WHERE o.advertiser_account_id = ?"
+            )
+            params: list[Any] = [account["id"]]
+            if status is not None:
+                sql += " AND o.status = ?"
+                params.append(status)
+            sql += " ORDER BY o.created_at DESC LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_order_view(
+        self,
+        order_id: str,
+        *,
+        advertiser_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order:
+                raise NotFound(f"订单不存在：{order_id}")
+            order_dict = dict(order)
+            if advertiser_telegram_user_id is not None:
+                account = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not account or order_dict["advertiser_account_id"] != account["id"]:
+                    raise NotFound(f"订单不存在：{order_id}")
+            channel = conn.execute(
+                "SELECT id, title, ref_token, username FROM channels WHERE id = ?",
+                (order_dict["channel_id"],),
+            ).fetchone()
+            creative = conn.execute(
+                "SELECT id, format_type, text, target_url, button_text, light_short_text "
+                "FROM creatives WHERE id = ?",
+                (order_dict["creative_id"],),
+            ).fetchone()
+            slot = conn.execute(
+                "SELECT slot_type FROM ad_slots WHERE id = ?", (order_dict["slot_id"],)
+            ).fetchone()
+            deliveries = conn.execute(
+                "SELECT id, status, scheduled_at, sent_at, charge_cents, message_id "
+                "FROM deliveries WHERE order_id = ? ORDER BY scheduled_at ASC",
+                (order_id,),
+            ).fetchall()
+            return {
+                **order_dict,
+                "channel": dict(channel) if channel else None,
+                "creative": dict(creative) if creative else None,
+                "slot_type": slot["slot_type"] if slot else None,
+                "deliveries": [dict(row) for row in deliveries],
+            }
 
     def _ensure_delivery(self, conn: sqlite3.Connection, order_id: str, scheduled_at: str) -> str:
         existing = conn.execute(

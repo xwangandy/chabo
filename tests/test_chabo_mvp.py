@@ -2228,6 +2228,109 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
 
+    # ---------- AI-callable service-layer surface ----------
+
+    def test_order_service_list_and_view_enforce_ownership(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="AI 工具调用测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+
+        listed = self.app.orders.list_orders(advertiser_telegram_user_id=10001)
+        self.assertEqual([row["id"] for row in listed], [order["id"]])
+        self.assertEqual(listed[0]["channel_title"], channel["title"])
+
+        # Foreign user gets empty list
+        self.assertEqual(self.app.orders.list_orders(advertiser_telegram_user_id=99999), [])
+
+        view = self.app.orders.get_order_view(order["id"], advertiser_telegram_user_id=10001)
+        self.assertEqual(view["id"], order["id"])
+        self.assertEqual(view["creative"]["text"], "AI 工具调用测试文案")
+        self.assertEqual(view["channel"]["ref_token"], channel["ref_token"])
+        self.assertEqual(view["slot_type"], "standard_card")
+
+        with self.assertRaises(NotFound):
+            self.app.orders.get_order_view(order["id"], advertiser_telegram_user_id=99999)
+
+    def test_channel_service_view_bundles_config_policies_rates_and_stats(self) -> None:
+        channel = self.bind_channel()
+        # ensure rates / policies are seeded by triggering a quote
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="news",
+            median_24h_views=10_000,
+            light_unique_clickers_30d=10,
+            risk_level="normal",
+        )
+
+        listed = self.app.channels.list_publisher_channels(publisher_telegram_user_id=20001)
+        self.assertEqual([row["id"] for row in listed], [channel["id"]])
+        self.assertEqual(self.app.channels.list_publisher_channels(publisher_telegram_user_id=88888), [])
+
+        view = self.app.channels.get_channel_view(
+            channel["id"], publisher_telegram_user_id=20001
+        )
+        self.assertEqual(view["id"], channel["id"])
+        self.assertIsNotNone(view["config"])
+        format_types = {p["format_type"] for p in view["format_policies"]}
+        self.assertIn("standard_card", format_types)
+        self.assertTrue(view["rate_cards"])
+        self.assertEqual(view["today_ads"], 0)
+
+        with self.assertRaises(NotFound):
+            self.app.channels.get_channel_view(channel["id"], publisher_telegram_user_id=88888)
+
+    def test_ledger_service_summaries_match_account_state(self) -> None:
+        # Wallet summary from advertiser-only top up
+        self.app.ledger.manual_topup(10001, money_to_cents("12.50"), display_name="广告主")
+        wallet = self.app.ledger.get_wallet_summary(telegram_user_id=10001)
+        self.assertEqual(wallet["available_balance_cents"], 1250)
+        self.assertEqual(wallet["reserved_balance_cents"], 0)
+
+        # Unknown user returns zeros
+        empty = self.app.ledger.get_wallet_summary(telegram_user_id=77777)
+        self.assertEqual(empty["available_balance_cents"], 0)
+        self.assertNotIn("account_id", empty)
+
+        # Earnings summary from a delivered ad
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="收益服务测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        earnings = self.app.ledger.get_earnings_summary(telegram_user_id=20001)
+        self.assertGreater(earnings["pending_earnings_cents"], 0)
+
+        breakdown = self.app.ledger.list_channel_earnings(publisher_telegram_user_id=20001)
+        self.assertEqual([row["channel_id"] for row in breakdown], [channel["id"]])
+        self.assertEqual(breakdown[0]["pending_cents"], earnings["pending_earnings_cents"])
+        self.assertEqual(breakdown[0]["delivery_count"], 1)
+        self.assertEqual(self.app.ledger.list_channel_earnings(publisher_telegram_user_id=88888), [])
+
     def _advertiser_callback(self, data: str, *, telegram_user_id: int = 10001, cb_id: str = "cb_adv") -> dict:
         return self.app.update_handler.handle(
             {

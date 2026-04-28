@@ -44,6 +44,15 @@ cp .env.example .env
 chabo init-db
 ```
 
+定期备份（推荐 cron）：
+
+```bash
+# 自动写到 <db_dir>/backups/chabo-YYYYMMDD-HHMMSS.sqlite3
+chabo backup-db
+# 或显式路径
+chabo backup-db --target /var/backups/chabo/snapshot.sqlite3
+```
+
 创建广告主并人工入账：
 
 ```bash
@@ -237,12 +246,14 @@ chabo resolve-dispute --dispute-id <dispute_id> --resolution "证据不足，恢
 
 插播现在内置一个标准库 HTTP 服务，不额外引入 Web 框架。它提供：
 
-- `GET /health`：健康检查。
+- `GET /health`：健康检查；带 DB ping 和运营计数（`pending_review_orders / running_orders / sent_today / scheduled_due / open_disputes / failed_recent`）。可被 LB 或监控系统直接用作 readiness 信号。
 - `POST /telegram/webhook/<secret>`：Telegram webhook update 入口。
-- `GET /admin?token=<admin_token>`：轻量运营后台页面。
+- `GET /admin?token=<admin_token>`：轻量运营后台页面，顶部有六张运营摘要卡片（与 `/health` 同一组数据），告警计数会高亮成红色。
 - `GET /admin/orders|disputes|deliveries`：运营 JSON 查询。
 - `GET /admin/orders/<order_id>|deliveries/<delivery_id>|disputes/<dispute_id>`：详情页，包含关联对象、证据链和账本流水。
 - `POST /admin/orders/<order_id>/approve|reject`、`POST /admin/deliveries/<delivery_id>/refund`、`POST /admin/dispatch-due`、`POST /admin/confirm-earnings`：运营动作。
+
+`run-web` 启动时会跑 `check_token_strength`：loopback 绑定可零配置；外部 IP 上缺 `CHABO_ADMIN_TOKEN` / `CHABO_WEBHOOK_SECRET`，或 token 短于 16 字符或包含 `test/demo/changeme/secret` 等弱关键字，启动日志会打印明确告警，提示生产前换强随机值。
 
 投放退款支持两种方式：不传 `amount` 时退还该投放剩余可退金额；传 `amount` 时执行部分退款，并按比例回滚频道主待确认收益和平台服务费。
 

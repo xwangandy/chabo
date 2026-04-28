@@ -34,6 +34,7 @@ class FakeGateway:
         self.fail_send = False
         self.fail_pin = False
         self.bot_user = {"id": 999001, "username": "ChaBoTestBot"}
+        self.chats = {}
         self.chat_members = {}
         self.chat_administrators = {}
 
@@ -117,6 +118,12 @@ class FakeGateway:
 
     def get_me(self) -> dict:
         return self.bot_user
+
+    def get_chat(self, *, chat_id: str | int) -> dict:
+        key = str(chat_id)
+        if key not in self.chats:
+            raise TelegramError("chat not found")
+        return self.chats[key]
 
     def get_chat_member(self, *, chat_id: str | int, user_id: str | int) -> dict:
         key = (str(chat_id), str(user_id))
@@ -278,14 +285,49 @@ class ChaboMvpTest(unittest.TestCase):
         )
         self.assertEqual(start["type"], "channel_start")
         self.assertEqual(start["channel_id"], channel["id"])
-        self.assertIn("频道招商", self.gateway.private_messages[-1]["text"])
-        self.assertIn("投广告到 测试频道", self.gateway.private_messages[-1]["text"])
-        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][0][0]["text"], "🧾 投广告到测试频道")
-        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][1][0]["text"], "🗂 广告库")
+        landing = self.gateway.private_messages[-1]
+        self.assertIn("频道招商", landing["text"])
+        self.assertIn("目标频道", landing["text"])
+        self.assertIn("📺 测试频道", landing["text"])
+        self.assertIn("先选插播位", landing["text"])
+        button_texts = [button["text"] for row in landing["inline_keyboard"] for button in row]
+        self.assertIn("🔖 轻插播", button_texts)
+        self.assertIn("🖼 标准插播", button_texts)
+        self.assertNotIn("🗂 广告库", button_texts)
+        self.assertNotIn("💰 广告钱包", button_texts)
 
         with self.app.db.transaction() as conn:
             session = conn.execute("SELECT * FROM advertiser_sessions").fetchone()
         self.assertEqual(session["ref_channel_id"], channel["id"])
+
+    def test_channel_management_syncs_latest_title_from_telegram(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self.gateway.chats[str(-100123)] = {
+            "id": -100123,
+            "type": "channel",
+            "title": "广告投放测试",
+            "username": "ad_test",
+        }
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_sync_title",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}},
+                    "data": "publisher:channels",
+                }
+            }
+        )
+
+        self.assertEqual(result["type"], "callback_publisher_channels")
+        keyboard = self.gateway.private_messages[-1]["inline_keyboard"]
+        self.assertEqual(keyboard[0][0]["text"], "📺 广告投放测试")
+        with self.app.db.transaction() as conn:
+            refreshed = conn.execute("SELECT * FROM channels WHERE id = ?", (channel["id"],)).fetchone()
+        self.assertEqual(refreshed["title"], "广告投放测试")
+        self.assertEqual(refreshed["username"], "ad_test")
 
     def test_start_menu_and_callback_navigation(self) -> None:
         first_start = self.app.update_handler.handle(
@@ -549,6 +591,50 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(advertiser["available_balance_cents"], 800)
         self.assertEqual(advertiser["reserved_balance_cents"], 1200)
         self.assertIsNone(state)
+
+    def test_order_flow_guides_existing_creative_before_budget(self) -> None:
+        channel, _order = self.create_approved_order(slot_type="standard_card", budget="20")
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        slot = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"order:slot:{channel['id']}:standard_card",
+                }
+            }
+        )
+        picker = self.gateway.private_messages[-1]
+        self.assertEqual(slot["type"], "callback_order_slot_selected")
+        self.assertIn("选择广告素材", picker["text"])
+        button_texts = [button["text"] for row in picker["inline_keyboard"] for button in row]
+        self.assertTrue(any(text.startswith("📄 这是一条插播广告") for text in button_texts))
+        self.assertIn("➕ 新建广告", button_texts)
+
+        picked = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "order:pick:0",
+                }
+            }
+        )
+
+        self.assertEqual(picked["type"], "callback_order_creative_selected")
+        self.assertIn("第三步：设置本次预算", self.gateway.private_messages[-1]["text"])
 
     def test_light_tail_order_collects_short_entry_and_full_detail(self) -> None:
         channel = self.bind_channel()

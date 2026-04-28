@@ -85,6 +85,9 @@ class MessageGateway(Protocol):
     def get_me(self) -> dict[str, Any]:
         ...
 
+    def get_chat(self, *, chat_id: str | int) -> dict[str, Any]:
+        ...
+
     def get_chat_member(self, *, chat_id: str | int, user_id: str | int) -> dict[str, Any]:
         ...
 
@@ -199,6 +202,9 @@ class BotApiClient:
 
     def get_me(self) -> dict[str, Any]:
         return self._post("getMe", {})
+
+    def get_chat(self, *, chat_id: str | int) -> dict[str, Any]:
+        return self._post("getChat", {"chat_id": chat_id})
 
     def get_chat_member(self, *, chat_id: str | int, user_id: str | int) -> dict[str, Any]:
         return self._post("getChatMember", {"chat_id": chat_id, "user_id": user_id})
@@ -400,6 +406,9 @@ class NullGateway:
         return None
 
     def get_me(self) -> dict[str, Any]:
+        raise TelegramError("CHABO_BOT_TOKEN is not configured")
+
+    def get_chat(self, *, chat_id: str | int) -> dict[str, Any]:
         raise TelegramError("CHABO_BOT_TOKEN is not configured")
 
     def get_chat_member(self, *, chat_id: str | int, user_id: str | int) -> dict[str, Any]:

@@ -200,6 +200,8 @@ class UpdateHandler:
                 channel = self.channels.get_by_token(conn, channel_token)
                 if channel:
                     break
+            if channel:
+                channel = self._sync_channel_profile_conn(conn, channel)
             session_id = new_id("sess")
             conn.execute(
                 """
@@ -346,6 +348,13 @@ class UpdateHandler:
             channel_id, slot_type = rest.rsplit(":", 1)
             self._set_order_slot(chat_id, user, channel_id, slot_type, message)
             return {"handled": True, "type": "callback_order_slot_selected", "channel_id": channel_id, "slot_type": slot_type}
+        if data.startswith("order:pick:"):
+            index = int(data.removeprefix("order:pick:"))
+            self._select_order_creative(chat_id, user, index, message)
+            return {"handled": True, "type": "callback_order_creative_selected", "index": index}
+        if data == "order:newcreative":
+            self._begin_new_order_creative(chat_id, user, message)
+            return {"handled": True, "type": "callback_order_new_creative"}
         if data == "order:cancel":
             self._clear_conversation(chat_id)
             self._reply_or_edit(
@@ -547,17 +556,17 @@ class UpdateHandler:
             text="\n".join(
                 [
                     "📣 频道招商",
+                    "",
+                    "目标频道",
                     f"📺 {channel_title}",
                     "",
-                    f"投广告到 {channel_title}",
-                    "",
-                    "💵 当前价",
-                    *self._rate_lines(rates),
+                    "先选插播位。",
+                    "下一步：广告素材 -> 预算。",
                     "",
                     "✅ 发布成功才扣费",
                 ]
             ),
-            inline_keyboard=self._channel_sales_keyboard(channel),
+            inline_keyboard=self._slot_picker_keyboard(channel["id"], rates),
         )
 
     def _send_advertiser_library(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
@@ -655,7 +664,7 @@ class UpdateHandler:
     ) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
-            channel = self._find_channel(conn, channel_identifier)
+            channel = self._sync_channel_profile_conn(conn, self._find_channel(conn, channel_identifier))
         channels = self._publisher_channels_for_user(user_id, self._display_name(user))
         if not any(row["id"] == channel["id"] for row in channels):
             self._reply_or_edit(
@@ -814,12 +823,7 @@ class UpdateHandler:
                 return {"handled": True, "type": "order_form_invalid_url"}
             payload["target_url"] = clean_text
             self._set_conversation(chat_id, state["account_id"], "create_order", "budget", payload)
-            price = self._slot_price_cents(payload["channel_id"], payload["slot_type"])
-            self.gateway.send_private_message(
-                chat_id=chat_id,
-                text=f"请设置本次频道插播预算，最低 USD {cents_to_money(price)}。例如：20",
-                inline_keyboard=self._cancel_keyboard(),
-            )
+            self._ask_order_budget(chat_id, payload, None)
             return {"handled": True, "type": "order_form_url_saved"}
 
         if step == "budget":
@@ -911,7 +915,7 @@ class UpdateHandler:
 
     def _send_channel_quote(self, chat_id: str | int, channel_id: str, source_message: dict[str, Any] | None = None) -> None:
         with self.db.transaction() as conn:
-            channel = self.channels.get_channel(conn, channel_id)
+            channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, channel_id))
             rates = conn.execute(
                 """
                 SELECT s.slot_type, r.unit_price_cents, r.currency
@@ -931,7 +935,7 @@ class UpdateHandler:
 
     def _send_channel_order_help(self, chat_id: str | int, channel_id: str, source_message: dict[str, Any] | None = None) -> None:
         with self.db.transaction() as conn:
-            channel = self.channels.get_channel(conn, channel_id)
+            channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, channel_id))
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -1162,6 +1166,29 @@ class UpdateHandler:
     def _add_channel_url(self) -> str:
         return f"https://t.me/{self.settings.bot_username}?startchannel&admin=post_messages+edit_messages+pin_messages"
 
+    def _sync_channel_profile(self, channel: dict[str, Any]) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            return self._sync_channel_profile_conn(conn, channel)
+
+    def _sync_channel_profile_conn(self, conn: Any, channel: dict[str, Any]) -> dict[str, Any]:
+        try:
+            chat = self.gateway.get_chat(chat_id=channel["telegram_chat_id"])
+        except TelegramError:
+            return channel
+        title = chat.get("title") or chat.get("username") or channel["title"]
+        username = self._normalize_username(chat.get("username"))
+        if title == channel.get("title") and username == channel.get("username"):
+            return channel
+        conn.execute(
+            """
+            UPDATE channels
+            SET title = ?, username = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (title, username, channel["id"]),
+        )
+        return {**channel, "title": title, "username": username}
+
     def _publisher_channels_for_user(self, user_id: str | int, display_name: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "publisher", display_name)
@@ -1195,13 +1222,13 @@ class UpdateHandler:
                             can_edit_messages=bool(member.get("can_edit_messages")),
                             can_pin_messages=bool(member.get("can_pin_messages")),
                         )
-                    visible.append(channel)
+                    visible.append(self._sync_channel_profile(channel))
             except TelegramError:
                 # If Telegram cannot answer right now, keep previously bound ownership visible.
                 with self.db.transaction() as conn:
                     owner = conn.execute("SELECT telegram_user_id FROM accounts WHERE id = ?", (channel["owner_account_id"],)).fetchone()
                 if owner and str(owner["telegram_user_id"]) == str(user_id):
-                    visible.append(channel)
+                    visible.append(self._sync_channel_profile(channel))
         return visible
 
     def _user_can_manage_channel(self, user_id: str | int, channel: dict[str, Any]) -> bool:
@@ -1363,7 +1390,7 @@ class UpdateHandler:
 
     def _send_publisher_formats(self, chat_id: str | int, user: dict[str, Any], channel_identifier: str, source_message: dict[str, Any] | None = None) -> None:
         with self.db.transaction() as conn:
-            channel = self._find_channel(conn, channel_identifier)
+            channel = self._sync_channel_profile_conn(conn, self._find_channel(conn, channel_identifier))
             rows = conn.execute(
                 """
                 SELECT p.format_type, p.enabled, p.owner_price_band, p.platform_promo_enabled,
@@ -1438,8 +1465,8 @@ class UpdateHandler:
     def _start_order_flow(self, chat_id: str | int, user: dict[str, Any], channel_id: str, source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, user_id, "advertiser", user.get("first_name") or user.get("username"))
-            channel = self.channels.get_channel(conn, channel_id)
+            self.accounts.get_or_create_by_telegram(conn, user_id, "advertiser", user.get("first_name") or user.get("username"))
+            channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, channel_id))
             rates = conn.execute(
                 """
                 SELECT s.slot_type, r.unit_price_cents, r.currency
@@ -1451,43 +1478,75 @@ class UpdateHandler:
                 (channel_id,),
             ).fetchall()
         self._clear_conversation(chat_id)
-        keyboard = []
-        for rate in rates:
-            keyboard.append(
-                [
-                    {
-                        "text": f"{self._slot_label(rate['slot_type'])} · {rate['currency']} {rate['unit_price_cents'] / 100:.2f}",
-                        "callback_data": f"order:slot:{channel_id}:{rate['slot_type']}",
-                    }
-                ]
-            )
-        keyboard.append([{"text": "❌ 取消", "callback_data": "order:cancel"}])
-        self._reply_or_edit(
-            chat_id=chat_id,
-            source_message=source_message,
-            text=f"🧾 {channel['title']}\n请选择广告位：",
-            inline_keyboard=keyboard,
-        )
+        self._send_channel_sales_landing(chat_id, channel, rates, source_message)
 
     def _set_order_slot(self, chat_id: str | int, user: dict[str, Any], channel_id: str, slot_type: str, source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "advertiser", user.get("first_name") or user.get("username"))
-            channel = self.channels.get_channel(conn, channel_id)
-            rate = self.channels.get_rate(conn, channel_id, slot_type)
+            channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, channel_id))
+            creatives = conn.execute(
+                """
+                SELECT cr.*
+                FROM creatives cr
+                JOIN campaigns ca ON ca.id = cr.campaign_id
+                WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
+                ORDER BY cr.updated_at DESC, cr.created_at DESC
+                LIMIT 5
+                """,
+                (account["id"],),
+            ).fetchall()
+            creative_ids = [row["id"] for row in creatives]
         normalized_slot = self.channels.normalize_slot_type(slot_type)
+        payload = {"channel_id": channel_id, "slot_type": normalized_slot, "creative_ids": creative_ids}
+        if creatives:
+            self._set_conversation(chat_id, account["id"], "create_order", "choose_creative", payload)
+            lines = [
+                "📄 选择广告素材",
+                "",
+                f"频道：{channel['title']}",
+                f"位置：{self._slot_label(normalized_slot)}",
+                "",
+                "选择已有广告，或新建一个。",
+            ]
+            keyboard = []
+            for index, creative in enumerate(creatives):
+                label = self._short_title((creative["text"] or "").replace("\n", " "), 18)
+                keyboard.append([{"text": f"📄 {label}", "callback_data": f"order:pick:{index}"}])
+            keyboard.append([{"text": "➕ 新建广告", "callback_data": "order:newcreative"}])
+            keyboard.append([{"text": "⬅️ 重选广告形式", "callback_data": f"channel:order:{channel_id}"}])
+            self._reply_or_edit(chat_id=chat_id, source_message=source_message, text="\n".join(lines), inline_keyboard=keyboard)
+            return
+
+        self._begin_new_order_creative(chat_id, user, source_message, payload=payload, account_id=account["id"])
+
+    def _begin_new_order_creative(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        payload: dict[str, Any] | None = None,
+        account_id: str | None = None,
+    ) -> None:
+        if payload is None:
+            state = self._get_conversation(chat_id)
+            if not state:
+                self._reply_or_edit(
+                    chat_id=chat_id,
+                    source_message=source_message,
+                    text="⚠️ 当前投放步骤已失效，请从频道入口重新开始。",
+                    inline_keyboard=[[{"text": "🏠 工作台", "callback_data": "menu:home"}]],
+                )
+                return
+            payload = json.loads(state["payload_json"] or "{}")
+            account_id = state["account_id"]
+        normalized_slot = self.channels.normalize_slot_type(payload["slot_type"])
         first_step = "light_short_text" if normalized_slot == "light_tail" else "creative_text"
-        self._set_conversation(
-            chat_id,
-            account["id"],
-            "create_order",
-            first_step,
-            {"channel_id": channel_id, "slot_type": normalized_slot},
-        )
+        self._set_conversation(chat_id, account_id, "create_order", first_step, payload)
         if normalized_slot == "light_tail":
             text = (
-                f"✅ 已选 {self._slot_label(slot_type)}\n"
-                f"💵 USD {cents_to_money(rate['unit_price_cents'])}\n\n"
+                "➕ 新建轻插播广告\n\n"
                 "轻插播会在频道最新帖子底部放一行短入口，尽量不打扰阅读。\n"
                 "用户点击后，会打开 Bot 里的完整广告详情。\n\n"
                 "第一步：请发送 15 个字以内的短入口。\n"
@@ -1495,14 +1554,64 @@ class UpdateHandler:
             )
         else:
             text = (
-                f"✅ 已选 {self._slot_label(slot_type)}\n"
-                f"💵 USD {cents_to_money(rate['unit_price_cents'])}\n\n"
-                "请直接发送广告文案。"
+                f"➕ 新建{self._slot_name(normalized_slot)}广告\n\n"
+                "请发送广告文案。"
             )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=text,
+            inline_keyboard=self._cancel_keyboard(),
+        )
+
+    def _select_order_creative(self, chat_id: str | int, user: dict[str, Any], index: int, source_message: dict[str, Any] | None = None) -> None:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "create_order" or state["step"] != "choose_creative":
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 当前投放步骤已失效，请从频道入口重新开始。",
+                inline_keyboard=[[{"text": "🏠 工作台", "callback_data": "menu:home"}]],
+            )
+            return
+        payload = json.loads(state["payload_json"] or "{}")
+        creative_ids = payload.get("creative_ids") or []
+        if index < 0 or index >= len(creative_ids):
+            self._reply_or_edit(chat_id=chat_id, source_message=source_message, text="⚠️ 没有这个广告素材。", inline_keyboard=self._cancel_keyboard())
+            return
+        with self.db.transaction() as conn:
+            creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (creative_ids[index],)).fetchone()
+        if not creative:
+            self._reply_or_edit(chat_id=chat_id, source_message=source_message, text="⚠️ 广告素材不存在。", inline_keyboard=self._cancel_keyboard())
+            return
+        payload.update(
+            {
+                "creative_text": creative["text"],
+                "target_url": creative["target_url"],
+                "button_text": creative["button_text"],
+                "selected_creative_id": creative["id"],
+            }
+        )
+        self._set_conversation(chat_id, state["account_id"], "create_order", "budget", payload)
+        self._ask_order_budget(chat_id, payload, source_message, prefix="✅ 已选广告素材")
+
+    def _ask_order_budget(
+        self,
+        chat_id: str | int,
+        payload: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        prefix: str = "✅ 广告已准备好",
+    ) -> None:
+        price = self._slot_price_cents(payload["channel_id"], payload["slot_type"])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"{prefix}\n\n"
+                "第三步：设置本次预算。\n"
+                f"最低 USD {cents_to_money(price)}，例如：20"
+            ),
             inline_keyboard=self._cancel_keyboard(),
         )
 
@@ -1570,13 +1679,14 @@ class UpdateHandler:
             [{"text": "💵 价格", "callback_data": f"channel:quote:{channel_id}"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
         ]
 
-    def _channel_sales_keyboard(self, channel: dict[str, Any]) -> list[list[dict[str, str]]]:
-        title = self._short_title(channel["title"], 12)
-        return [
-            [{"text": f"🧾 投广告到{title}", "callback_data": f"channel:order:{channel['id']}"}],
-            [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
-            [{"text": "💵 价格说明", "callback_data": f"channel:quote:{channel['id']}"}, {"text": "🏠 工作台", "callback_data": "menu:home"}],
+    def _slot_picker_keyboard(self, channel_id: str, rates: list[Any]) -> list[list[dict[str, str]]]:
+        slot_buttons = [
+            {"text": self._slot_label(rate["slot_type"]), "callback_data": f"order:slot:{channel_id}:{rate['slot_type']}"}
+            for rate in rates
         ]
+        keyboard = self._button_grid(slot_buttons, 2)
+        keyboard.append([{"text": "💵 价格说明", "callback_data": f"channel:quote:{channel_id}"}, {"text": "🏠 工作台", "callback_data": "menu:home"}])
+        return keyboard
 
     def _channel_tokens_from_start_payload(self, payload: str) -> list[str]:
         if not payload:

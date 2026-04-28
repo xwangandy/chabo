@@ -2230,6 +2230,112 @@ class ChaboMvpTest(unittest.TestCase):
 
     # ---------- AI-callable service-layer surface ----------
 
+    def test_create_order_logs_via_tool_call_audit(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="工具调用埋点订单",
+            target_url="https://example.com",
+        )
+        # AI session creates an order
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+            actor_kind="ai",
+            session_id="sess_order_x1",
+        )
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_order"
+        )
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["session_id"], "sess_order_x1")
+        self.assertEqual(logs[0]["result_status"], "success")
+        self.assertIn(order["id"], logs[0]["result_summary"])
+
+        # Failure path: missing budget triggers InsufficientBalance via reserve
+        # → logged as error
+        from chabo.services import InsufficientBalance, ChaboError  # local import for the test
+        with self.assertRaises(ChaboError):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=10001,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10000"),  # blow past balance
+                actor_kind="ai",
+                session_id="sess_order_x2",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_order"
+        )
+        error_log = next(row for row in all_logs if row["result_status"] == "error")
+        self.assertEqual(error_log["session_id"], "sess_order_x2")
+        self.assertIn(error_log["error_type"], {"InsufficientBalance", "InvalidState"})
+
+    def test_self_promo_prepare_publish_logs_via_tool_call_audit(self) -> None:
+        channel = self.bind_channel()
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用埋点测试",
+            target_url="https://example.com",
+        )
+        prepared = self.app.self_promos.prepare_publish(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            material_id=material["id"],
+            actor_kind="ai",
+            session_id="sess_sp_x1",
+        )
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="self_promo_prepare_publish"
+        )
+        self.assertEqual(logs[0]["session_id"], "sess_sp_x1")
+        self.assertIn(prepared["self_promo_id"], logs[0]["result_summary"])
+
+        # Foreign user → NotFound logged as error
+        with self.assertRaises(NotFound):
+            self.app.self_promos.prepare_publish(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                material_id=material["id"],
+                actor_kind="ai",
+                session_id="sess_sp_x2",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            tool_name="self_promo_prepare_publish"
+        )
+        statuses = {row["result_status"] for row in all_logs}
+        self.assertIn("error", statuses)
+
+    def test_manual_topup_logs_via_tool_call_audit(self) -> None:
+        # Default actor_kind is admin since manual_topup is operator-driven
+        result = self.app.ledger.manual_topup(
+            10001,
+            money_to_cents("12.34"),
+            display_name="广告主",
+            actor_telegram_user_id=33333,
+            session_id="sess_topup_x1",
+        )
+        self.assertEqual(result["available_balance_cents"], 1234)
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="manual_topup"
+        )
+        self.assertEqual(logs[0]["actor_kind"], "admin")
+        self.assertEqual(logs[0]["session_id"], "sess_topup_x1")
+        self.assertIn("1234", logs[0]["result_summary"])
+        # If the caller does not provide actor_telegram_user_id, the recipient's id is used
+        self.app.ledger.manual_topup(20001, money_to_cents("1.00"))
+        fallback = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="manual_topup"
+        )
+        self.assertEqual(fallback[0]["actor_kind"], "admin")
+
     def test_instrumented_services_log_success_and_failure(self) -> None:
         # Success path: AI session calls create_material
         material = self.app.materials.create_material(

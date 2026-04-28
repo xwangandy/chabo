@@ -117,6 +117,7 @@ class LedgerService:
         self.db = db
         self.settings = settings
         self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def _record(
         self,
@@ -308,19 +309,47 @@ class LedgerService:
         *,
         display_name: str | None = None,
         memo: str = "人工入账",
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
-            conn.execute(
-                """
-                UPDATE accounts
-                SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (amount_cents, account["id"]),
+        audit_args = {
+            "telegram_user_id": str(telegram_user_id),
+            "amount_cents": amount_cents,
+            "memo_preview": (memo or "")[:80],
+        }
+        try:
+            with self.db.transaction() as conn:
+                account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (amount_cents, account["id"]),
+                )
+                self._record(conn, account["id"], "manual_topup", amount_cents, memo=memo)
+                result = self.accounts.get(conn, account["id"])
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="manual_topup",
+                actor_telegram_user_id=actor_telegram_user_id if actor_telegram_user_id is not None else telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-            self._record(conn, account["id"], "manual_topup", amount_cents, memo=memo)
-            return self.accounts.get(conn, account["id"])
+            raise
+        self.tool_calls.log_success(
+            tool_name="manual_topup",
+            actor_telegram_user_id=actor_telegram_user_id if actor_telegram_user_id is not None else telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"+{amount_cents} cents to {telegram_user_id}",
+        )
+        return result
 
     def stars_topup(
         self,
@@ -1705,6 +1734,77 @@ class OrderService:
         campaign_name: str = "插播广告",
         unit_price_override_cents: int | None = None,
         price_offer_id: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "channel_token": channel_token,
+            "slot_type": slot_type,
+            "budget_cents": budget_cents,
+            "material_id": material_id,
+            "has_inline_text": bool(text),
+            "has_end_at": end_at is not None,
+            "frequency_per_day": frequency_per_day,
+            "price_offer_id": price_offer_id,
+        }
+        try:
+            order = self._create_order_impl(
+                advertiser_telegram_user_id=advertiser_telegram_user_id,
+                channel_token=channel_token,
+                slot_type=slot_type,
+                budget_cents=budget_cents,
+                text=text,
+                target_url=target_url,
+                button_text=button_text,
+                category=category,
+                light_short_text=light_short_text,
+                material_id=material_id,
+                scheduled_at=scheduled_at,
+                end_at=end_at,
+                frequency_per_day=frequency_per_day,
+                campaign_name=campaign_name,
+                unit_price_override_cents=unit_price_override_cents,
+                price_offer_id=price_offer_id,
+            )
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="create_order",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="create_order",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"created {order['id']}",
+        )
+        return order
+
+    def _create_order_impl(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        channel_token: str,
+        slot_type: str,
+        budget_cents: int,
+        text: str | None,
+        target_url: str | None,
+        button_text: str,
+        category: str,
+        light_short_text: str | None,
+        material_id: str | None,
+        scheduled_at: datetime | None,
+        end_at: datetime | None,
+        frequency_per_day: int,
+        campaign_name: str,
+        unit_price_override_cents: int | None,
+        price_offer_id: str | None,
     ) -> dict[str, Any]:
         scheduled_at = scheduled_at or utcnow()
         slot_type = self.channels.normalize_slot_type(slot_type)
@@ -3043,6 +3143,7 @@ class SelfPromoService:
         self.settings = settings
         self.accounts = AccountService(db, settings)
         self.channels = ChannelService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def list_publishable_materials(
         self,
@@ -3084,6 +3185,8 @@ class SelfPromoService:
         publisher_telegram_user_id: str | int,
         channel_id: str,
         material_id: str,
+        actor_kind: str = "human",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a pending self-promo row and return all data needed to send.
 
@@ -3091,38 +3194,59 @@ class SelfPromoService:
         the caller writes the resulting message_id back via mark_sent /
         mark_failed.
         """
-        with self.db.transaction() as conn:
-            channel = self.channels.get_channel(conn, channel_id)
-            publisher = conn.execute(
-                "SELECT * FROM accounts WHERE telegram_user_id = ?",
-                (str(publisher_telegram_user_id),),
-            ).fetchone()
-            if not publisher or publisher["id"] != channel["owner_account_id"]:
-                raise NotFound(f"频道不属于该用户：{channel_id}")
-            material = conn.execute(
-                "SELECT * FROM creatives WHERE id = ?", (material_id,)
-            ).fetchone()
-            if not material or material["advertiser_account_id"] != publisher["id"]:
-                raise NotFound(f"广告素材不存在：{material_id}")
-            if material["archived_at"]:
-                raise InvalidState("广告素材已归档，无法用于自用发布")
-            if material["format_type"] not in self.PUBLISHABLE_FORMATS:
-                raise InvalidState("自用发布暂只支持标准插播或定制插播素材")
-            self_promo_id = new_id("sp")
-            conn.execute(
-                """
-                INSERT INTO self_promo_publishes (
-                    id, channel_id, creative_id, publisher_account_id, status
+        audit_args = {"channel_id": channel_id, "material_id": material_id}
+        try:
+            with self.db.transaction() as conn:
+                channel = self.channels.get_channel(conn, channel_id)
+                publisher = conn.execute(
+                    "SELECT * FROM accounts WHERE telegram_user_id = ?",
+                    (str(publisher_telegram_user_id),),
+                ).fetchone()
+                if not publisher or publisher["id"] != channel["owner_account_id"]:
+                    raise NotFound(f"频道不属于该用户：{channel_id}")
+                material = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?", (material_id,)
+                ).fetchone()
+                if not material or material["advertiser_account_id"] != publisher["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if material["archived_at"]:
+                    raise InvalidState("广告素材已归档，无法用于自用发布")
+                if material["format_type"] not in self.PUBLISHABLE_FORMATS:
+                    raise InvalidState("自用发布暂只支持标准插播或定制插播素材")
+                self_promo_id = new_id("sp")
+                conn.execute(
+                    """
+                    INSERT INTO self_promo_publishes (
+                        id, channel_id, creative_id, publisher_account_id, status
+                    )
+                    VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (self_promo_id, channel["id"], material["id"], publisher["id"]),
                 )
-                VALUES (?, ?, ?, ?, 'pending')
-                """,
-                (self_promo_id, channel["id"], material["id"], publisher["id"]),
+                prepared = {
+                    "self_promo_id": self_promo_id,
+                    "channel": dict(channel),
+                    "material": dict(material),
+                }
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="self_promo_prepare_publish",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-            return {
-                "self_promo_id": self_promo_id,
-                "channel": dict(channel),
-                "material": dict(material),
-            }
+            raise
+        self.tool_calls.log_success(
+            tool_name="self_promo_prepare_publish",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"prepared {prepared['self_promo_id']}",
+        )
+        return prepared
 
     def mark_sent(self, self_promo_id: str, *, message_id: str) -> dict[str, Any]:
         with self.db.transaction() as conn:

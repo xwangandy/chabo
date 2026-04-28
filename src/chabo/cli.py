@@ -1,0 +1,835 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from .app import create_app
+from .config import Settings
+from .db import Database
+from .money import cents_to_money, money_to_cents
+from .services import NotFound
+
+
+def load_dotenv(path: str = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def print_json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def cmd_init_db(args: argparse.Namespace) -> None:
+    settings = Settings.from_env()
+    Database(settings.db_path).init()
+    print(f"插播数据库已初始化：{settings.db_path}")
+
+
+def cmd_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    account = app.ledger.manual_topup(
+        args.telegram_user_id,
+        money_to_cents(args.amount),
+        display_name=args.display_name,
+        memo=args.memo,
+    )
+    print_json(_account_view(account))
+
+
+def cmd_show_account(args: argparse.Namespace) -> None:
+    app = create_app()
+    with app.db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE telegram_user_id = ? OR id = ?",
+            (args.account, args.account),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"account not found: {args.account}")
+        print_json(_account_view(dict(row)))
+
+
+def cmd_bind_channel(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = app.channels.bind_channel(
+        args.telegram_chat_id,
+        args.title,
+        args.username,
+        args.owner_telegram_user_id,
+        args.owner_display_name,
+    )
+    print_json({"channel": channel, "start_url": app.channels.start_url(channel)})
+
+
+def cmd_set_rate(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    updated = app.channels.update_rate(channel["id"], args.slot_type, money_to_cents(args.amount))
+    print_json(updated)
+
+
+def cmd_set_format_policy(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    policy = app.channels.set_format_policy(
+        channel["id"],
+        args.format_type,
+        enabled=args.enabled,
+        owner_price_band=args.owner_price_band,
+        platform_promo_enabled=args.platform_promo_enabled,
+        custom_multiplier_bps=args.custom_multiplier_bps,
+    )
+    print_json(policy)
+
+
+def cmd_assess_channel(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    assessment = app.pricing.assess_channel(
+        channel_id=channel["id"],
+        category=args.category,
+        median_24h_views=args.median_24h_views,
+        subscribers=args.subscribers,
+        light_clicks_30d=args.light_clicks_30d,
+        light_unique_clickers_30d=args.light_unique_clickers_30d,
+        repeat_purchase_count=args.repeat_purchase_count,
+        dispute_count=args.dispute_count,
+        risk_level=args.risk_level,
+    )
+    print_json(assessment)
+
+
+def cmd_quote_channel(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    quote = app.pricing.quote_channel(channel["id"], args.slot_type, args.owner_price_band)
+    print_json(quote)
+
+
+def cmd_apply_pricing(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    print_json(app.pricing.apply_quotes_to_rate_cards(channel["id"]))
+
+
+def cmd_make_offer(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    offer = app.price_offers.create_offer(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        channel_id=channel["id"],
+        slot_type=args.slot_type,
+        offered_price_cents=money_to_cents(args.amount),
+        creative_text=args.text,
+        target_url=args.target_url,
+        budget_cents=money_to_cents(args.budget) if args.budget else None,
+        button_text=args.button_text,
+        category=args.category,
+        scheduled_at=datetime.fromisoformat(args.scheduled_at) if args.scheduled_at else None,
+        end_at=datetime.fromisoformat(args.end_at) if args.end_at else None,
+        frequency_per_day=args.frequency_per_day,
+        message=args.message,
+    )
+    print_json(offer)
+
+
+def cmd_quote_subscription(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.subscriptions.quote(args.subscribers))
+
+
+def cmd_activate_subscription(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    subscription = app.subscriptions.activate(
+        channel_id=channel["id"],
+        subscriber_count=args.subscribers,
+        months=args.months,
+    )
+    print_json(subscription)
+
+
+def cmd_purchase_subscription(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    subscription = app.subscriptions.purchase(
+        channel_id=channel["id"],
+        subscriber_count=args.subscribers,
+        months=args.months,
+    )
+    print_json(subscription)
+
+
+def cmd_show_subscription(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    print_json(app.subscriptions.get_active(channel["id"]) or {"active": False})
+
+
+def cmd_quote_advertiser_plan(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertiser_subscriptions.quote(args.plan))
+
+
+def cmd_purchase_advertiser_plan(args: argparse.Namespace) -> None:
+    app = create_app()
+    subscription = app.advertiser_subscriptions.purchase(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        plan=args.plan,
+        months=args.months,
+    )
+    print_json(subscription)
+
+
+def cmd_show_advertiser_plan(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertiser_subscriptions.status(args.advertiser_telegram_user_id))
+
+
+def _send_stars_invoice(app: Any, invoice_response: dict[str, Any], chat_id: str | int | None = None) -> dict[str, Any]:
+    invoice = invoice_response["invoice"]
+    intent = invoice_response["intent"]
+    message_id = app.gateway.send_invoice(
+        chat_id=chat_id or intent["telegram_user_id"],
+        title=invoice["title"],
+        description=invoice["description"],
+        payload=invoice["payload"],
+        currency=invoice["currency"],
+        prices=invoice["prices"],
+    )
+    return {**invoice_response, "message_id": message_id}
+
+
+def cmd_send_stars_topup_invoice(args: argparse.Namespace) -> None:
+    app = create_app()
+    invoice_response = app.stars_payments.create_balance_topup_invoice(
+        telegram_user_id=args.telegram_user_id,
+        stars_amount=args.stars,
+        display_name=args.display_name,
+    )
+    print_json(_send_stars_invoice(app, invoice_response, args.chat_id))
+
+
+def cmd_send_publisher_subscription_invoice(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    invoice_response = app.stars_payments.create_publisher_subscription_invoice(
+        channel_id=channel["id"],
+        subscriber_count=args.subscribers,
+        months=args.months,
+    )
+    print_json(_send_stars_invoice(app, invoice_response, args.chat_id))
+
+
+def cmd_send_advertiser_plan_invoice(args: argparse.Namespace) -> None:
+    app = create_app()
+    invoice_response = app.stars_payments.create_advertiser_subscription_invoice(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        plan=args.plan,
+        months=args.months,
+    )
+    print_json(_send_stars_invoice(app, invoice_response, args.chat_id))
+
+
+def cmd_show_stars_payment_intent(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.stars_payments.get_intent(args.intent))
+
+
+def cmd_create_probe(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    probe = app.light_probes.create_probe(
+        channel_id=channel["id"],
+        short_text=args.short_text,
+        detail_text=args.detail_text,
+        target_url=args.target_url,
+        button_text=args.button_text,
+        start_at=datetime.fromisoformat(args.start_at) if args.start_at else None,
+        end_at=datetime.fromisoformat(args.end_at) if args.end_at else None,
+    )
+    print_json({"probe": probe, "start_url": app.light_probes.start_url(probe)})
+
+
+def cmd_pause_probe(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.light_probes.pause_probe(args.probe_id))
+
+
+def cmd_probe_stats(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel_id = None
+    if args.channel:
+        channel = _find_channel(app, args.channel)
+        channel_id = channel["id"]
+    print_json(app.light_probes.stats(channel_id=channel_id, probe_id=args.probe_id))
+
+
+def cmd_discover_channels(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.advertisers.discover_channels(
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+            category=args.category,
+            min_score=args.min_score,
+            max_risk_level=args.max_risk_level,
+            max_price_cents=money_to_cents(args.max_price) if args.max_price else None,
+            slot_type=args.slot_type,
+            limit=args.limit,
+        )
+    )
+
+
+def cmd_save_channel(args: argparse.Namespace) -> None:
+    app = create_app()
+    channel = _find_channel(app, args.channel)
+    print_json(
+        app.advertisers.save_channel(
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+            channel_id=channel["id"],
+            note=args.note,
+        )
+    )
+
+
+def cmd_list_saved_channels(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertisers.list_saved_channels(args.advertiser_telegram_user_id))
+
+
+def cmd_create_alert_rule(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.advertisers.create_alert_rule(
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+            category=args.category,
+            min_score=args.min_score,
+            max_risk_level=args.max_risk_level,
+            max_price_cents=money_to_cents(args.max_price) if args.max_price else None,
+            slot_type=args.slot_type,
+        )
+    )
+
+
+def cmd_scan_alerts(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertisers.scan_alerts(args.advertiser_telegram_user_id))
+
+
+def cmd_list_alerts(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertisers.list_alert_events(args.advertiser_telegram_user_id, status=args.status))
+
+
+def cmd_advertiser_report(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.advertisers.report(args.advertiser_telegram_user_id))
+
+
+def cmd_batch_orders(args: argparse.Namespace) -> None:
+    app = create_app()
+    tokens = [token.strip() for token in args.channel_tokens.split(",") if token.strip()]
+    print_json(
+        app.advertisers.create_batch_orders(
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+            channel_tokens=tokens,
+            slot_type=args.slot_type,
+            text=args.text,
+            target_url=args.target_url,
+            budget_cents=money_to_cents(args.budget),
+            button_text=args.button_text,
+            category=args.category,
+        )
+    )
+
+
+def cmd_respond_offer(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.price_offers.respond_offer(args.offer_id, accepted=args.accept))
+
+
+def cmd_create_order(args: argparse.Namespace) -> None:
+    app = create_app()
+    order = app.orders.create_order(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        channel_token=args.channel_token,
+        slot_type=args.slot_type,
+        text=args.text,
+        target_url=args.target_url,
+        budget_cents=money_to_cents(args.budget),
+        button_text=args.button_text,
+        category=args.category,
+        scheduled_at=datetime.fromisoformat(args.scheduled_at) if args.scheduled_at else None,
+        end_at=datetime.fromisoformat(args.end_at) if args.end_at else None,
+        frequency_per_day=args.frequency_per_day,
+        campaign_name=args.campaign_name,
+    )
+    print_json(order)
+
+
+def cmd_approve_order(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.orders.approve_order(args.order_id))
+
+
+def cmd_reject_order(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.orders.reject_order(args.order_id, args.reason))
+
+
+def cmd_refund_delivery(args: argparse.Namespace) -> None:
+    app = create_app()
+    if args.amount:
+        print_json(app.orders.refund_delivery_partial(args.delivery_id, money_to_cents(args.amount), args.reason))
+    else:
+        print_json(app.orders.refund_delivery(args.delivery_id, args.reason))
+
+
+def cmd_dispatch_due(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.fulfillment.dispatch_due(args.limit))
+
+
+def cmd_confirm_earnings(args: argparse.Namespace) -> None:
+    app = create_app()
+    count = app.fulfillment.confirm_due_earnings(args.observation_hours)
+    print_json({"confirmed_deliveries": count})
+
+
+def cmd_list_orders(args: argparse.Namespace) -> None:
+    app = create_app()
+    with app.db.transaction() as conn:
+        rows = conn.execute(
+            """
+            SELECT o.id, o.status, o.budget_cents, o.reserved_cents, o.spent_cents,
+                   o.scheduled_at, c.title AS channel_title, cr.text AS creative_text
+            FROM ad_orders o
+            JOIN channels c ON c.id = o.channel_id
+            JOIN creatives cr ON cr.id = o.creative_id
+            ORDER BY o.created_at DESC
+            LIMIT ?
+            """,
+            (args.limit,),
+        ).fetchall()
+        print_json([dict(row) for row in rows])
+
+
+def cmd_open_dispute(args: argparse.Namespace) -> None:
+    app = create_app()
+    dispute = app.disputes.open_dispute(
+        opened_by_telegram_user_id=args.opened_by_telegram_user_id,
+        delivery_id=args.delivery_id,
+        reason=args.reason,
+    )
+    print_json(dispute)
+
+
+def cmd_list_disputes(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.disputes.list_disputes(status=args.status, limit=args.limit))
+
+
+def cmd_resolve_dispute(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(app.disputes.resolve_dispute(dispute_id=args.dispute_id, resolution=args.resolution))
+
+
+def cmd_handle_update(args: argparse.Namespace) -> None:
+    app = create_app()
+    update = json.loads(Path(args.file).read_text(encoding="utf-8")) if args.file else json.load(sys.stdin)
+    print_json(app.update_handler.handle(update))
+
+
+def cmd_run_polling(args: argparse.Namespace) -> None:
+    from .polling import PollingRunner
+
+    settings = Settings.from_env()
+    PollingRunner(settings).run(
+        timeout=args.timeout,
+        limit=args.limit,
+        once=args.once,
+        drop_pending_updates=args.drop_pending_updates,
+    )
+
+
+def cmd_run_web(args: argparse.Namespace) -> None:
+    from .web import run_server
+
+    settings = Settings.from_env()
+    run_server(
+        settings=settings,
+        host=args.host,
+        port=args.port,
+        admin_token=args.admin_token,
+        webhook_secret=args.webhook_secret,
+    )
+
+
+def cmd_set_webhook(args: argparse.Namespace) -> None:
+    settings = Settings.from_env()
+    if not settings.bot_token:
+        raise RuntimeError("CHABO_BOT_TOKEN is required")
+    from .telegram import BotApiClient
+
+    secret = args.secret or settings.webhook_secret
+    result = BotApiClient(settings.bot_token, settings.telegram_http_backend).set_webhook(
+        url=args.url,
+        secret_token=secret,
+        drop_pending_updates=args.drop_pending_updates,
+    )
+    print_json({"ok": result, "url": args.url, "secret_configured": bool(secret)})
+
+
+def _find_channel(app: Any, identifier: str) -> dict[str, Any]:
+    with app.db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM channels WHERE id = ? OR ref_token = ? OR telegram_chat_id = ? OR username = ?",
+            (identifier, identifier, identifier, identifier),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"channel not found: {identifier}")
+        return dict(row)
+
+
+def _account_view(account: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": account["id"],
+        "telegram_user_id": account["telegram_user_id"],
+        "role": account["role"],
+        "display_name": account["display_name"],
+        "available": cents_to_money(account["available_balance_cents"]),
+        "reserved": cents_to_money(account["reserved_balance_cents"]),
+        "spent": cents_to_money(account["spent_balance_cents"]),
+        "pending_earnings": cents_to_money(account["pending_earnings_cents"]),
+        "confirmed_earnings": cents_to_money(account["confirmed_earnings_cents"]),
+        "releasable_earnings": cents_to_money(account["releasable_earnings_cents"]),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="chabo", description="插播 Telegram 广告插播 MVP 管理工具")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init-db", help="初始化 SQLite 数据库")
+    p.set_defaults(func=cmd_init_db)
+
+    p = sub.add_parser("topup", help="人工入账广告主插播余额")
+    p.add_argument("--telegram-user-id", required=True)
+    p.add_argument("--amount", required=True, help="金额，例如 100 或 100.50")
+    p.add_argument("--display-name")
+    p.add_argument("--memo", default="人工入账")
+    p.set_defaults(func=cmd_topup)
+
+    p = sub.add_parser("show-account", help="查看账户余额")
+    p.add_argument("account", help="account_id 或 telegram_user_id")
+    p.set_defaults(func=cmd_show_account)
+
+    p = sub.add_parser("bind-channel", help="绑定频道并生成插播入口")
+    p.add_argument("--telegram-chat-id", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("--username")
+    p.add_argument("--owner-telegram-user-id", required=True)
+    p.add_argument("--owner-display-name")
+    p.set_defaults(func=cmd_bind_channel)
+
+    p = sub.add_parser("set-rate", help="设置频道广告位刊例价")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--amount", required=True)
+    p.set_defaults(func=cmd_set_rate)
+
+    p = sub.add_parser("set-format-policy", help="设置频道主接受的插播广告形态")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--format-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--owner-price-band", default="medium", choices=["low", "medium", "high", "custom"])
+    p.add_argument("--platform-promo-enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--custom-multiplier-bps", type=int)
+    p.set_defaults(func=cmd_set_format_policy)
+
+    p = sub.add_parser("assess-channel", help="生成频道插播定价评估")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--category", default="general")
+    p.add_argument("--median-24h-views", type=int, default=0)
+    p.add_argument("--subscribers", type=int, default=0)
+    p.add_argument("--light-clicks-30d", type=int, default=0)
+    p.add_argument("--light-unique-clickers-30d", type=int, default=0)
+    p.add_argument("--repeat-purchase-count", type=int, default=0)
+    p.add_argument("--dispute-count", type=int, default=0)
+    p.add_argument("--risk-level", default="normal", choices=["normal", "watch", "high", "blocked"])
+    p.set_defaults(func=cmd_assess_channel)
+
+    p = sub.add_parser("quote-channel", help="按最新评估给频道广告形态报价")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--owner-price-band", choices=["low", "medium", "high", "custom"])
+    p.set_defaults(func=cmd_quote_channel)
+
+    p = sub.add_parser("apply-pricing", help="把最新报价写入频道刊例价")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.set_defaults(func=cmd_apply_pricing)
+
+    p = sub.add_parser("make-offer", help="广告主对频道发起砍价报价")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--amount", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--budget", help="不填则默认等于报价金额")
+    p.add_argument("--button-text", default="查看详情")
+    p.add_argument("--category", default="general")
+    p.add_argument("--scheduled-at", help="ISO 时间，默认立即")
+    p.add_argument("--end-at", help="循环插播可用")
+    p.add_argument("--frequency-per-day", type=int, default=1)
+    p.add_argument("--message")
+    p.set_defaults(func=cmd_make_offer)
+
+    p = sub.add_parser("quote-subscription", help="按订阅人数计算频道高级订阅月费")
+    p.add_argument("--subscribers", type=int, required=True)
+    p.set_defaults(func=cmd_quote_subscription)
+
+    p = sub.add_parser("activate-subscription", help="开通频道高级订阅")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--subscribers", type=int, required=True)
+    p.add_argument("--months", type=int, default=1)
+    p.set_defaults(func=cmd_activate_subscription)
+
+    p = sub.add_parser("purchase-subscription", help="从频道主余额扣款购买频道高级订阅")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--subscribers", type=int, required=True)
+    p.add_argument("--months", type=int, default=1)
+    p.set_defaults(func=cmd_purchase_subscription)
+
+    p = sub.add_parser("show-subscription", help="查看频道当前高级订阅")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.set_defaults(func=cmd_show_subscription)
+
+    p = sub.add_parser("quote-advertiser-plan", help="查看广告主高级服务套餐")
+    p.add_argument("--plan", required=True, choices=["pro", "enterprise"])
+    p.set_defaults(func=cmd_quote_advertiser_plan)
+
+    p = sub.add_parser("purchase-advertiser-plan", help="从广告主余额扣款购买高级服务")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--plan", required=True, choices=["pro", "enterprise"])
+    p.add_argument("--months", type=int, default=1)
+    p.set_defaults(func=cmd_purchase_advertiser_plan)
+
+    p = sub.add_parser("show-advertiser-plan", help="查看广告主高级服务状态")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.set_defaults(func=cmd_show_advertiser_plan)
+
+    p = sub.add_parser("send-stars-topup-invoice", help="发送广告主 Stars 余额充值发票")
+    p.add_argument("--telegram-user-id", required=True)
+    p.add_argument("--stars", type=int, required=True, help="Telegram Stars 数量")
+    p.add_argument("--display-name")
+    p.add_argument("--chat-id", help="默认发给 telegram-user-id")
+    p.set_defaults(func=cmd_send_stars_topup_invoice)
+
+    p = sub.add_parser("send-publisher-subscription-invoice", help="发送频道主高级订阅 Stars 发票")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--subscribers", type=int, required=True)
+    p.add_argument("--months", type=int, default=1)
+    p.add_argument("--chat-id", help="默认发给频道主账号")
+    p.set_defaults(func=cmd_send_publisher_subscription_invoice)
+
+    p = sub.add_parser("send-advertiser-plan-invoice", help="发送广告主高级服务 Stars 发票")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--plan", required=True, choices=["pro", "enterprise"])
+    p.add_argument("--months", type=int, default=1)
+    p.add_argument("--chat-id", help="默认发给广告主")
+    p.set_defaults(func=cmd_send_advertiser_plan_invoice)
+
+    p = sub.add_parser("show-stars-payment-intent", help="查看 Stars 支付意图")
+    p.add_argument("intent", help="intent_id 或 invoice payload")
+    p.set_defaults(func=cmd_show_stars_payment_intent)
+
+    p = sub.add_parser("create-probe", help="创建频道轻插播探针")
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--short-text", required=True, help="短文案，用于运营识别")
+    p.add_argument("--detail-text", required=True, help="用户点击后在 Bot 内看到的详情")
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--button-text", default="了解详情")
+    p.add_argument("--start-at", help="ISO 时间，默认立即")
+    p.add_argument("--end-at", help="ISO 时间")
+    p.set_defaults(func=cmd_create_probe)
+
+    p = sub.add_parser("pause-probe", help="暂停轻插播探针")
+    p.add_argument("--probe-id", required=True)
+    p.set_defaults(func=cmd_pause_probe)
+
+    p = sub.add_parser("probe-stats", help="查看轻插播探针点击统计")
+    p.add_argument("--channel", help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--probe-id")
+    p.set_defaults(func=cmd_probe_stats)
+
+    p = sub.add_parser("discover-channels", help="广告主发现优质频道")
+    p.add_argument("--advertiser-telegram-user-id", help="传入后按广告主订阅套餐放开发现数量")
+    p.add_argument("--category")
+    p.add_argument("--min-score", type=int, default=0)
+    p.add_argument("--max-risk-level", default="watch", choices=["normal", "watch", "high", "blocked"])
+    p.add_argument("--max-price")
+    p.add_argument("--slot-type", default="standard_card", choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_discover_channels)
+
+    p = sub.add_parser("save-channel", help="广告主收藏频道")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_save_channel)
+
+    p = sub.add_parser("list-saved-channels", help="查看广告主收藏频道")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.set_defaults(func=cmd_list_saved_channels)
+
+    p = sub.add_parser("create-alert-rule", help="创建新频道/优质频道提醒规则")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--category")
+    p.add_argument("--min-score", type=int, default=70)
+    p.add_argument("--max-risk-level", default="normal", choices=["normal", "watch", "high", "blocked"])
+    p.add_argument("--max-price")
+    p.add_argument("--slot-type", default="standard_card", choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.set_defaults(func=cmd_create_alert_rule)
+
+    p = sub.add_parser("scan-alerts", help="扫描并生成广告主频道提醒事件")
+    p.add_argument("--advertiser-telegram-user-id")
+    p.set_defaults(func=cmd_scan_alerts)
+
+    p = sub.add_parser("list-alerts", help="查看广告主频道提醒事件")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--status", default="new")
+    p.set_defaults(func=cmd_list_alerts)
+
+    p = sub.add_parser("advertiser-report", help="查看广告主投放报表")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.set_defaults(func=cmd_advertiser_report)
+
+    p = sub.add_parser("batch-orders", help="批量创建插播订单")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--channel-tokens", required=True, help="多个 ref_token，用逗号分隔")
+    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--text", required=True)
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--budget", required=True, help="每个频道的预算")
+    p.add_argument("--button-text", default="查看详情")
+    p.add_argument("--category", default="general")
+    p.set_defaults(func=cmd_batch_orders)
+
+    p = sub.add_parser("respond-offer", help="频道主接受或拒绝砍价报价")
+    p.add_argument("--offer-id", required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--accept", action="store_true")
+    group.add_argument("--reject", action="store_true")
+    p.set_defaults(func=cmd_respond_offer)
+
+    p = sub.add_parser("create-order", help="创建插播订单并冻结预算")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--channel-token", required=True)
+    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--text", required=True)
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--budget", required=True)
+    p.add_argument("--button-text", default="查看详情")
+    p.add_argument("--category", default="general")
+    p.add_argument("--scheduled-at", help="ISO 时间，默认立即")
+    p.add_argument("--end-at", help="ISO 时间，循环插播可用")
+    p.add_argument("--frequency-per-day", type=int, default=1)
+    p.add_argument("--campaign-name", default="插播广告")
+    p.set_defaults(func=cmd_create_order)
+
+    p = sub.add_parser("approve-order", help="审核通过订单并创建首个投放任务")
+    p.add_argument("--order-id", required=True)
+    p.set_defaults(func=cmd_approve_order)
+
+    p = sub.add_parser("reject-order", help="审核拒绝订单并释放冻结预算")
+    p.add_argument("--order-id", required=True)
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_reject_order)
+
+    p = sub.add_parser("refund-delivery", help="对已扣费投放执行退款；不传 amount 时全额退款")
+    p.add_argument("--delivery-id", required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--amount", help="部分退款金额，例如 3.50；不填则退还剩余可退金额")
+    p.set_defaults(func=cmd_refund_delivery)
+
+    p = sub.add_parser("dispatch-due", help="调度到期插播任务")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_dispatch_due)
+
+    p = sub.add_parser("confirm-earnings", help="确认观察期到期的频道主收益")
+    p.add_argument("--observation-hours", type=int, default=24)
+    p.set_defaults(func=cmd_confirm_earnings)
+
+    p = sub.add_parser("list-orders", help="列出订单")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_list_orders)
+
+    p = sub.add_parser("open-dispute", help="创建插播争议并保留证据")
+    p.add_argument("--opened-by-telegram-user-id", required=True)
+    p.add_argument("--delivery-id", required=True)
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_open_dispute)
+
+    p = sub.add_parser("list-disputes", help="列出插播争议")
+    p.add_argument("--status")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_list_disputes)
+
+    p = sub.add_parser("resolve-dispute", help="人工裁决插播争议")
+    p.add_argument("--dispute-id", required=True)
+    p.add_argument("--resolution", required=True)
+    p.set_defaults(func=cmd_resolve_dispute)
+
+    p = sub.add_parser("handle-update", help="从 JSON 文件或 stdin 处理一条 Telegram update")
+    p.add_argument("--file")
+    p.set_defaults(func=cmd_handle_update)
+
+    p = sub.add_parser("run-polling", help="启动插播 Bot polling 运行器")
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--once", action="store_true", help="只拉取并处理一轮 update，适合测试")
+    p.add_argument("--drop-pending-updates", action="store_true", help="启动前丢弃 Telegram 侧积压 update")
+    p.set_defaults(func=cmd_run_polling)
+
+    p = sub.add_parser("run-web", help="启动插播 HTTP webhook 与运营后台")
+    p.add_argument("--host", default=None, help="默认读取 CHABO_WEB_HOST")
+    p.add_argument("--port", type=int, default=None, help="默认读取 CHABO_WEB_PORT")
+    p.add_argument("--admin-token", help="覆盖 CHABO_ADMIN_TOKEN")
+    p.add_argument("--webhook-secret", help="覆盖 CHABO_WEBHOOK_SECRET")
+    p.set_defaults(func=cmd_run_web)
+
+    p = sub.add_parser("set-webhook", help="把 Telegram webhook 指向插播 HTTP 服务公网地址")
+    p.add_argument("--url", required=True, help="例如 https://example.com/telegram/webhook/<secret>")
+    p.add_argument("--secret", help="Telegram secret_token；默认读取 CHABO_WEBHOOK_SECRET")
+    p.add_argument("--drop-pending-updates", action="store_true")
+    p.set_defaults(func=cmd_set_webhook)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+        return 0
+    except Exception as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

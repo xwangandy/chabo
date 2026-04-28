@@ -958,6 +958,273 @@ class ChannelService:
         )
 
 
+class MaterialService:
+    """Independent ad material (creative) library.
+
+    Stable boundary for Bot, CLI, Admin and future AI tool calls. All
+    public methods validate ownership through advertiser_telegram_user_id.
+    Format codes are internal: light_tail (文字插播), standard_card (标准插播),
+    strong_post (定制插播); display layers translate to Chinese product names.
+    """
+
+    SUPPORTED_FORMATS = ("light_tail", "standard_card", "strong_post")
+    LIGHT_SHORT_TEXT_MIN = 2
+    LIGHT_SHORT_TEXT_MAX = 15
+    LIBRARY_CAMPAIGN_NAME = "插播素材库"
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+
+    def create_material(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str = "查看详情",
+        category: str = "general",
+        light_short_text: str | None = None,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        format_type = self._normalize_format(format_type)
+        text, target_url, button_text, category = self._normalize_text_fields(
+            text, target_url, button_text, category
+        )
+        if format_type == "light_tail":
+            short = (light_short_text or "").strip()
+            if len(short) < self.LIGHT_SHORT_TEXT_MIN:
+                raise InvalidState(
+                    f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
+                )
+            if len(short) > self.LIGHT_SHORT_TEXT_MAX:
+                raise InvalidState(
+                    f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
+                )
+            light_short_text = short
+        else:
+            light_short_text = None
+
+        with self.db.transaction() as conn:
+            advertiser = self.accounts.get_or_create_by_telegram(
+                conn,
+                advertiser_telegram_user_id,
+                "advertiser",
+                display_name=display_name,
+            )
+            material_id = self._insert_material(
+                conn,
+                advertiser_account_id=advertiser["id"],
+                format_type=format_type,
+                text=text,
+                target_url=target_url,
+                button_text=button_text,
+                category=category,
+                light_short_text=light_short_text,
+            )
+            return self._fetch_material(conn, material_id)
+
+    def list_materials(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        format_type: str | None = None,
+        include_archived: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                return []
+            sql = "SELECT * FROM creatives WHERE advertiser_account_id = ?"
+            params: list[Any] = [advertiser["id"]]
+            if format_type is not None:
+                sql += " AND format_type = ?"
+                params.append(self._normalize_format(format_type))
+            if not include_archived:
+                sql += " AND archived_at IS NULL"
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM creatives WHERE id = ?",
+                (material_id,),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            material = dict(row)
+            if advertiser_telegram_user_id is not None:
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser or material["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+            return material
+
+    def archive_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM creatives WHERE id = ?",
+                (material_id,),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser or row["advertiser_account_id"] != advertiser["id"]:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            if row["archived_at"]:
+                return dict(row)
+            conn.execute(
+                "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (iso(), material_id),
+            )
+            return self._fetch_material(conn, material_id)
+
+    # ------ helpers reusable from OrderService inside an open transaction ------
+
+    def insert_material_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str = "查看详情",
+        category: str = "general",
+        light_short_text: str | None = None,
+        campaign_id: str | None = None,
+    ) -> str:
+        format_type = self._normalize_format(format_type)
+        text, target_url, button_text, category = self._normalize_text_fields(
+            text, target_url, button_text, category
+        )
+        if format_type == "light_tail" and light_short_text:
+            light_short_text = light_short_text.strip() or None
+        else:
+            light_short_text = None
+        return self._insert_material(
+            conn,
+            advertiser_account_id=advertiser_account_id,
+            format_type=format_type,
+            text=text,
+            target_url=target_url,
+            button_text=button_text,
+            category=category,
+            light_short_text=light_short_text,
+            campaign_id=campaign_id,
+        )
+
+    def ensure_library_campaign(
+        self, conn: sqlite3.Connection, advertiser_account_id: str
+    ) -> str:
+        row = conn.execute(
+            "SELECT id FROM campaigns WHERE advertiser_account_id = ? AND name = ? LIMIT 1",
+            (advertiser_account_id, self.LIBRARY_CAMPAIGN_NAME),
+        ).fetchone()
+        if row:
+            return row["id"]
+        campaign_id = new_id("camp")
+        conn.execute(
+            "INSERT INTO campaigns (id, advertiser_account_id, name) VALUES (?, ?, ?)",
+            (campaign_id, advertiser_account_id, self.LIBRARY_CAMPAIGN_NAME),
+        )
+        return campaign_id
+
+    # ----------------------------- internals -----------------------------
+
+    def _insert_material(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str,
+        category: str,
+        light_short_text: str | None,
+        campaign_id: str | None = None,
+    ) -> str:
+        if not text:
+            raise InvalidState("广告素材文案不能为空")
+        if not target_url:
+            raise InvalidState("广告素材必须包含目标链接")
+        if campaign_id is None:
+            campaign_id = self.ensure_library_campaign(conn, advertiser_account_id)
+        material_id = new_id("cre")
+        content_hash = hashlib.sha256(
+            f"{format_type}|{light_short_text or ''}|{text}|{target_url}|{button_text}".encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO creatives (
+                id, campaign_id, advertiser_account_id, format_type,
+                text, target_url, button_text, category, light_short_text,
+                status, content_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)
+            """,
+            (
+                material_id,
+                campaign_id,
+                advertiser_account_id,
+                format_type,
+                text,
+                target_url,
+                button_text,
+                category,
+                light_short_text,
+                content_hash,
+            ),
+        )
+        return material_id
+
+    def _fetch_material(self, conn: sqlite3.Connection, material_id: str) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM creatives WHERE id = ?", (material_id,)).fetchone()
+        return dict(row)
+
+    def _normalize_format(self, format_type: str) -> str:
+        if format_type not in self.SUPPORTED_FORMATS:
+            raise InvalidState(
+                "不支持的素材形态："
+                f"{format_type}（仅支持 light_tail / standard_card / strong_post）"
+            )
+        return format_type
+
+    def _normalize_text_fields(
+        self, text: str, target_url: str, button_text: str, category: str
+    ) -> tuple[str, str, str, str]:
+        text = (text or "").strip()
+        target_url = (target_url or "").strip()
+        button_text = (button_text or "查看详情").strip() or "查看详情"
+        category = (category or "general").strip() or "general"
+        return text, target_url, button_text, category
+
+
 class OrderService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -965,6 +1232,7 @@ class OrderService:
         self.accounts = AccountService(db, settings)
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
+        self.materials = MaterialService(db, settings)
 
     def create_order(
         self,

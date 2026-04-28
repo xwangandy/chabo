@@ -1022,6 +1022,66 @@ class ChannelService:
             ).fetchone()
             return dict(row)
 
+    def _verify_publisher_owns_channel(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+    ) -> None:
+        account = conn.execute(
+            "SELECT id FROM accounts WHERE telegram_user_id = ?",
+            (str(publisher_telegram_user_id),),
+        ).fetchone()
+        if not account:
+            raise NotFound(f"频道不存在：{channel_id}")
+        channel = conn.execute(
+            "SELECT owner_account_id FROM channels WHERE id = ?", (channel_id,)
+        ).fetchone()
+        if not channel or channel["owner_account_id"] != account["id"]:
+            raise NotFound(f"频道不存在：{channel_id}")
+
+    def set_format_policy_for_publisher(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        format_type: str,
+        enabled: bool,
+        owner_price_band: str = "medium",
+        platform_promo_enabled: bool = True,
+        custom_multiplier_bps: int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            self._verify_publisher_owns_channel(
+                conn,
+                publisher_telegram_user_id=publisher_telegram_user_id,
+                channel_id=channel_id,
+            )
+        return self.set_format_policy(
+            channel_id,
+            format_type,
+            enabled=enabled,
+            owner_price_band=owner_price_band,
+            platform_promo_enabled=platform_promo_enabled,
+            custom_multiplier_bps=custom_multiplier_bps,
+        )
+
+    def set_daily_ad_limit_for_publisher(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        daily_ad_limit: int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            self._verify_publisher_owns_channel(
+                conn,
+                publisher_telegram_user_id=publisher_telegram_user_id,
+                channel_id=channel_id,
+            )
+        return self.set_daily_ad_limit(channel_id, daily_ad_limit)
+
     def set_daily_ad_limit(self, channel_id: str, daily_ad_limit: int) -> dict[str, Any]:
         if daily_ad_limit < 1 or daily_ad_limit > 24:
             raise InvalidState("每日广告条数需要在 1 到 24 之间")

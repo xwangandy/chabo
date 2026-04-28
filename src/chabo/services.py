@@ -3164,6 +3164,7 @@ class PriceOfferService:
         self.channels = ChannelService(db, settings)
         self.pricing = PricingService(db, settings)
         self.ledger = LedgerService(db, settings)
+        self.materials = MaterialService(db, settings)
 
     def create_offer(
         self,
@@ -3277,11 +3278,7 @@ class PriceOfferService:
             raise InsufficientBalance("广告主插播余额不足，接受砍价后无法冻结预算")
 
         campaign_id = new_id("camp")
-        creative_id = new_id("cre")
         order_id = new_id("ord")
-        content_hash = hashlib.sha256(
-            f"{offer['creative_text']}|{offer['target_url']}|{offer['button_text']}".encode("utf-8")
-        ).hexdigest()
         scheduled_at = offer["scheduled_at"] or iso()
         conn.execute(
             """
@@ -3290,22 +3287,20 @@ class PriceOfferService:
             """,
             (campaign_id, offer["advertiser_account_id"], "砍价成交插播广告"),
         )
-        conn.execute(
-            """
-            INSERT INTO creatives (
-                id, campaign_id, text, target_url, button_text, category, content_hash
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                creative_id,
-                campaign_id,
-                offer["creative_text"],
-                offer["target_url"],
-                offer["button_text"],
-                offer["category"],
-                content_hash,
-            ),
+        material_format = (
+            offer["slot_type"]
+            if offer["slot_type"] in MaterialService.SUPPORTED_FORMATS
+            else "standard_card"
+        )
+        creative_id = self.materials.insert_material_in_conn(
+            conn,
+            advertiser_account_id=offer["advertiser_account_id"],
+            format_type=material_format,
+            text=offer["creative_text"],
+            target_url=offer["target_url"],
+            button_text=offer["button_text"],
+            category=offer["category"],
+            campaign_id=campaign_id,
         )
         conn.execute(
             """
@@ -3334,7 +3329,19 @@ class PriceOfferService:
             ),
         )
         self.ledger.reserve_budget(conn, offer["advertiser_account_id"], order_id, budget_cents, rate["currency"])
-        self._snapshot(conn, order_id, None, "creative", {"text": offer["creative_text"], "target_url": offer["target_url"], "button_text": offer["button_text"]})
+        self._snapshot(
+            conn,
+            order_id,
+            None,
+            "creative",
+            {
+                "text": offer["creative_text"],
+                "target_url": offer["target_url"],
+                "button_text": offer["button_text"],
+                "format_type": material_format,
+                "material_id": creative_id,
+            },
+        )
         self._snapshot(conn, order_id, None, "accepted_price_offer", dict(offer))
         self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": offer["offered_price_cents"], "price_offer_id": offer["id"]})
         self._snapshot(conn, order_id, None, "channel", channel)

@@ -1240,11 +1240,13 @@ class OrderService:
         advertiser_telegram_user_id: str | int,
         channel_token: str,
         slot_type: str,
-        text: str,
-        target_url: str,
         budget_cents: int,
+        text: str | None = None,
+        target_url: str | None = None,
         button_text: str = "查看详情",
         category: str = "general",
+        light_short_text: str | None = None,
+        material_id: str | None = None,
         scheduled_at: datetime | None = None,
         end_at: datetime | None = None,
         frequency_per_day: int = 1,
@@ -1254,6 +1256,8 @@ class OrderService:
     ) -> dict[str, Any]:
         scheduled_at = scheduled_at or utcnow()
         slot_type = self.channels.normalize_slot_type(slot_type)
+        if material_id is None and not (text and target_url):
+            raise InvalidState("创建订单需要提供 material_id 或者 text+target_url")
         with self.db.transaction() as conn:
             advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
             channel = self.channels.get_by_token(conn, channel_token)
@@ -1284,9 +1288,7 @@ class OrderService:
             if budget_cents < unit_price_cents:
                 raise InvalidState("插播预算低于该广告位单次刊例价")
             campaign_id = new_id("camp")
-            creative_id = new_id("cre")
             order_id = new_id("ord")
-            content_hash = hashlib.sha256(f"{text}|{target_url}|{button_text}".encode("utf-8")).hexdigest()
             conn.execute(
                 """
                 INSERT INTO campaigns (id, advertiser_account_id, name)
@@ -1294,15 +1296,48 @@ class OrderService:
                 """,
                 (campaign_id, advertiser["id"], campaign_name),
             )
-            conn.execute(
-                """
-                INSERT INTO creatives (
-                    id, campaign_id, text, target_url, button_text, category, content_hash
+            if material_id is not None:
+                material = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?", (material_id,)
+                ).fetchone()
+                if not material or material["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if material["archived_at"]:
+                    raise InvalidState("广告素材已归档，请先恢复或选择其他素材")
+                creative_id = material["id"]
+                creative_snapshot = {
+                    "text": material["text"],
+                    "target_url": material["target_url"],
+                    "button_text": material["button_text"],
+                    "format_type": material["format_type"],
+                    "light_short_text": material["light_short_text"],
+                    "material_id": material["id"],
+                }
+            else:
+                material_format = (
+                    slot_type
+                    if slot_type in MaterialService.SUPPORTED_FORMATS
+                    else "standard_card"
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (creative_id, campaign_id, text, target_url, button_text, category, content_hash),
-            )
+                creative_id = self.materials.insert_material_in_conn(
+                    conn,
+                    advertiser_account_id=advertiser["id"],
+                    format_type=material_format,
+                    text=text or "",
+                    target_url=target_url or "",
+                    button_text=button_text,
+                    category=category,
+                    light_short_text=light_short_text,
+                    campaign_id=campaign_id,
+                )
+                creative_snapshot = {
+                    "text": text,
+                    "target_url": target_url,
+                    "button_text": button_text,
+                    "format_type": material_format,
+                    "light_short_text": light_short_text,
+                    "material_id": creative_id,
+                }
             conn.execute(
                 """
                 INSERT INTO ad_orders (
@@ -1330,7 +1365,7 @@ class OrderService:
                 ),
             )
             self.ledger.reserve_budget(conn, advertiser["id"], order_id, budget_cents, rate["currency"])
-            self._snapshot(conn, order_id, None, "creative", {"text": text, "target_url": target_url, "button_text": button_text})
+            self._snapshot(conn, order_id, None, "creative", creative_snapshot)
             self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": unit_price_cents, "price_offer_id": price_offer_id})
             self._snapshot(conn, order_id, None, "channel", channel)
             return self.get_order(conn, order_id)

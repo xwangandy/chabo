@@ -76,34 +76,32 @@ class FulfillmentService:
             return {"delivery_id": delivery["id"], "status": "budget_exhausted"}
 
         track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery['id']}"
+        sales_url = f"https://t.me/{self.settings.bot_username}?start=ch_{channel['ref_token']}"
         ad_text = creative["text"]
-        button_text = creative["button_text"]
         message_id: str
         if slot["slot_type"] == "light_tail":
-            short_text = creative["button_text"] or "查看详情"
+            short_text = creative["light_short_text"] or creative["button_text"] or "查看详情"
             inserted_message_id = self._insert_light_tail_into_latest_post(conn, channel, short_text, track_url)
             if inserted_message_id:
                 message_id = inserted_message_id
             else:
                 ad_text = f"🔖 {short_text}"
-                button_text = "查看完整广告"
                 try:
                     message_id = self.gateway.send_ad(
                         chat_id=channel["telegram_chat_id"],
                         text=ad_text,
-                        button_text=button_text,
-                        button_url=track_url,
+                        inline_keyboard=[[{"text": "查看完整广告", "url": track_url}]],
                     )
                 except TelegramError as exc:
                     self._mark_delivery_failed(conn, delivery, order, str(exc))
                     return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
         else:
+            keyboard = self._build_post_keyboard(creative, sales_url=sales_url, track_url=track_url)
             try:
                 message_id = self.gateway.send_ad(
                     chat_id=channel["telegram_chat_id"],
                     text=ad_text,
-                    button_text=button_text,
-                    button_url=track_url,
+                    inline_keyboard=keyboard,
                 )
             except TelegramError as exc:
                 self._mark_delivery_failed(conn, delivery, order, str(exc))
@@ -158,6 +156,23 @@ class FulfillmentService:
         self._maybe_notify_budget(conn, order["id"])
         self.orders.maybe_schedule_next(conn, order["id"])
         return {"delivery_id": delivery["id"], "status": "sent", "message_id": message_id}
+
+    def _build_post_keyboard(
+        self,
+        creative: sqlite3.Row,
+        *,
+        sales_url: str,
+        track_url: str,
+    ) -> list[list[dict[str, str]]]:
+        cta_text = (creative["button_text"] or "").strip() or "查看详情"
+        target_url = creative["target_url"]
+        return [
+            [
+                {"text": "📣 频道招商", "url": sales_url},
+                {"text": "🔍 查看详情", "url": track_url},
+            ],
+            [{"text": cta_text, "url": target_url}],
+        ]
 
     def _insert_light_tail_into_latest_post(
         self,

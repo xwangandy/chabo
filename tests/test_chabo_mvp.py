@@ -39,7 +39,7 @@ class FakeGateway:
         self.chat_members = {}
         self.chat_administrators = {}
 
-    def send_ad(self, *, chat_id: str, text: str, button_text: str, button_url: str) -> str:
+    def send_ad(self, *, chat_id: str, text: str, inline_keyboard: list[list[dict[str, str]]]) -> str:
         if self.fail_send:
             raise TelegramError("send failed")
         self.next_message_id += 1
@@ -48,8 +48,7 @@ class FakeGateway:
             {
                 "chat_id": chat_id,
                 "text": text,
-                "button_text": button_text,
-                "button_url": button_url,
+                "inline_keyboard": inline_keyboard,
                 "message_id": message_id,
             }
         )
@@ -1211,8 +1210,16 @@ class ChaboMvpTest(unittest.TestCase):
         dispatched = self.app.fulfillment.dispatch_due()
 
         self.assertEqual(dispatched[0]["status"], "sent")
-        self.assertEqual(self.gateway.sent_ads[0]["button_text"], "查看详情")
-        self.assertIn("ad_del_", self.gateway.sent_ads[0]["button_url"])
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual(len(keyboard), 2)
+        top_row_texts = [b["text"] for b in keyboard[0]]
+        self.assertIn("📣 频道招商", top_row_texts)
+        self.assertIn("🔍 查看详情", top_row_texts)
+        sales_button = next(b for b in keyboard[0] if b["text"] == "📣 频道招商")
+        detail_button = next(b for b in keyboard[0] if b["text"] == "🔍 查看详情")
+        self.assertIn("ch_", sales_button["url"])
+        self.assertIn("ad_del_", detail_button["url"])
+        self.assertEqual(keyboard[1][0]["text"], "查看详情")
 
         with self.app.db.transaction() as conn:
             advertiser = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
@@ -2195,6 +2202,59 @@ class ChaboMvpTest(unittest.TestCase):
         payload_after = json.loads(state_after["payload_json"])
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
+
+    def test_standard_placement_publishes_three_button_keyboard(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播文案",
+            target_url="https://advertiser.example/landing",
+            button_text="立即购买",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        dispatched = self.app.fulfillment.dispatch_due()
+        self.assertEqual(dispatched[0]["status"], "sent")
+
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual(len(keyboard), 2)
+        top_row = keyboard[0]
+        self.assertEqual([b["text"] for b in top_row], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", top_row[0]["url"])
+        self.assertIn("ad_del_", top_row[1]["url"])
+        self.assertEqual(keyboard[1], [{"text": "立即购买", "url": "https://advertiser.example/landing"}])
+
+    def test_strong_placement_also_publishes_three_buttons(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制插播文案",
+            target_url="https://advertiser.example/strong",
+            button_text="开始使用",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="strong_post",
+            material_id=material["id"],
+            budget_cents=money_to_cents("20"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertEqual(keyboard[1][0]["text"], "开始使用")
 
     def test_offer_acceptance_records_library_material(self) -> None:
         channel = self.bind_channel()

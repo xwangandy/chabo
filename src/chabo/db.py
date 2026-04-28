@@ -421,6 +421,29 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS topup_requests (
+    id TEXT PRIMARY KEY,
+    recipient_telegram_user_id TEXT NOT NULL,
+    recipient_account_id TEXT REFERENCES accounts(id),
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    reason TEXT NOT NULL,
+    evidence_url TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requester_account_id TEXT NOT NULL REFERENCES accounts(id),
+    request_note TEXT,
+    approver_account_id TEXT REFERENCES accounts(id),
+    approval_note TEXT,
+    settled_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (amount_cents > 0),
+    CHECK (status IN ('pending', 'approved', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_topup_requests_status ON topup_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_topup_requests_recipient ON topup_requests(recipient_telegram_user_id, created_at);
+
 CREATE TABLE IF NOT EXISTS tool_call_logs (
     id TEXT PRIMARY KEY,
     actor_account_id TEXT REFERENCES accounts(id),

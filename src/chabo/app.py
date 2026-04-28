@@ -21,6 +21,7 @@ from .services import (
     StarsPaymentService,
     SubscriptionService,
     ToolCallLogService,
+    TopupApprovalService,
 )
 from .telegram import BotApiClient, MessageGateway, NullGateway
 
@@ -42,6 +43,7 @@ class ChaboApp:
     light_probes: LightProbeService
     self_promos: SelfPromoService
     tool_call_logs: ToolCallLogService
+    topup_approvals: TopupApprovalService
     advertiser_subscriptions: AdvertiserSubscriptionService
     advertisers: AdvertiserService
     fulfillment: FulfillmentService
@@ -70,6 +72,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         light_probes=LightProbeService(db, settings),
         self_promos=SelfPromoService(db, settings),
         tool_call_logs=ToolCallLogService(db, settings),
+        topup_approvals=TopupApprovalService(db, settings),
         advertiser_subscriptions=AdvertiserSubscriptionService(db, settings),
         advertisers=AdvertiserService(db, settings),
         fulfillment=FulfillmentService(db, settings, gateway),

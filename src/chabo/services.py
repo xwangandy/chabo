@@ -3029,6 +3029,290 @@ class AdvertiserSubscriptionService:
         )
 
 
+class TopupApprovalService:
+    """Two-person approval workflow for manual top-ups.
+
+    The requester and the approver must be different accounts. Approval
+    triggers `LedgerService.manual_topup` with the approver recorded as
+    the actor; rejection leaves balances untouched. The status enum is
+    deliberately small (`pending / approved / rejected`) — `approved` is
+    only set after the ledger write succeeds, so anything in `pending`
+    is auditable but not yet impactful.
+    """
+
+    STATUSES = ("pending", "approved", "rejected")
+    MAX_REASON_LEN = 500
+    MAX_NOTE_LEN = 500
+    MAX_URL_LEN = 1000
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+        self.ledger = LedgerService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
+
+    def request_topup(
+        self,
+        *,
+        recipient_telegram_user_id: str | int,
+        amount_cents: int,
+        reason: str,
+        requester_telegram_user_id: str | int,
+        evidence_url: str | None = None,
+        currency: str = "USD",
+        request_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        if amount_cents <= 0:
+            raise InvalidState("入账金额必须大于 0")
+        cleaned_reason = (reason or "").strip()
+        if not cleaned_reason:
+            raise InvalidState("入账请求必须填写原因 / 凭证摘要")
+        if len(cleaned_reason) > self.MAX_REASON_LEN:
+            raise InvalidState(f"原因最长 {self.MAX_REASON_LEN} 字")
+        cleaned_evidence = (evidence_url or "").strip() or None
+        if cleaned_evidence and len(cleaned_evidence) > self.MAX_URL_LEN:
+            raise InvalidState(f"凭证链接最长 {self.MAX_URL_LEN} 字")
+        cleaned_request_note = (request_note or "").strip() or None
+        if cleaned_request_note and len(cleaned_request_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"申请备注最长 {self.MAX_NOTE_LEN} 字")
+        request_id = new_id("treq")
+        try:
+            with self.db.transaction() as conn:
+                requester = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(requester_telegram_user_id),),
+                ).fetchone()
+                if not requester:
+                    raise NotFound(f"申请人账号不存在：{requester_telegram_user_id}")
+                recipient_row = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(recipient_telegram_user_id),),
+                ).fetchone()
+                recipient_account_id = recipient_row["id"] if recipient_row else None
+                conn.execute(
+                    """
+                    INSERT INTO topup_requests (
+                        id, recipient_telegram_user_id, recipient_account_id,
+                        amount_cents, currency, reason, evidence_url, status,
+                        requester_account_id, request_note
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        request_id,
+                        str(recipient_telegram_user_id),
+                        recipient_account_id,
+                        amount_cents,
+                        currency,
+                        cleaned_reason,
+                        cleaned_evidence,
+                        requester["id"],
+                        cleaned_request_note,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                request = dict(row)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_request",
+                actor_telegram_user_id=requester_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={
+                    "recipient": str(recipient_telegram_user_id),
+                    "amount_cents": amount_cents,
+                },
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_request",
+            actor_telegram_user_id=requester_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={
+                "recipient": str(recipient_telegram_user_id),
+                "amount_cents": amount_cents,
+                "has_evidence": bool(cleaned_evidence),
+            },
+            result_summary=f"requested {request_id}",
+        )
+        return request
+
+    def approve_topup(
+        self,
+        *,
+        request_id: str,
+        approver_telegram_user_id: str | int,
+        approval_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        cleaned_note = (approval_note or "").strip() or None
+        if cleaned_note and len(cleaned_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"审批备注最长 {self.MAX_NOTE_LEN} 字")
+        request_snapshot: dict[str, Any] | None = None
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"入账请求不存在：{request_id}")
+                if row["status"] != "pending":
+                    raise InvalidState(f"入账请求当前状态不能审批：{row['status']}")
+                approver = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(approver_telegram_user_id),),
+                ).fetchone()
+                if not approver:
+                    raise NotFound(f"审批人账号不存在：{approver_telegram_user_id}")
+                if approver["id"] == row["requester_account_id"]:
+                    raise InvalidState("审批人必须与申请人是不同账号（双人复核）")
+                request_snapshot = dict(row)
+                approver_id = approver["id"]
+            self.ledger.manual_topup(
+                request_snapshot["recipient_telegram_user_id"],
+                request_snapshot["amount_cents"],
+                memo=f"人工入账：{request_snapshot['reason']}",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+            )
+            with self.db.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE topup_requests
+                    SET status = 'approved',
+                        approver_account_id = ?,
+                        approval_note = ?,
+                        settled_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (approver_id, cleaned_note, request_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                final = dict(row)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_approve",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_approve",
+            actor_telegram_user_id=approver_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+            result_summary=f"approved {request_id}",
+        )
+        return final
+
+    def reject_topup(
+        self,
+        *,
+        request_id: str,
+        approver_telegram_user_id: str | int,
+        approval_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        cleaned_note = (approval_note or "").strip() or None
+        if cleaned_note and len(cleaned_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"审批备注最长 {self.MAX_NOTE_LEN} 字")
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"入账请求不存在：{request_id}")
+                if row["status"] != "pending":
+                    raise InvalidState(f"入账请求当前状态不能拒绝：{row['status']}")
+                approver = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(approver_telegram_user_id),),
+                ).fetchone()
+                if not approver:
+                    raise NotFound(f"审批人账号不存在：{approver_telegram_user_id}")
+                if approver["id"] == row["requester_account_id"]:
+                    raise InvalidState("审批人必须与申请人是不同账号（双人复核）")
+                conn.execute(
+                    """
+                    UPDATE topup_requests
+                    SET status = 'rejected',
+                        approver_account_id = ?,
+                        approval_note = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (approver["id"], cleaned_note, request_id),
+                )
+                final = dict(conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone())
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_reject",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_reject",
+            actor_telegram_user_id=approver_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+            result_summary=f"rejected {request_id}",
+        )
+        return final
+
+    def list_requests(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if status is not None and status not in self.STATUSES:
+            raise InvalidState(f"非法 status：{status}")
+        sql = "SELECT * FROM topup_requests"
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self.db.transaction() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_request(self, request_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"入账请求不存在：{request_id}")
+            return dict(row)
+
+
 class ToolCallLogService:
     """Audit log for AI tool calls and operator actions.
 

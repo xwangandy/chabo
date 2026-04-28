@@ -2228,6 +2228,114 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
 
+    def _advertiser_callback(self, data: str, *, telegram_user_id: int = 10001, cb_id: str = "cb_adv") -> dict:
+        return self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": cb_id,
+                    "from": {"id": telegram_user_id, "first_name": "广告主"},
+                    "message": {"chat": {"id": telegram_user_id}},
+                    "data": data,
+                }
+            }
+        )
+
+    def test_wallet_balance_page_offers_topup_reserved_statement_buttons(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+        result = self._advertiser_callback("advertiser:balance", cb_id="cb_wallet_open")
+        self.assertEqual(result["type"], "callback_advertiser_balance")
+        callbacks = [
+            b.get("callback_data")
+            for row in self.gateway.private_messages[-1]["inline_keyboard"]
+            for b in row
+        ]
+        self.assertIn("wallet:topup", callbacks)
+        self.assertIn("wallet:reserved", callbacks)
+        self.assertIn("wallet:statement", callbacks)
+
+    def test_wallet_topup_pick_sends_stars_invoice(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        result = self._advertiser_callback("wallet:topup:500", cb_id="cb_wallet_topup_500")
+        self.assertEqual(result["type"], "callback_wallet_topup_invoice_sent")
+        self.assertEqual(result["stars_amount"], 500)
+        invoice = self.gateway.invoices[-1]
+        self.assertEqual(invoice["chat_id"], "10001")
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertEqual(invoice["prices"][0]["amount"], 500)
+        with self.app.db.transaction() as conn:
+            intent = conn.execute(
+                "SELECT * FROM stars_payment_intents WHERE buyer_account_id = (SELECT id FROM accounts WHERE telegram_user_id = '10001')"
+            ).fetchone()
+        self.assertEqual(intent["stars_amount"], 500)
+        self.assertEqual(intent["status"], "pending")
+
+    def test_wallet_reserved_lists_active_reserved_orders(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="冻结测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        result = self._advertiser_callback("wallet:reserved", cb_id="cb_wallet_reserved")
+        self.assertEqual(result["type"], "callback_wallet_reserved")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("冻结明细", text)
+        self.assertIn(channel["title"], text)
+        self.assertIn(order["id"], text)
+
+    def test_wallet_statement_lists_recent_transactions(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("15")
+        result = self._advertiser_callback("wallet:statement", cb_id="cb_wallet_statement")
+        self.assertEqual(result["type"], "callback_wallet_statement")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("账单流水", text)
+        self.assertIn("人工入账", text)
+        self.assertIn("15.00", text)
+
+    def test_placement_submit_insufficient_balance_offers_topup_button(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        # No topup → insufficient balance
+        for cb_id, data in [
+            ("cb_ins_open", f"channel:order:{channel['id']}"),
+            ("cb_ins_slot", "place:slot:standard_card"),
+            ("cb_ins_creative", "place:creative"),
+            ("cb_ins_new", "place:new:standard_card"),
+        ]:
+            self._advertiser_callback(data, cb_id=cb_id)
+        # Send creative text and url to finish material creation
+        for text in ["这是预算不足测试的文案", "https://example.com"]:
+            self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": 99,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+        submit = self._advertiser_callback("place:submit", cb_id="cb_ins_submit")
+        self.assertEqual(submit["type"], "callback_placement_submit_failed")
+        callbacks = [
+            b.get("callback_data")
+            for row in self.gateway.private_messages[-1]["inline_keyboard"]
+            for b in row
+        ]
+        self.assertIn("wallet:topup", callbacks)
+
     def test_publisher_self_promo_panel_lists_publishable_materials(self) -> None:
         channel = self.bind_channel()
         self.confirm_timezone(20001, role="publisher", display_name="频道主")

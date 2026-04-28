@@ -9,7 +9,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
+from .services import AccountService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 
 
@@ -313,6 +313,23 @@ class UpdateHandler:
         if data == "advertiser:balance":
             self._send_advertiser_balance(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_balance"}
+        if data == "wallet:topup":
+            self._send_wallet_topup_picker(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_topup_picker"}
+        if data.startswith("wallet:topup:"):
+            stars_str = data.removeprefix("wallet:topup:")
+            try:
+                stars_amount = int(stars_str)
+            except ValueError:
+                self._send_wallet_topup_picker(chat_id, user, message)
+                return {"handled": True, "type": "callback_wallet_topup_invalid"}
+            return self._trigger_wallet_topup(chat_id, user, stars_amount, message)
+        if data == "wallet:reserved":
+            self._send_wallet_reserved(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_reserved"}
+        if data == "wallet:statement":
+            self._send_wallet_statement(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_statement"}
         if data == "advertiser:library":
             self._send_advertiser_library(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_library"}
@@ -955,16 +972,22 @@ class UpdateHandler:
             if self.settings.bot_auto_approve_orders:
                 order = self.orders.approve_order(order["id"])
         except ChaboError as exc:
+            short = str(exc)
+            insufficient = isinstance(exc, InsufficientBalance) or "余额" in short
+            primary_row: list[dict[str, str]] = []
+            if insufficient:
+                primary_row.append({"text": "💳 立即充值", "callback_data": "wallet:topup"})
+            primary_row.append({"text": "🧩 降低配置", "callback_data": "place:display"})
             self._reply_or_edit(
                 chat_id=chat_id,
                 source_message=source_message,
                 text=f"⚠️ 暂时无法提交投放\n\n{exc}",
                 inline_keyboard=[
-                    [{"text": "💰 充值", "callback_data": "advertiser:balance"}, {"text": "🧩 降低配置", "callback_data": "place:display"}],
-                    [{"text": "🏠 工作台", "callback_data": "menu:home"}],
+                    primary_row,
+                    [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 工作台", "callback_data": "menu:home"}],
                 ],
             )
-            return {"handled": True, "type": "callback_placement_submit_failed", "error": str(exc)}
+            return {"handled": True, "type": "callback_placement_submit_failed", "error": short}
 
         self._clear_conversation(chat_id)
         review_text = "✅ 已自动通过审核\n🚀 已进入排期" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
@@ -1316,21 +1339,190 @@ class UpdateHandler:
         self._sync_channel_admins(channel["id"], channel["telegram_chat_id"])
         self._send_publisher_channel_dashboard(chat_id, user, channel["ref_token"], source_message)
 
-    def _send_advertiser_balance(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
+    def _send_advertiser_balance(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        prefix: str | None = None,
+    ) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", user.get("first_name") or user.get("username"))
+        body = (
+            "💰 广告钱包\n\n"
+            f"💵 可用：USD {cents_to_money(account['available_balance_cents'])}\n"
+            f"🔒 冻结：USD {cents_to_money(account['reserved_balance_cents'])}\n"
+            f"📊 已花：USD {cents_to_money(account['spent_balance_cents'])}"
+        )
+        text = f"{prefix}\n\n{body}" if prefix else body
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[
+                [{"text": "💳 Stars 充值", "callback_data": "wallet:topup"}],
+                [{"text": "🔒 冻结明细", "callback_data": "wallet:reserved"}, {"text": "📜 账单流水", "callback_data": "wallet:statement"}],
+                [{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    WALLET_TOPUP_PRESETS = (100, 500, 1000, 2000)
+
+    def _send_wallet_topup_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        rate = self.settings.star_credit_cents
+        lines = [
+            "💳 Stars 充值",
+            "",
+            f"汇率：1 ⭐ = USD {cents_to_money(rate)} 插播余额",
+            "选一个金额，会发一张 Telegram Stars 发票，付款成功即到账。",
+        ]
+        amount_buttons = [
+            {
+                "text": f"{stars} ⭐ → USD {cents_to_money(stars * rate)}",
+                "callback_data": f"wallet:topup:{stars}",
+            }
+            for stars in self.WALLET_TOPUP_PRESETS
+        ]
+        keyboard = self._button_grid(amount_buttons, 2)
+        keyboard.append([{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _trigger_wallet_topup(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        stars_amount: int,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = user.get("id") or chat_id
+        try:
+            invoice_response = self.stars_payments.create_balance_topup_invoice(
+                telegram_user_id=user_id,
+                stars_amount=stars_amount,
+                display_name=self._display_name(user),
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法发起充值\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+            )
+            return {"handled": True, "type": "callback_wallet_topup_failed", "error": str(exc)}
+        invoice = invoice_response["invoice"]
+        try:
+            invoice_message_id = self.gateway.send_invoice(
+                chat_id=user_id,
+                title=invoice["title"],
+                description=invoice["description"],
+                payload=invoice["payload"],
+                currency=invoice["currency"],
+                prices=invoice["prices"],
+            )
+        except TelegramError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 发票发送失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+            )
+            return {"handled": True, "type": "callback_wallet_topup_failed", "error": str(exc)}
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "💰 广告钱包\n\n"
-                f"💵 可用：USD {account['available_balance_cents'] / 100:.2f}\n"
-                f"🔒 冻结：USD {account['reserved_balance_cents'] / 100:.2f}\n"
-                f"📊 已花：USD {account['spent_balance_cents'] / 100:.2f}"
+                f"💳 已发送 {stars_amount} ⭐ 充值发票\n\n"
+                "在 Telegram 内打开发票完成支付，到账后回到广告钱包查看余额。"
             ),
-            inline_keyboard=[[{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
         )
+        return {
+            "handled": True,
+            "type": "callback_wallet_topup_invoice_sent",
+            "stars_amount": stars_amount,
+            "invoice_message_id": invoice_message_id,
+        }
+
+    def _send_wallet_reserved(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_reserved_orders(telegram_user_id=user_id)
+        lines = ["🔒 冻结明细", ""]
+        if not rows:
+            lines.append("当前没有冻结的预算。")
+        else:
+            for row in rows:
+                title = row["channel_title"] or "（未知频道）"
+                lines.append(
+                    f"📌 {title}｜{row['currency']} {cents_to_money(row['reserved_cents'])}（订单 {row['order_id']}）"
+                )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[
+                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                [{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}],
+            ],
+        )
+
+    def _send_wallet_statement(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_transactions(telegram_user_id=user_id, limit=10)
+        lines = ["📜 账单流水（最近 10 条）", ""]
+        if not rows:
+            lines.append("还没有账务记录。")
+        else:
+            for row in rows:
+                sign = "+" if row["amount_cents"] >= 0 else "-"
+                amount = cents_to_money(abs(row["amount_cents"]))
+                kind = self._wallet_tx_label(row["type"])
+                memo = row["memo"] or ""
+                detail = f" — {memo}" if memo else ""
+                lines.append(f"{sign} {row['currency']} {amount}｜{kind}{detail}")
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+        )
+
+    @staticmethod
+    def _wallet_tx_label(tx_type: str) -> str:
+        labels = {
+            "manual_topup": "人工入账",
+            "stars_topup": "Stars 充值",
+            "reserve_budget": "预算冻结",
+            "release_reserved": "释放冻结",
+            "advertiser_charge": "投放扣费",
+            "advertiser_refund": "投放退款",
+            "publisher_earning": "频道入账",
+            "publisher_earning_confirmed": "收益确认",
+            "publisher_subscription_charge": "频道订阅扣费",
+            "advertiser_subscription_charge": "高级服务扣费",
+        }
+        return labels.get(tx_type, tx_type)
 
     def _send_publisher_earnings(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id

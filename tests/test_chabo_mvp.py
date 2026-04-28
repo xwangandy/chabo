@@ -2230,6 +2230,81 @@ class ChaboMvpTest(unittest.TestCase):
 
     # ---------- AI-callable service-layer surface ----------
 
+    def test_database_backup_writes_a_consistent_snapshot(self) -> None:
+        # Seed some state, then back up
+        self.bind_channel()
+        self.app.ledger.manual_topup(10001, money_to_cents("5.00"), display_name="广告主")
+        target = Path(self.tmp.name) / "backups" / "snapshot.sqlite3"
+        written = self.app.db.backup_to(str(target))
+        self.assertTrue(Path(written).exists())
+        # The backup must contain the same data
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(str(target)) as conn:
+            row = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertEqual(row[0], 500)
+
+    def test_health_endpoint_includes_db_status_and_ops_counters(self) -> None:
+        url = self.start_http_server()
+        with urllib.request.urlopen(f"{url}/health") as response:
+            payload = json.loads(response.read())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["db"], "ok")
+        self.assertIn("ops", payload)
+        for key in (
+            "pending_review_orders",
+            "running_orders",
+            "sent_today",
+            "open_disputes",
+            "failed_recent",
+            "scheduled_due",
+        ):
+            self.assertIn(key, payload["ops"])
+
+    def test_admin_landing_renders_summary_cards(self) -> None:
+        # Create an order in pending_review so the alert variant lights up
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="待审核测试",
+            target_url="https://example.com",
+        )
+        self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        url = self.start_http_server()
+        request = urllib.request.Request(f"{url}/admin?token=admin-token")
+        with urllib.request.urlopen(request) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn("待审核订单", html)
+        self.assertIn("Open 争议", html)
+        # Pending order should land in the alert variant
+        self.assertIn("summary-card alert", html)
+
+    def test_token_strength_check_flags_weak_and_loopback_safe(self) -> None:
+        from chabo.web import check_token_strength
+        # On a public host, missing tokens should warn
+        warns = check_token_strength(admin_token=None, webhook_secret=None, host="0.0.0.0")
+        self.assertEqual(len(warns), 2)
+        # Loopback gives no warnings on missing config
+        warns = check_token_strength(admin_token=None, webhook_secret=None, host="127.0.0.1")
+        self.assertEqual(warns, [])
+        # Weak (short) token warns regardless of host
+        warns = check_token_strength(admin_token="short", webhook_secret="changeme-pls", host="127.0.0.1")
+        self.assertEqual(len(warns), 2)
+        # Strong tokens give no warnings
+        strong_admin = "x9k2L7m4Pq8rT5wYzNbFjC3Hd"
+        strong_secret = "4Yh8m2KpW3qX9zV6cR1nB7tJfL5g"
+        warns = check_token_strength(admin_token=strong_admin, webhook_secret=strong_secret, host="0.0.0.0")
+        self.assertEqual(warns, [])
+
     def test_create_order_logs_via_tool_call_audit(self) -> None:
         channel = self.bind_channel()
         self.topup_advertiser("20")

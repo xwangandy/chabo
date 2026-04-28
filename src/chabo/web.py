@@ -46,6 +46,43 @@ def make_server(
     )
 
 
+WEAK_TOKEN_PATTERNS = ("test", "demo", "changeme", "default", "secret", "admin", "token")
+MIN_PROD_TOKEN_LEN = 16
+
+
+def check_token_strength(*, admin_token: str | None, webhook_secret: str | None, host: str | None = None) -> list[str]:
+    """Return a list of human-readable warnings about weak production tokens.
+
+    Empty list means the configured tokens look OK. The host argument
+    enables a "production-only" check that flags missing webhook secrets
+    when the server is bound to a non-loopback address.
+    """
+    warnings: list[str] = []
+    is_loopback = host in (None, "", "127.0.0.1", "localhost", "::1")
+
+    def looks_weak(value: str) -> bool:
+        lowered = value.lower()
+        if len(value) < MIN_PROD_TOKEN_LEN:
+            return True
+        if any(pattern in lowered for pattern in WEAK_TOKEN_PATTERNS):
+            return True
+        return False
+
+    if not admin_token:
+        if not is_loopback:
+            warnings.append("⚠️  CHABO_ADMIN_TOKEN 未配置；非 loopback 地址下 /admin 会拒绝任何请求。")
+    elif looks_weak(admin_token):
+        warnings.append("⚠️  CHABO_ADMIN_TOKEN 强度不足（少于 16 字符或包含弱关键词），生产部署前请换成强随机值。")
+
+    if not webhook_secret:
+        if not is_loopback:
+            warnings.append("⚠️  CHABO_WEBHOOK_SECRET 未配置；非 loopback 地址下 Telegram webhook 无法被验证。")
+    elif looks_weak(webhook_secret):
+        warnings.append("⚠️  CHABO_WEBHOOK_SECRET 强度不足，请使用强随机值并通过 set-webhook 同步到 Telegram。")
+
+    return warnings
+
+
 def run_server(
     *,
     settings: Settings | None = None,
@@ -63,6 +100,12 @@ def run_server(
     )
     bound_host, bound_port = server.server_address
     print(f"插播 HTTP 服务已启动：http://{bound_host}:{bound_port}")
+    for warning in check_token_strength(
+        admin_token=server.admin_token,
+        webhook_secret=server.webhook_secret,
+        host=str(bound_host),
+    ):
+        print(warning)
     try:
         server.serve_forever()
     finally:
@@ -78,14 +121,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send_json(
-                {
-                    "ok": True,
-                    "service": "chabo",
-                    "bot_username": self.server.app.settings.bot_username,
-                    "db_path": self.server.app.settings.db_path,
-                }
-            )
+            self._send_json(self._build_health_payload())
             return
         if parsed.path == "/admin":
             if not self._require_admin(parsed.query):
@@ -224,6 +260,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         orders = self._list_orders(status=order_status, limit=20)
         deliveries = self._list_deliveries(status=None, limit=20)
         disputes = self.server.app.disputes.list_disputes(status=None, limit=20)
+        summary = self._ops_summary()
         rows = [
             "<!doctype html><html><head><meta charset='utf-8'><title>插播运营后台</title>",
             "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:24px;background:#f6f7f9;color:#17202a}"
@@ -231,8 +268,22 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             "table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #dde2e8}"
             "th,td{border-bottom:1px solid #edf0f3;padding:8px;text-align:left;font-size:13px;vertical-align:top}"
             "th{background:#eef2f6}button{padding:6px 10px;border:1px solid #bac3cf;background:#fff;border-radius:6px;cursor:pointer}"
-            "input{padding:6px;border:1px solid #bac3cf;border-radius:6px}.muted{color:#697586}.bar form{display:inline;margin-right:8px}</style></head><body>",
+            "input{padding:6px;border:1px solid #bac3cf;border-radius:6px}.muted{color:#697586}.bar form{display:inline;margin-right:8px}"
+            ".summary{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 20px}"
+            ".summary-card{background:#fff;border:1px solid #dde2e8;border-radius:10px;padding:14px 18px;min-width:140px}"
+            ".summary-card .label{color:#697586;font-size:12px;letter-spacing:.5px;text-transform:uppercase}"
+            ".summary-card .value{font-size:24px;font-weight:600;margin-top:4px}"
+            ".summary-card.alert{border-color:#ec7d6c;background:#fff6f4}"
+            ".summary-card.alert .value{color:#c0392b}</style></head><body>",
             "<h1>插播运营后台</h1>",
+            "<div class='summary'>",
+            self._summary_card("待审核订单", summary["pending_review_orders"], alert=summary["pending_review_orders"] > 0),
+            self._summary_card("进行中订单", summary["running_orders"]),
+            self._summary_card("今日已发", summary["sent_today"]),
+            self._summary_card("到期未发", summary["scheduled_due"], alert=summary["scheduled_due"] > 0),
+            self._summary_card("Open 争议", summary["open_disputes"], alert=summary["open_disputes"] > 0),
+            self._summary_card("近 24h 失败", summary["failed_recent"], alert=summary["failed_recent"] > 0),
+            "</div>",
             "<div class='bar'>",
             f"<a href='/admin{token_query}'>全部</a> ",
             f"<a href='{_e(_url_with_params('/admin', token_query, {'status': 'pending_review'}))}'>待审核</a> ",
@@ -378,6 +429,61 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 pass
         return _e(value)
+
+    def _summary_card(self, label: str, value: int, *, alert: bool = False) -> str:
+        css = "summary-card alert" if alert else "summary-card"
+        return f"<div class='{css}'><div class='label'>{_e(label)}</div><div class='value'>{value}</div></div>"
+
+    def _ops_summary(self) -> dict[str, Any]:
+        with self.server.app.db.transaction() as conn:
+            pending_review = conn.execute(
+                "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'pending_review'"
+            ).fetchone()["n"]
+            running_orders = conn.execute(
+                "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'running'"
+            ).fetchone()["n"]
+            sent_today = conn.execute(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE status IN ('sent', 'confirmed') "
+                "AND DATE(sent_at) = DATE('now')"
+            ).fetchone()["n"]
+            open_disputes = conn.execute(
+                "SELECT COUNT(*) AS n FROM disputes WHERE status = 'open'"
+            ).fetchone()["n"]
+            failed_recent = conn.execute(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' "
+                "AND updated_at >= datetime('now', '-1 day')"
+            ).fetchone()["n"]
+            scheduled_due = conn.execute(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'scheduled' "
+                "AND scheduled_at <= datetime('now')"
+            ).fetchone()["n"]
+        return {
+            "pending_review_orders": pending_review,
+            "running_orders": running_orders,
+            "sent_today": sent_today,
+            "open_disputes": open_disputes,
+            "failed_recent": failed_recent,
+            "scheduled_due": scheduled_due,
+        }
+
+    def _build_health_payload(self) -> dict[str, Any]:
+        settings = self.server.app.settings
+        payload: dict[str, Any] = {
+            "ok": True,
+            "service": "chabo",
+            "bot_username": settings.bot_username,
+            "db_path": settings.db_path,
+        }
+        try:
+            with self.server.app.db.transaction() as conn:
+                conn.execute("SELECT 1").fetchone()
+                payload["db"] = "ok"
+                payload["ops"] = self._ops_summary()
+        except Exception as exc:
+            payload["ok"] = False
+            payload["db"] = "error"
+            payload["db_error"] = str(exc)[:200]
+        return payload
 
     def _form(self, path: str, token_query: str, body: str) -> str:
         token_input = ""

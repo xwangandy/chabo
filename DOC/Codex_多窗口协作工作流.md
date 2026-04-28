@@ -16,7 +16,15 @@
 
 ## 2. 当前前提
 
-当前目录 `/Users/lanjinglive618/ChaBo` 还不是 git 仓库。真正使用 worktree 前，需要先建立一次版本化基线。
+当前目录 `/Users/lanjinglive618/ChaBo` 是主工作区，主分支为 `main`，云端协作仓库为：
+
+```text
+https://github.com/xwangandy/chabo
+```
+
+主工作区只用于总控、验收、合并和真实 Bot 手动测试。执行窗口不得直接在主工作区开发。
+
+如果在新机器或新目录重新开始，先建立一次版本化基线。
 
 建议基线命令：
 
@@ -26,9 +34,11 @@ git init
 git add .
 git commit -m "baseline: chabo project scaffold"
 git branch -M main
+git remote add origin https://github.com/xwangandy/chabo.git
+git push -u origin main
 ```
 
-如果之后接入 GitHub 或私有远程仓库，再添加 remote。没有 remote 也可以先在本机使用 branch + worktree。
+本机已完成初始化后，不要重复运行 `git init`。后续正常使用 `git pull --ff-only`、branch 和 worktree。
 
 ## 3. 角色边界
 
@@ -91,6 +101,8 @@ worktree 路径：
 
 ```bash
 cd /Users/lanjinglive618/ChaBo
+git switch main
+git pull --ff-only
 mkdir -p /Users/lanjinglive618/ChaBo-worktrees
 git worktree add -b task/CHB-YYYYMMDD-NN-short-name \
   /Users/lanjinglive618/ChaBo-worktrees/CHB-YYYYMMDD-NN-short-name \

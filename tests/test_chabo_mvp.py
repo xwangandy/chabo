@@ -15,6 +15,7 @@ from chabo.app import create_app
 from chabo.config import Settings
 from chabo.money import money_to_cents
 from chabo.polling import PollingRunner
+from chabo.services import InvalidState, NotFound
 from chabo.telegram import TelegramError
 from chabo.web import make_server
 
@@ -1879,6 +1880,171 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(report["sent_count"], 2)
         self.assertEqual(report["bot_starts"], 1)
         self.assertEqual(len(report["by_channel"]), 2)
+
+
+    # --------- Ad library / MaterialService ---------
+
+    def test_material_library_creates_three_formats_with_ownership(self) -> None:
+        light = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="完整文字插播详情文案",
+            target_url="https://example.com/detail",
+            light_short_text="想投这里？",
+            display_name="广告主",
+        )
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播文案 v1",
+            target_url="https://example.com/std",
+        )
+        custom = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制插播文案",
+            target_url="https://example.com/strong",
+            button_text="立即下载",
+        )
+        self.assertEqual(light["format_type"], "light_tail")
+        self.assertEqual(light["light_short_text"], "想投这里？")
+        self.assertIsNone(std["light_short_text"])
+        self.assertEqual(custom["button_text"], "立即下载")
+
+        listed = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(len(listed), 3)
+        light_only = self.app.materials.list_materials(
+            advertiser_telegram_user_id=10001, format_type="light_tail"
+        )
+        self.assertEqual([item["id"] for item in light_only], [light["id"]])
+
+        # Foreign user cannot read another advertiser's material
+        with self.assertRaises(NotFound):
+            self.app.materials.get_material(
+                std["id"], advertiser_telegram_user_id=99999
+            )
+
+    def test_material_library_validates_format_and_short_text(self) -> None:
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="pin24h",
+                text="不合法",
+                target_url="https://example.com",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="light_tail",
+                text="缺少短入口",
+                target_url="https://example.com",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="light_tail",
+                text="详情",
+                target_url="https://example.com",
+                light_short_text="超过十五个字的短入口测试一二三四五",
+            )
+
+    def test_create_order_reuses_library_material_and_blocks_archived(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="可复用的标准插播文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.assertEqual(order["creative_id"], material["id"])
+
+        # Foreign advertiser cannot use someone else's material_id
+        with self.assertRaises(NotFound):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=99999,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10"),
+            )
+
+        # Archive the material — subsequent orders should be rejected
+        self.app.materials.archive_material(
+            material["id"], advertiser_telegram_user_id=10001
+        )
+        with self.assertRaises(InvalidState):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=10001,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10"),
+            )
+
+        # Default list excludes archived; include_archived shows it again
+        active = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertNotIn(material["id"], [m["id"] for m in active])
+        with_archived = self.app.materials.list_materials(
+            advertiser_telegram_user_id=10001, include_archived=True
+        )
+        self.assertIn(material["id"], [m["id"] for m in with_archived])
+
+    def test_inline_create_order_populates_library(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            text="inline 文案",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        listed = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in listed], [order["creative_id"]])
+        self.assertEqual(listed[0]["format_type"], "standard_card")
+
+    def test_offer_acceptance_records_library_material(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="news",
+            median_24h_views=10_000,
+            light_unique_clickers_30d=20,
+            risk_level="normal",
+        )
+        offer = self.app.price_offers.create_offer(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+            slot_type="standard_card",
+            offered_price_cents=money_to_cents("3"),
+            creative_text="砍价插播文案",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("3"),
+            message="3 美金试试",
+        )
+        result = self.app.price_offers.respond_offer(offer["id"], accepted=True)
+        self.assertEqual(result["status"], "accepted")
+        order_id = result["accepted_order_id"]
+        with self.app.db.transaction() as conn:
+            order_row = conn.execute(
+                "SELECT creative_id FROM ad_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            creative_row = conn.execute(
+                "SELECT advertiser_account_id, format_type FROM creatives WHERE id = ?",
+                (order_row["creative_id"],),
+            ).fetchone()
+        self.assertIsNotNone(creative_row["advertiser_account_id"])
+        self.assertEqual(creative_row["format_type"], "standard_card")
 
 
 if __name__ == "__main__":

@@ -2230,6 +2230,81 @@ class ChaboMvpTest(unittest.TestCase):
 
     # ---------- AI-callable service-layer surface ----------
 
+    def test_instrumented_services_log_success_and_failure(self) -> None:
+        # Success path: AI session calls create_material
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="AI 自动创建的素材",
+            target_url="https://example.com",
+            actor_kind="ai",
+            session_id="sess_ai_x1",
+        )
+        success_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_material"
+        )
+        self.assertEqual(len(success_logs), 1)
+        self.assertEqual(success_logs[0]["actor_kind"], "ai")
+        self.assertEqual(success_logs[0]["session_id"], "sess_ai_x1")
+        self.assertEqual(success_logs[0]["result_status"], "success")
+        self.assertIn(material["id"], success_logs[0]["result_summary"])
+
+        # Failure path: bad format_type triggers InvalidState and produces an error log
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="pin24h",
+                text="bad",
+                target_url="https://example.com",
+                actor_kind="ai",
+                session_id="sess_ai_x1",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_material"
+        )
+        self.assertEqual(len(all_logs), 2)
+        error_log = next(row for row in all_logs if row["result_status"] == "error")
+        self.assertEqual(error_log["error_type"], "InvalidState")
+        self.assertEqual(error_log["session_id"], "sess_ai_x1")
+
+        # Operator wrapper logs as actor_kind=admin by default
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="运营员")
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order_for_operator(
+            order_id=order["id"],
+            operator_telegram_user_id=33333,
+        )
+        op_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="approve_order_for_operator"
+        )
+        self.assertEqual(op_logs[0]["actor_kind"], "admin")
+        self.assertEqual(op_logs[0]["result_status"], "success")
+        self.assertIn(order["id"], op_logs[0]["result_summary"])
+
+        # Publisher wrapper logs the band switch
+        self.app.channels.set_format_policy_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            format_type="standard_card",
+            enabled=True,
+            owner_price_band="high",
+            actor_kind="ai",
+            session_id="sess_pub_y1",
+        )
+        pub_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="set_format_policy_for_publisher"
+        )
+        self.assertEqual(pub_logs[0]["session_id"], "sess_pub_y1")
+        self.assertIn("high", pub_logs[0]["result_summary"])
+
     def test_tool_call_log_service_records_and_filters(self) -> None:
         # No actor → still recorded with NULL actor_account_id
         log_a = self.app.tool_call_logs.log_call(

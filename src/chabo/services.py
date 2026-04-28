@@ -747,6 +747,7 @@ class ChannelService:
         self.db = db
         self.settings = settings
         self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def bind_channel(
         self,
@@ -1051,21 +1052,50 @@ class ChannelService:
         owner_price_band: str = "medium",
         platform_promo_enabled: bool = True,
         custom_multiplier_bps: int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        with self.db.transaction() as conn:
-            self._verify_publisher_owns_channel(
-                conn,
-                publisher_telegram_user_id=publisher_telegram_user_id,
-                channel_id=channel_id,
+        audit_args = {
+            "channel_id": channel_id,
+            "format_type": format_type,
+            "enabled": enabled,
+            "owner_price_band": owner_price_band,
+            "platform_promo_enabled": platform_promo_enabled,
+        }
+        try:
+            with self.db.transaction() as conn:
+                self._verify_publisher_owns_channel(
+                    conn,
+                    publisher_telegram_user_id=publisher_telegram_user_id,
+                    channel_id=channel_id,
+                )
+            policy = self.set_format_policy(
+                channel_id,
+                format_type,
+                enabled=enabled,
+                owner_price_band=owner_price_band,
+                platform_promo_enabled=platform_promo_enabled,
+                custom_multiplier_bps=custom_multiplier_bps,
             )
-        return self.set_format_policy(
-            channel_id,
-            format_type,
-            enabled=enabled,
-            owner_price_band=owner_price_band,
-            platform_promo_enabled=platform_promo_enabled,
-            custom_multiplier_bps=custom_multiplier_bps,
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="set_format_policy_for_publisher",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="set_format_policy_for_publisher",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"{format_type} → {owner_price_band}, enabled={int(enabled)}",
         )
+        return policy
 
     def set_daily_ad_limit_for_publisher(
         self,
@@ -1073,14 +1103,37 @@ class ChannelService:
         publisher_telegram_user_id: str | int,
         channel_id: str,
         daily_ad_limit: int,
+        actor_kind: str = "human",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        with self.db.transaction() as conn:
-            self._verify_publisher_owns_channel(
-                conn,
-                publisher_telegram_user_id=publisher_telegram_user_id,
-                channel_id=channel_id,
+        audit_args = {"channel_id": channel_id, "daily_ad_limit": daily_ad_limit}
+        try:
+            with self.db.transaction() as conn:
+                self._verify_publisher_owns_channel(
+                    conn,
+                    publisher_telegram_user_id=publisher_telegram_user_id,
+                    channel_id=channel_id,
+                )
+            cfg = self.set_daily_ad_limit(channel_id, daily_ad_limit)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="set_daily_ad_limit_for_publisher",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-        return self.set_daily_ad_limit(channel_id, daily_ad_limit)
+            raise
+        self.tool_calls.log_success(
+            tool_name="set_daily_ad_limit_for_publisher",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"daily_ad_limit → {daily_ad_limit}",
+        )
+        return cfg
 
     def set_daily_ad_limit(self, channel_id: str, daily_ad_limit: int) -> dict[str, Any]:
         if daily_ad_limit < 1 or daily_ad_limit > 24:
@@ -1277,6 +1330,7 @@ class MaterialService:
         self.db = db
         self.settings = settings
         self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def create_material(
         self,
@@ -1289,43 +1343,72 @@ class MaterialService:
         category: str = "general",
         light_short_text: str | None = None,
         display_name: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        format_type = self._normalize_format(format_type)
-        text, target_url, button_text, category = self._normalize_text_fields(
-            text, target_url, button_text, category
-        )
-        if format_type == "light_tail":
-            short = (light_short_text or "").strip()
-            if len(short) < self.LIGHT_SHORT_TEXT_MIN:
-                raise InvalidState(
-                    f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
-                )
-            if len(short) > self.LIGHT_SHORT_TEXT_MAX:
-                raise InvalidState(
-                    f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
-                )
-            light_short_text = short
-        else:
-            light_short_text = None
+        audit_args = {
+            "format_type": format_type,
+            "target_url": target_url,
+            "category": category,
+            "text_preview": (text or "")[:60],
+            "has_light_short_text": bool(light_short_text),
+        }
+        try:
+            format_type = self._normalize_format(format_type)
+            text, target_url, button_text, category = self._normalize_text_fields(
+                text, target_url, button_text, category
+            )
+            if format_type == "light_tail":
+                short = (light_short_text or "").strip()
+                if len(short) < self.LIGHT_SHORT_TEXT_MIN:
+                    raise InvalidState(
+                        f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
+                    )
+                if len(short) > self.LIGHT_SHORT_TEXT_MAX:
+                    raise InvalidState(
+                        f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
+                    )
+                light_short_text = short
+            else:
+                light_short_text = None
 
-        with self.db.transaction() as conn:
-            advertiser = self.accounts.get_or_create_by_telegram(
-                conn,
-                advertiser_telegram_user_id,
-                "advertiser",
-                display_name=display_name,
+            with self.db.transaction() as conn:
+                advertiser = self.accounts.get_or_create_by_telegram(
+                    conn,
+                    advertiser_telegram_user_id,
+                    "advertiser",
+                    display_name=display_name,
+                )
+                material_id = self._insert_material(
+                    conn,
+                    advertiser_account_id=advertiser["id"],
+                    format_type=format_type,
+                    text=text,
+                    target_url=target_url,
+                    button_text=button_text,
+                    category=category,
+                    light_short_text=light_short_text,
+                )
+                material = self._fetch_material(conn, material_id)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="create_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-            material_id = self._insert_material(
-                conn,
-                advertiser_account_id=advertiser["id"],
-                format_type=format_type,
-                text=text,
-                target_url=target_url,
-                button_text=button_text,
-                category=category,
-                light_short_text=light_short_text,
-            )
-            return self._fetch_material(conn, material_id)
+            raise
+        self.tool_calls.log_success(
+            tool_name="create_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"created {material['id']}",
+        )
+        return material
 
     def list_materials(
         self,
@@ -1382,27 +1465,53 @@ class MaterialService:
         material_id: str,
         *,
         advertiser_telegram_user_id: str | int,
+        actor_kind: str = "human",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM creatives WHERE id = ?",
-                (material_id,),
-            ).fetchone()
-            if not row:
-                raise NotFound(f"广告素材不存在：{material_id}")
-            advertiser = conn.execute(
-                "SELECT id FROM accounts WHERE telegram_user_id = ?",
-                (str(advertiser_telegram_user_id),),
-            ).fetchone()
-            if not advertiser or row["advertiser_account_id"] != advertiser["id"]:
-                raise NotFound(f"广告素材不存在：{material_id}")
-            if row["archived_at"]:
-                return dict(row)
-            conn.execute(
-                "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (iso(), material_id),
+        audit_args = {"material_id": material_id}
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?",
+                    (material_id,),
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser or row["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if row["archived_at"]:
+                    material = dict(row)
+                    already_archived = True
+                else:
+                    conn.execute(
+                        "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (iso(), material_id),
+                    )
+                    material = self._fetch_material(conn, material_id)
+                    already_archived = False
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="archive_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-            return self._fetch_material(conn, material_id)
+            raise
+        self.tool_calls.log_success(
+            tool_name="archive_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=("already archived" if already_archived else f"archived {material_id}"),
+        )
+        return material
 
     # ------ helpers reusable from OrderService inside an open transaction ------
 
@@ -1575,6 +1684,7 @@ class OrderService:
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
         self.materials = MaterialService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def create_order(
         self,
@@ -1717,8 +1827,31 @@ class OrderService:
         *,
         order_id: str,
         operator_telegram_user_id: str | int,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id))
+        audit_args = {"order_id": order_id}
+        try:
+            order = self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id))
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="approve_order_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="approve_order_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"approved {order_id}",
+        )
+        return order
 
     def reject_order_for_operator(
         self,
@@ -1726,8 +1859,31 @@ class OrderService:
         order_id: str,
         reason: str,
         operator_telegram_user_id: str | int,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id))
+        audit_args = {"order_id": order_id, "reason_preview": (reason or "")[:80]}
+        try:
+            order = self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id))
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="reject_order_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="reject_order_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"rejected {order_id}",
+        )
+        return order
 
     def refund_delivery_for_operator(
         self,
@@ -1736,11 +1892,40 @@ class OrderService:
         reason: str,
         operator_telegram_user_id: str | int,
         amount_cents: int | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        actor = self._operator_account_id(operator_telegram_user_id)
-        if amount_cents is None:
-            return self.refund_delivery(delivery_id, reason, actor)
-        return self.refund_delivery_partial(delivery_id, amount_cents, reason, actor)
+        audit_args = {
+            "delivery_id": delivery_id,
+            "amount_cents": amount_cents,
+            "reason_preview": (reason or "")[:80],
+        }
+        try:
+            actor = self._operator_account_id(operator_telegram_user_id)
+            if amount_cents is None:
+                delivery = self.refund_delivery(delivery_id, reason, actor)
+            else:
+                delivery = self.refund_delivery_partial(delivery_id, amount_cents, reason, actor)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="refund_delivery_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        kind = "full" if amount_cents is None else f"partial {amount_cents}"
+        self.tool_calls.log_success(
+            tool_name="refund_delivery_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"{kind} refund on {delivery_id}",
+        )
+        return delivery
 
     def _operator_account_id(self, telegram_user_id: str | int) -> str:
         with self.db.transaction() as conn:
@@ -2798,6 +2983,48 @@ class ToolCallLogService:
             if not row:
                 raise NotFound(f"工具调用日志不存在：{log_id}")
             return dict(row)
+
+    def log_success(
+        self,
+        *,
+        tool_name: str,
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        result_summary: str | None = None,
+    ) -> dict[str, Any]:
+        return self.log_call(
+            tool_name=tool_name,
+            actor_telegram_user_id=actor_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=arguments,
+            result_status="success",
+            result_summary=result_summary,
+        )
+
+    def log_failure(
+        self,
+        *,
+        tool_name: str,
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        error: BaseException,
+        result_summary: str | None = None,
+    ) -> dict[str, Any]:
+        return self.log_call(
+            tool_name=tool_name,
+            actor_telegram_user_id=actor_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=arguments,
+            result_status="error",
+            error_type=type(error).__name__,
+            result_summary=result_summary or str(error)[:200],
+        )
 
 
 class SelfPromoService:

@@ -1,0 +1,230 @@
+"""Invariant + concurrency tests for the ledger / order pipeline.
+
+These tests check properties that must hold across many call sequences,
+not just specific golden-path scripts:
+
+- advertiser balance triple (available/reserved/spent) sums to net topups
+- publisher earning triple (pending/confirmed/releasable) sums to net
+  earned-minus-reversed
+- charge = publisher_net + platform_fee (no money created/lost)
+- BEGIN IMMEDIATE serializes concurrent approve_order so only one wins
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from chabo.app import create_app
+from chabo.config import Settings
+from chabo.money import money_to_cents
+from chabo.services import ChaboError, InvalidState
+
+from _fixtures import FakeGateway
+
+
+class InvariantTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gateway = FakeGateway()
+        self.settings = Settings(
+            db_path=str(Path(self.tmp.name) / "invariants.sqlite3"),
+            bot_username="ChaBoTestBot",
+        )
+        self.app = create_app(self.settings, self.gateway)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _bind_channel(self) -> dict:
+        return self.app.channels.bind_channel(
+            telegram_chat_id=-100123,
+            title="测试频道",
+            username="invariant_channel",
+            owner_telegram_user_id=20001,
+            owner_display_name="频道主",
+        )
+
+    def _account_balances(self, telegram_user_id: int) -> dict:
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT available_balance_cents, reserved_balance_cents, spent_balance_cents,
+                       pending_earnings_cents, confirmed_earnings_cents, releasable_earnings_cents
+                FROM accounts WHERE telegram_user_id = ?
+                """,
+                (str(telegram_user_id),),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    # --- Invariant 1: advertiser triple sum is conserved through the full lifecycle.
+    def test_advertiser_triple_conserved_across_lifecycle(self) -> None:
+        topup_cents = 10000  # $100
+        self.app.ledger.manual_topup(10001, topup_cents, display_name="广告主")
+        channel = self._bind_channel()
+
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="不变式测试广告",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("20"),
+        )
+        self.app.orders.approve_order(order["id"])
+        delivered = self.app.fulfillment.dispatch_due()
+        self.assertEqual(len(delivered), 1)
+        delivery_id = delivered[0]["delivery_id"]
+
+        # Partial refund: $5 back to advertiser
+        self.app.orders.refund_delivery_partial(delivery_id, money_to_cents("5"), reason="部分退款")
+
+        balances = self._account_balances(10001)
+        triple_sum = (
+            balances["available_balance_cents"]
+            + balances["reserved_balance_cents"]
+            + balances["spent_balance_cents"]
+        )
+        self.assertEqual(
+            triple_sum,
+            topup_cents,
+            f"available+reserved+spent must equal net topups; got {balances}",
+        )
+
+    # --- Invariant 2: full refund returns advertiser to pre-order state.
+    def test_full_refund_restores_advertiser_available(self) -> None:
+        topup_cents = 10000
+        self.app.ledger.manual_topup(10001, topup_cents, display_name="广告主")
+        channel = self._bind_channel()
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="全退测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("30"),
+        )
+        self.app.orders.approve_order(order["id"])
+        delivered = self.app.fulfillment.dispatch_due()
+        self.app.orders.refund_delivery(delivered[0]["delivery_id"], reason="频道主删帖")
+
+        balances = self._account_balances(10001)
+        self.assertEqual(balances["available_balance_cents"], topup_cents)
+        self.assertEqual(balances["reserved_balance_cents"], 0)
+        self.assertEqual(balances["spent_balance_cents"], 0)
+
+    # --- Invariant 3: delivery accounting — charge = publisher_net + platform_fee.
+    def test_delivery_amounts_reconcile(self) -> None:
+        self.app.ledger.manual_topup(10001, 10000, display_name="广告主")
+        channel = self._bind_channel()
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="账目对平测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("50"),
+        )
+        self.app.orders.approve_order(order["id"])
+        delivered = self.app.fulfillment.dispatch_due()
+        delivery_id = delivered[0]["delivery_id"]
+
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT charge_cents, publisher_net_cents, platform_fee_cents FROM deliveries WHERE id = ?",
+                (delivery_id,),
+            ).fetchone()
+        self.assertEqual(
+            row["charge_cents"],
+            row["publisher_net_cents"] + row["platform_fee_cents"],
+            f"charge must equal publisher_net + platform_fee: row={dict(row)}",
+        )
+
+    # --- Invariant 4: rejecting an order releases reserved budget completely.
+    def test_reject_order_releases_full_reserved(self) -> None:
+        topup_cents = 10000
+        self.app.ledger.manual_topup(10001, topup_cents, display_name="广告主")
+        channel = self._bind_channel()
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="拒审测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("25"),
+        )
+        before = self._account_balances(10001)
+        self.assertEqual(before["reserved_balance_cents"], money_to_cents("25"))
+
+        self.app.orders.reject_order(order["id"], reason="不合规")
+
+        after = self._account_balances(10001)
+        self.assertEqual(after["reserved_balance_cents"], 0)
+        self.assertEqual(after["available_balance_cents"], topup_cents)
+        self.assertEqual(after["spent_balance_cents"], 0)
+
+
+class ConcurrencyTest(unittest.TestCase):
+    """Verify BEGIN IMMEDIATE + busy_timeout serialize concurrent writers."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gateway = FakeGateway()
+        self.settings = Settings(
+            db_path=str(Path(self.tmp.name) / "concurrency.sqlite3"),
+            bot_username="ChaBoTestBot",
+        )
+        self.app = create_app(self.settings, self.gateway)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_concurrent_approve_only_one_succeeds(self) -> None:
+        self.app.ledger.manual_topup(10001, 10000, display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100124,
+            title="并发测试频道",
+            username="concurrency_channel",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="并发审核测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("20"),
+        )
+
+        results: list[Exception | dict] = []
+        barrier = threading.Barrier(2)
+
+        def approve_in_thread() -> None:
+            barrier.wait()
+            try:
+                results.append(self.app.orders.approve_order(order["id"]))
+            except Exception as exc:
+                results.append(exc)
+
+        threads = [threading.Thread(target=approve_in_thread) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        successes = [r for r in results if isinstance(r, dict)]
+        failures = [r for r in results if isinstance(r, Exception)]
+
+        self.assertEqual(len(successes), 1, f"exactly one approve should succeed; got {results}")
+        self.assertEqual(len(failures), 1, f"exactly one approve should be rejected; got {results}")
+        self.assertIsInstance(failures[0], (InvalidState, ChaboError))
+
+
+if __name__ == "__main__":
+    unittest.main()

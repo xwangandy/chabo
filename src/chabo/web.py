@@ -105,6 +105,7 @@ def run_server(
     admin_token: str | None = None,
     webhook_secret: str | None = None,
 ) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     server = make_server(
         settings=settings,
         host=host,
@@ -113,13 +114,13 @@ def run_server(
         webhook_secret=webhook_secret,
     )
     bound_host, bound_port = server.server_address
-    print(f"插播 HTTP 服务已启动：http://{bound_host}:{bound_port}")
+    logger.info("server_started host=%s port=%s", bound_host, bound_port)
     for warning in check_token_strength(
         admin_token=server.admin_token,
         webhook_secret=server.webhook_secret,
         host=str(bound_host),
     ):
-        print(warning)
+        logger.warning(warning)
     try:
         server.serve_forever()
     finally:
@@ -130,7 +131,12 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
     server: ChaboHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(json.dumps({"event": "http_request", "client": self.client_address[0], "message": format % args}, ensure_ascii=False))
+        logger.info(
+            json.dumps(
+                {"event": "http_request", "client": self.client_address[0], "message": format % args},
+                ensure_ascii=False,
+            )
+        )
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)

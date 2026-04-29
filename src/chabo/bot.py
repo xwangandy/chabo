@@ -976,6 +976,9 @@ class UpdateHandler:
     def _placement_text(self, channel: dict[str, Any], payload: dict[str, Any], panel: str) -> str:
         lines = [
             f"🎯 给「{channel['title']}」投放广告",
+        ]
+        lines.extend(self._channel_quality_lines(channel["id"]))
+        lines.extend([
             "",
             f"展示：{self._placement_display_label(payload)}",
             f"发布：{self._placement_period_label(payload)}",
@@ -984,7 +987,7 @@ class UpdateHandler:
             f"费用：{self._placement_cost_label(payload)}",
             "",
             f"下一步：{self._placement_next_step(payload)}",
-        ]
+        ])
         if panel == "display":
             lines.extend(["", "🧩 展示设置", "选择广告在频道里的呈现方式。"])
         elif panel == "schedule":
@@ -996,6 +999,68 @@ class UpdateHandler:
             lines.extend(self._placement_cost_breakdown(channel, payload))
             lines.append("确认后冻结预算，发布成功才扣费。")
         return "\n".join(lines)
+
+    # 类目商业价值: 施工图 §8.4 — 高 / 中高 / 中 / 中低 / 低 / 高风险
+    CATEGORY_VALUE = {
+        "finance": ("金融", "高"),
+        "web3": ("Web3", "高"),
+        "crypto": ("加密", "高"),
+        "ai": ("AI", "高"),
+        "software": ("软件", "高"),
+        "education": ("教育", "中高"),
+        "hiring": ("招聘", "中高"),
+        "ecommerce": ("电商", "中高"),
+        "tools": ("工具", "中高"),
+        "vertical": ("垂直社群", "中高"),
+        "news": ("新闻资讯", "中"),
+        "gossip": ("吃瓜", "中低"),
+        "fun": ("搞笑", "中低"),
+        "entertainment": ("娱乐", "中低"),
+        "movies": ("影视", "低"),
+        "anime": ("动漫", "低"),
+        "adult": ("成人", "高风险"),
+        "general": ("通用", "中"),
+    }
+
+    def _channel_quality_lines(self, channel_id: str) -> list[str]:
+        """Latest channel assessment as a 1-2 line quality signal block.
+
+        Returned lines are appended right under the channel title in the
+        placement configurator so advertisers see traffic / category / risk
+        before they commit a budget. No assessment yet → empty list.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT category, median_24h_views, subscribers, risk_level, score
+                FROM channel_pricing_assessments
+                WHERE channel_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (channel_id,),
+            ).fetchone()
+        if not row:
+            return []
+        # Line 1: traffic snapshot
+        traffic_parts: list[str] = []
+        if row["subscribers"]:
+            traffic_parts.append(f"👥 订阅 {int(row['subscribers']):,}")
+        if row["median_24h_views"]:
+            traffic_parts.append(f"📈 24h 中位浏览 {int(row['median_24h_views']):,}")
+        # Line 2: category + business value + risk
+        category_label, value_label = self.CATEGORY_VALUE.get(
+            (row["category"] or "general").lower(),
+            (row["category"] or "未分类", "未评估"),
+        )
+        risk_emoji = {"normal": "🟢", "watch": "🟡", "high": "🟠", "blocked": "🔴"}.get(row["risk_level"], "⚪️")
+        category_line = f"🏷 {category_label} (商业价值 {value_label}) · {risk_emoji} 风控 {row['risk_level']}"
+
+        result: list[str] = []
+        if traffic_parts:
+            result.append(" · ".join(traffic_parts))
+        result.append(category_line)
+        return result
 
     def _placement_cost_breakdown(self, channel: dict[str, Any], payload: dict[str, Any]) -> list[str]:
         """One-shot cost breakdown for the placement confirm panel.

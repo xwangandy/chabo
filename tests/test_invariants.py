@@ -400,6 +400,50 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("中档", msg["text"])
         self.assertIn("高档", msg["text"])
 
+    def test_placement_top_block_shows_channel_quality_signals(self) -> None:
+        # P1-7: traffic + category + risk surface in the configurator's top
+        # block so advertisers can judge channel quality before committing.
+        self.app.ledger.manual_topup(10001, money_to_cents("100"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100137,
+            title="质量信号频道",
+            username="quality_channel",
+            owner_telegram_user_id=20011,
+            owner_display_name="频道主",
+        )
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20000,
+            subscribers=50000,
+        )
+        text = self.app.update_handler._placement_text(
+            channel=channel,
+            payload={"channel_id": channel["id"], "slot_type": "standard_card"},
+            panel="home",
+        )
+        self.assertIn("订阅 50,000", text)
+        self.assertIn("24h 中位浏览 20,000", text)
+        self.assertIn("软件 (商业价值 高)", text)
+        self.assertIn("风控", text)
+
+    def test_placement_top_block_no_assessment_no_quality_lines(self) -> None:
+        self.app.ledger.manual_topup(10001, money_to_cents("100"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100138,
+            title="未评估频道",
+            username="no_assessment",
+            owner_telegram_user_id=20012,
+            owner_display_name="频道主",
+        )
+        text = self.app.update_handler._placement_text(
+            channel=channel,
+            payload={"channel_id": channel["id"], "slot_type": "standard_card"},
+            panel="home",
+        )
+        self.assertNotIn("订阅", text)
+        self.assertNotIn("商业价值", text)
+
     def test_placement_confirm_panel_shows_cost_breakdown(self) -> None:
         # P1-6: cost confirm panel shows base × pin × period decomposition,
         # plus publisher-net / platform-fee split so advertiser sees where cents go.

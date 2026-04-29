@@ -3396,6 +3396,67 @@ class ChaboMvpTest(unittest.TestCase):
                 reason="他人想偷开案",
             )
 
+    def test_advertiser_dispute_cancel_clears_conversation_state(self) -> None:
+        """bug_007: tapping cancel must wipe dispute_open so the next message is not eaten."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Open dispute prompt → conversation row written
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disp_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertEqual(state["flow"], "dispute_open")
+
+        # Tap cancel — must use the dispute_cancel suffix and clear state
+        cancel = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disp_cancel",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute_cancel",
+                }
+            }
+        )
+        self.assertEqual(cancel["type"], "callback_advertiser_dispute_cancel")
+        with self.app.db.transaction() as conn:
+            state_after = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state_after is None or state_after["flow"] != "dispute_open")
+
+        # A stray plain-text message must NOT file a dispute now
+        before_disputes = self.app.disputes.list_disputes()
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 200,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "thanks 👋",
+                }
+            }
+        )
+        after_disputes = self.app.disputes.list_disputes()
+        self.assertEqual(len(after_disputes), len(before_disputes))
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+        self.assertEqual(delivery["status"], "sent")  # not 'disputed'
+
     def test_advertiser_dispute_blocks_after_full_refund(self) -> None:
         """bug_008: refunded deliveries must not be re-disputable."""
         _, order = self.create_approved_order()

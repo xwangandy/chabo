@@ -3344,6 +3344,195 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("❌", detail_text)
         self.assertIn("原因", detail_text)
 
+    def test_library_create_button_walks_standard_format_end_to_end(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Library page exposes ➕ 新建素材
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib_open_new",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        self.assertTrue(
+            any(b["callback_data"] == "advertiser:material:new" for b in all_buttons),
+            "Library should expose ➕ 新建素材",
+        )
+
+        # Pick format → standard_card
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_format",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:material:new",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_standard",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:material:new:standard_card",
+                }
+            }
+        )
+        self.assertIn("请发送广告文案", self._last_user_facing_text())
+
+        # Walk text → url
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 11,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "全新独立创建的标准插播文案",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 12,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://example.com/standalone",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_saved")
+
+        # Material is in the library
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], "全新独立创建的标准插播文案")
+        self.assertEqual(items[0]["target_url"], "https://example.com/standalone")
+        self.assertEqual(items[0]["format_type"], "standard_card")
+
+        # Conversation state cleaned up
+        with self.app.db.transaction() as conn:
+            state_row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state_row is None or state_row["flow"] != "material_create")
+
+    def test_library_create_light_tail_collects_short_then_detail_then_url(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        for cb_id, data in [
+            ("cb_lt_picker", "advertiser:material:new"),
+            ("cb_lt_format", "advertiser:material:new:light_tail"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+
+        # Short entry too long → rejection, conversation stays at light_short_text
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 21,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "一" * 16,
+                }
+            }
+        )
+        # Errors go through send_private_message — assert directly against that channel
+        self.assertIn("2-15 个字", self.gateway.private_messages[-1]["text"])
+
+        # Within bounds
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 22,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "想看广告？",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 23,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "完整文字插播详情文案，应该够长。",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 24,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://example.com/light",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_saved")
+
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(items[0]["format_type"], "light_tail")
+        self.assertEqual(items[0]["light_short_text"], "想看广告？")
+        self.assertEqual(items[0]["button_text"], "想看广告？")
+
+    def test_library_create_url_must_be_http(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        for cb_id, data in [
+            ("cb_url_picker", "advertiser:material:new"),
+            ("cb_url_std", "advertiser:material:new:standard_card"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 31,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "标准卡片正文文案",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 32,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "ftp://example.com/wrong",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_invalid_url")
+        self.assertEqual(self.app.materials.list_materials(advertiser_telegram_user_id=10001), [])
+
     def test_material_edit_text_via_bot_updates_creative_and_renders_panel(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         material = self.app.materials.create_material(

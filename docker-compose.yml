@@ -1,0 +1,28 @@
+services:
+  chabo:
+    build: .
+    image: chabo:local
+    container_name: chabo
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - CHABO_BOT_TOKEN
+      - CHABO_BOT_USERNAME
+      - CHABO_ADMIN_TOKEN
+      - CHABO_WEBHOOK_SECRET
+      - CHABO_DEFAULT_SERVICE_FEE_BPS
+      - CHABO_DEFAULT_HOLDBACK_BPS
+      - CHABO_DEFAULT_HOLDBACK_DAYS
+      - CHABO_STAR_CREDIT_CENTS
+      - CHABO_TELEGRAM_HTTP_BACKEND
+    volumes:
+      - chabo_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  chabo_data:

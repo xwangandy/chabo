@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 SCHEMA = """
@@ -514,11 +514,16 @@ class Database:
         self.path = path
 
     def connect(self) -> sqlite3.Connection:
-        if self.path != ":memory:":
+        is_memory = self.path == ":memory:"
+        if not is_memory:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        if not is_memory:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def init(self) -> None:
@@ -543,74 +548,36 @@ class Database:
         return str(target.resolve())
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
-        statements = [
-            "ALTER TABLE price_offers ADD COLUMN budget_cents INTEGER",
-            "ALTER TABLE price_offers ADD COLUMN creative_text TEXT",
-            "ALTER TABLE price_offers ADD COLUMN target_url TEXT",
-            "ALTER TABLE price_offers ADD COLUMN button_text TEXT DEFAULT '查看详情'",
-            "ALTER TABLE price_offers ADD COLUMN category TEXT DEFAULT 'general'",
-            "ALTER TABLE price_offers ADD COLUMN scheduled_at TEXT",
-            "ALTER TABLE price_offers ADD COLUMN end_at TEXT",
-            "ALTER TABLE price_offers ADD COLUMN frequency_per_day INTEGER DEFAULT 1",
-            "ALTER TABLE price_offers ADD COLUMN accepted_order_id TEXT REFERENCES ad_orders(id)",
-            "ALTER TABLE ad_orders ADD COLUMN price_offer_id TEXT REFERENCES price_offers(id)",
-            "ALTER TABLE deliveries ADD COLUMN refunded_cents INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE deliveries ADD COLUMN publisher_reversed_cents INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE deliveries ADD COLUMN platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE accounts ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
-            "ALTER TABLE accounts ADD COLUMN timezone_confirmed_at TEXT",
-            "ALTER TABLE creatives ADD COLUMN advertiser_account_id TEXT REFERENCES accounts(id)",
-            "ALTER TABLE creatives ADD COLUMN format_type TEXT NOT NULL DEFAULT 'standard_card'",
-            "ALTER TABLE creatives ADD COLUMN light_short_text TEXT",
-            "ALTER TABLE creatives ADD COLUMN archived_at TEXT",
-        ]
-        for statement in statements:
-            try:
-                conn.execute(statement)
-            except sqlite3.OperationalError as exc:
-                if "duplicate column name" not in str(exc).lower():
-                    raise
-        self._backfill_creative_library(conn)
+        """Apply numbered migrations once each, tracked in schema_migrations.
 
-    def _backfill_creative_library(self, conn: sqlite3.Connection) -> None:
+        Migrations are listed in MIGRATIONS at module scope, ordered by id.
+        A migration that touches an already-up-to-date schema is still safe
+        to run because each step is itself idempotent (ALTER TABLE wrapped
+        in duplicate-column suppression, UPDATEs guarded by WHERE clauses,
+        CREATE INDEX IF NOT EXISTS). The schema_migrations table records
+        which ids have been applied so future non-idempotent migrations
+        only run once.
+        """
         conn.execute(
             """
-            UPDATE creatives
-            SET advertiser_account_id = (
-                SELECT advertiser_account_id FROM campaigns
-                WHERE campaigns.id = creatives.campaign_id
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            WHERE advertiser_account_id IS NULL
             """
         )
-        conn.execute(
-            """
-            UPDATE creatives
-            SET format_type = COALESCE((
-                SELECT ad_slots.slot_type FROM ad_orders
-                JOIN ad_slots ON ad_slots.id = ad_orders.slot_id
-                WHERE ad_orders.creative_id = creatives.id
-                ORDER BY ad_orders.created_at ASC
-                LIMIT 1
-            ), 'standard_card')
-            WHERE format_type = 'standard_card'
-              AND EXISTS (
-                SELECT 1 FROM ad_orders WHERE ad_orders.creative_id = creatives.id
-              )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_creatives_advertiser ON creatives(advertiser_account_id, archived_at, created_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_creatives_format ON creatives(advertiser_account_id, format_type, archived_at)"
-        )
+        applied = {row[0] for row in conn.execute("SELECT id FROM schema_migrations").fetchall()}
+        for mig_id, mig_fn in MIGRATIONS:
+            if mig_id in applied:
+                continue
+            mig_fn(conn)
+            conn.execute("INSERT INTO schema_migrations (id) VALUES (?)", (mig_id,))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self.connect()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -618,3 +585,106 @@ class Database:
             raise
         finally:
             conn.close()
+
+
+# --- Numbered migrations ---------------------------------------------------
+# Each entry is (id, callable). The callable receives a sqlite3.Connection
+# and must apply the change idempotently. New migrations append a new (id,
+# fn) tuple — never edit a published id, and never reorder.
+
+def _add_columns_idempotent(conn: sqlite3.Connection, statements: list[str]) -> None:
+    for stmt in statements:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+
+def _0001_price_offers_v2(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE price_offers ADD COLUMN budget_cents INTEGER",
+        "ALTER TABLE price_offers ADD COLUMN creative_text TEXT",
+        "ALTER TABLE price_offers ADD COLUMN target_url TEXT",
+        "ALTER TABLE price_offers ADD COLUMN button_text TEXT DEFAULT '查看详情'",
+        "ALTER TABLE price_offers ADD COLUMN category TEXT DEFAULT 'general'",
+        "ALTER TABLE price_offers ADD COLUMN scheduled_at TEXT",
+        "ALTER TABLE price_offers ADD COLUMN end_at TEXT",
+        "ALTER TABLE price_offers ADD COLUMN frequency_per_day INTEGER DEFAULT 1",
+        "ALTER TABLE price_offers ADD COLUMN accepted_order_id TEXT REFERENCES ad_orders(id)",
+    ])
+
+
+def _0002_orders_price_offer_link(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE ad_orders ADD COLUMN price_offer_id TEXT REFERENCES price_offers(id)",
+    ])
+
+
+def _0003_deliveries_partial_refund(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE deliveries ADD COLUMN refunded_cents INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE deliveries ADD COLUMN publisher_reversed_cents INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE deliveries ADD COLUMN platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0",
+    ])
+
+
+def _0004_accounts_timezone(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE accounts ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
+        "ALTER TABLE accounts ADD COLUMN timezone_confirmed_at TEXT",
+    ])
+
+
+def _0005_creatives_library_columns(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE creatives ADD COLUMN advertiser_account_id TEXT REFERENCES accounts(id)",
+        "ALTER TABLE creatives ADD COLUMN format_type TEXT NOT NULL DEFAULT 'standard_card'",
+        "ALTER TABLE creatives ADD COLUMN light_short_text TEXT",
+        "ALTER TABLE creatives ADD COLUMN archived_at TEXT",
+    ])
+
+
+def _0006_creative_library_backfill(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE creatives
+        SET advertiser_account_id = (
+            SELECT advertiser_account_id FROM campaigns
+            WHERE campaigns.id = creatives.campaign_id
+        )
+        WHERE advertiser_account_id IS NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE creatives
+        SET format_type = COALESCE((
+            SELECT ad_slots.slot_type FROM ad_orders
+            JOIN ad_slots ON ad_slots.id = ad_orders.slot_id
+            WHERE ad_orders.creative_id = creatives.id
+            ORDER BY ad_orders.created_at ASC
+            LIMIT 1
+        ), 'standard_card')
+        WHERE format_type = 'standard_card'
+          AND EXISTS (
+            SELECT 1 FROM ad_orders WHERE ad_orders.creative_id = creatives.id
+          )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_creatives_advertiser ON creatives(advertiser_account_id, archived_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_creatives_format ON creatives(advertiser_account_id, format_type, archived_at)"
+    )
+
+
+MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
+    ("0001_price_offers_v2", _0001_price_offers_v2),
+    ("0002_orders_price_offer_link", _0002_orders_price_offer_link),
+    ("0003_deliveries_partial_refund", _0003_deliveries_partial_refund),
+    ("0004_accounts_timezone", _0004_accounts_timezone),
+    ("0005_creatives_library_columns", _0005_creatives_library_columns),
+    ("0006_creative_library_backfill", _0006_creative_library_backfill),
+]

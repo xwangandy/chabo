@@ -3,59 +3,15 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
+from .services import AccountService, AdvertiserService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
-
-
-DEFAULT_USER_TIMEZONE = "Asia/Shanghai"
-
-
-TIMEZONE_ALIASES = {
-    "beijing": "Asia/Shanghai",
-    "北京": "Asia/Shanghai",
-    "北京时间": "Asia/Shanghai",
-    "shanghai": "Asia/Shanghai",
-    "上海": "Asia/Shanghai",
-    "china": "Asia/Shanghai",
-    "中国": "Asia/Shanghai",
-    "manila": "Asia/Manila",
-    "马尼拉": "Asia/Manila",
-    "philippines": "Asia/Manila",
-    "菲律宾": "Asia/Manila",
-    "hongkong": "Asia/Hong_Kong",
-    "hong kong": "Asia/Hong_Kong",
-    "香港": "Asia/Hong_Kong",
-    "taipei": "Asia/Taipei",
-    "台北": "Asia/Taipei",
-    "taiwan": "Asia/Taipei",
-    "台湾": "Asia/Taipei",
-    "singapore": "Asia/Singapore",
-    "新加坡": "Asia/Singapore",
-    "tokyo": "Asia/Tokyo",
-    "东京": "Asia/Tokyo",
-    "seoul": "Asia/Seoul",
-    "首尔": "Asia/Seoul",
-    "bangkok": "Asia/Bangkok",
-    "曼谷": "Asia/Bangkok",
-    "dubai": "Asia/Dubai",
-    "迪拜": "Asia/Dubai",
-    "rome": "Europe/Rome",
-    "罗马": "Europe/Rome",
-    "london": "Europe/London",
-    "伦敦": "Europe/London",
-    "new york": "America/New_York",
-    "newyork": "America/New_York",
-    "纽约": "America/New_York",
-    "los angeles": "America/Los_Angeles",
-    "losangeles": "America/Los_Angeles",
-    "洛杉矶": "America/Los_Angeles",
-}
+from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
 
 
 SLOT_DISPLAY_NAMES = {
@@ -92,13 +48,14 @@ class UpdateHandler:
         self.settings = settings
         self.gateway = gateway
         self.accounts = AccountService(db, settings)
-        self.channels = ChannelService(db, settings)
+        self.channels = ChannelService(db, settings, gateway=gateway)
         self.ledger = LedgerService(db, settings)
         self.light_probes = LightProbeService(db, settings)
         self.materials = MaterialService(db, settings)
-        self.orders = OrderService(db, settings)
+        self.orders = OrderService(db, settings, gateway=gateway)
         self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
+        self.advertisers = AdvertiserService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
         if "pre_checkout_query" in update:
@@ -1020,6 +977,9 @@ class UpdateHandler:
     def _placement_text(self, channel: dict[str, Any], payload: dict[str, Any], panel: str) -> str:
         lines = [
             f"🎯 给「{channel['title']}」投放广告",
+        ]
+        lines.extend(self._channel_quality_lines(channel["id"]))
+        lines.extend([
             "",
             f"展示：{self._placement_display_label(payload)}",
             f"发布：{self._placement_period_label(payload)}",
@@ -1028,7 +988,7 @@ class UpdateHandler:
             f"费用：{self._placement_cost_label(payload)}",
             "",
             f"下一步：{self._placement_next_step(payload)}",
-        ]
+        ])
         if panel == "display":
             lines.extend(["", "🧩 展示设置", "选择广告在频道里的呈现方式。"])
         elif panel == "schedule":
@@ -1036,18 +996,129 @@ class UpdateHandler:
         elif panel == "creative":
             lines.extend(["", "📁 广告素材", "选择已有素材，或创建一条新素材。"])
         elif panel == "confirm":
-            lines.extend(["", "✅ 费用确认", "确认后冻结预算，发布成功才扣费。"])
+            lines.extend(["", "✅ 费用确认"])
+            lines.extend(self._placement_cost_breakdown(channel, payload))
+            lines.append("确认后冻结预算，发布成功才扣费。")
         return "\n".join(lines)
+
+    # 类目商业价值: 施工图 §8.4 — 高 / 中高 / 中 / 中低 / 低 / 高风险
+    CATEGORY_VALUE = {
+        "finance": ("金融", "高"),
+        "web3": ("Web3", "高"),
+        "crypto": ("加密", "高"),
+        "ai": ("AI", "高"),
+        "software": ("软件", "高"),
+        "education": ("教育", "中高"),
+        "hiring": ("招聘", "中高"),
+        "ecommerce": ("电商", "中高"),
+        "tools": ("工具", "中高"),
+        "vertical": ("垂直社群", "中高"),
+        "news": ("新闻资讯", "中"),
+        "gossip": ("吃瓜", "中低"),
+        "fun": ("搞笑", "中低"),
+        "entertainment": ("娱乐", "中低"),
+        "movies": ("影视", "低"),
+        "anime": ("动漫", "低"),
+        "adult": ("成人", "高风险"),
+        "general": ("通用", "中"),
+    }
+
+    def _channel_quality_lines(self, channel_id: str) -> list[str]:
+        """Latest channel assessment as a 1-2 line quality signal block.
+
+        Returned lines are appended right under the channel title in the
+        placement configurator so advertisers see traffic / category / risk
+        before they commit a budget. No assessment yet → empty list.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT category, median_24h_views, subscribers, risk_level, score
+                FROM channel_pricing_assessments
+                WHERE channel_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (channel_id,),
+            ).fetchone()
+        if not row:
+            return []
+        # Line 1: traffic snapshot
+        traffic_parts: list[str] = []
+        if row["subscribers"]:
+            traffic_parts.append(f"👥 订阅 {int(row['subscribers']):,}")
+        if row["median_24h_views"]:
+            traffic_parts.append(f"📈 24h 中位浏览 {int(row['median_24h_views']):,}")
+        # Line 2: category + business value + risk
+        category_label, value_label = self.CATEGORY_VALUE.get(
+            (row["category"] or "general").lower(),
+            (row["category"] or "未分类", "未评估"),
+        )
+        risk_emoji = {"normal": "🟢", "watch": "🟡", "high": "🟠", "blocked": "🔴"}.get(row["risk_level"], "⚪️")
+        category_line = f"🏷 {category_label} (商业价值 {value_label}) · {risk_emoji} 风控 {row['risk_level']}"
+
+        result: list[str] = []
+        if traffic_parts:
+            result.append(" · ".join(traffic_parts))
+        result.append(category_line)
+        return result
+
+    def _placement_cost_breakdown(self, channel: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+        """One-shot cost breakdown for the placement confirm panel.
+
+        Shows: per-delivery base / pin multiplier / period multiplier / total,
+        plus the publisher-net / platform-fee split so advertisers know how
+        the cents are routed.
+        """
+        slot_type = payload.get("slot_type")
+        if not slot_type:
+            return ["报价待计算 — 先选展示形态。"]
+        normalized = self.channels.normalize_slot_type(slot_type)
+        base_unit = self._slot_price_cents(payload["channel_id"], normalized)
+        pin_on = bool(payload.get("pin")) and normalized in PINNABLE_PLACEMENT_SLOTS
+        pin_unit = base_unit * 2 if pin_on else base_unit
+        period_cfg = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
+        deliveries = int(period_cfg["deliveries"])
+        discount_bps = int(period_cfg["discount_bps"])
+        per_delivery = max(1, round(pin_unit * discount_bps / 10000))
+        total = per_delivery * deliveries
+
+        with self.db.transaction() as conn:
+            cfg = conn.execute(
+                "SELECT service_fee_bps FROM channel_configs WHERE channel_id = ?",
+                (payload["channel_id"],),
+            ).fetchone()
+        fee_bps = int(cfg["service_fee_bps"]) if cfg else self.settings.default_service_fee_bps
+        platform_fee = (total * fee_bps) // 10_000
+        publisher_net = total - platform_fee
+
+        lines = ["📊 报价拆解"]
+        lines.append(f"• 基准 USD {cents_to_money(base_unit)} / 次")
+        if pin_on:
+            lines.append(f"• 置顶加价 ×2 → USD {cents_to_money(pin_unit)} / 次")
+        if discount_bps != 10_000:
+            discount_pct = discount_bps / 100  # bps→%
+            lines.append(f"• {period_cfg['label']}: {deliveries} 次 × {discount_pct:.0f}% 折扣")
+        lines.append(f"• 单次结算 USD {cents_to_money(per_delivery)} × {deliveries} 次 = USD {cents_to_money(total)}")
+        if fee_bps > 0:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 USD {cents_to_money(platform_fee)} ({fee_bps/100:.1f}%)")
+        else:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 0% (推广按钮 / 高级订阅)")
+        lines.append("")
+        return lines
 
     def _placement_keyboard(self, panel: str, payload: dict[str, Any], creatives: list[Any] | None = None) -> list[list[dict[str, str]]]:
         if panel == "display":
             selected = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            prices = self._placement_slot_prices(payload["channel_id"]) if payload.get("channel_id") else {}
             buttons = []
             for slot_type in PLACEMENT_SLOT_TYPES:
                 prefix = "✅ " if selected == slot_type else ""
-                buttons.append({"text": f"{prefix}{self._slot_label(slot_type)}", "callback_data": f"place:slot:{slot_type}"})
+                price_cents = prices.get(slot_type)
+                price_label = f" · USD {cents_to_money(price_cents)}" if price_cents else ""
+                buttons.append({"text": f"{prefix}{self._slot_label(slot_type)}{price_label}", "callback_data": f"place:slot:{slot_type}"})
             keyboard = self._button_grid(buttons, 2)
-            pin_text = "📌 置顶：开启" if payload.get("pin") else "📌 置顶：关闭"
+            pin_text = "📌 置顶：开启 (×2)" if payload.get("pin") else "📌 置顶：关闭"
             keyboard.append([{"text": pin_text, "callback_data": "place:pin"}])
             keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
             return keyboard
@@ -1775,12 +1846,48 @@ class UpdateHandler:
                 """,
                 (account["id"],),
             ).fetchall()
+
+        # P1-8: aggregate report header so advertiser sees totals at a glance
+        try:
+            report = self.advertisers.report(user_id)
+        except Exception:
+            report = None
+
+        lines: list[str] = []
+        if report:
+            lines.append("📊 投放总览")
+            lines.append(
+                f"• 订单 {report['orders_count']}｜已发 {report['sent_count']}/{report['deliveries_count']}"
+            )
+            lines.append(
+                f"• 总预算 USD {cents_to_money(report['total_budget_cents'])}"
+                f"｜已扣费 USD {cents_to_money(report['charged_cents'])}"
+            )
+            lines.append(f"• 详情页点击 {report['bot_starts']}")
+            if report.get("by_channel") and not report.get("limited"):
+                lines.append("")
+                lines.append("📺 频道分布")
+                for channel_row in report["by_channel"][:5]:
+                    lines.append(
+                        f"• {channel_row['title']}｜{channel_row['orders_count']} 单｜"
+                        f"已扣费 USD {cents_to_money(channel_row['charged_cents'])}"
+                    )
+            elif report.get("limited"):
+                lines.append("")
+                lines.append("ℹ️ 频道分布与完整报表需要 Pro / Enterprise 套餐。")
+            lines.append("")
+
         if rows:
-            lines = ["📋 最近订单"]
+            lines.append("📋 最近订单")
             for row in rows:
-                lines.append(f"• {row['title']}｜{self._status_label(row['status'])}｜预算 {row['budget_cents'] / 100:.2f}｜已花 {row['spent_cents'] / 100:.2f}")
+                lines.append(
+                    f"• {row['title']}｜{self._status_label(row['status'])}"
+                    f"｜预算 USD {cents_to_money(int(row['budget_cents']))}"
+                    f"｜已花 USD {cents_to_money(int(row['spent_cents']))}"
+                )
         else:
-            lines = ["📋 暂无订单\n\n从频道按钮进入即可创建。"]
+            lines.append("📋 暂无订单\n\n从频道按钮进入即可创建。")
+
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -2022,21 +2129,10 @@ class UpdateHandler:
         self._send_main_menu(chat_id, source_message, user)
 
     def _resolve_timezone(self, raw_value: str) -> str | None:
-        value = raw_value.strip()
-        if not value:
-            return None
-        normalized = value.lower().replace("_", " ")
-        aliased = TIMEZONE_ALIASES.get(normalized) or TIMEZONE_ALIASES.get(normalized.replace(" ", ""))
-        timezone_name = aliased or value
-        try:
-            ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
-            return None
-        return timezone_name
+        return resolve_timezone(raw_value)
 
     def _timezone_now(self, timezone_name: str) -> str:
-        now = datetime.now(ZoneInfo(timezone_name))
-        return f"{timezone_name}（{now.strftime('%Y-%m-%d %H:%M')}）"
+        return format_timezone_now(timezone_name)
 
     def _add_channel_url(self) -> str:
         return f"https://t.me/{self.settings.bot_username}?startchannel&admin=post_messages+edit_messages+pin_messages"
@@ -2932,6 +3028,24 @@ class UpdateHandler:
         with self.db.transaction() as conn:
             rate = self.channels.get_rate(conn, channel_id, slot_type)
             return int(rate["unit_price_cents"])
+
+    def _placement_slot_prices(self, channel_id: str) -> dict[str, int]:
+        """Per-slot unit_price_cents for the placement display panel.
+
+        Single query to label all three format buttons with their per-delivery
+        price; the cost panel still computes the full quote (period × pin × ...).
+        """
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.slot_type, r.unit_price_cents
+                FROM ad_slots s
+                JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+                WHERE s.channel_id = ?
+                """,
+                (channel_id,),
+            ).fetchall()
+        return {row["slot_type"]: int(row["unit_price_cents"]) for row in rows}
 
     def _find_channel(self, conn: Any, identifier: str) -> dict[str, Any]:
         row = conn.execute(

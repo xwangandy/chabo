@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import html
 import json
+import logging
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -10,6 +12,18 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .app import ChaboApp, create_app
 from .config import Settings
 from .money import cents_to_money, money_to_cents
+from .services import ChaboError
+
+
+MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MB cap on POST body
+logger = logging.getLogger(__name__)
+
+
+def _safe_eq(provided: str | None, expected: str | None) -> bool:
+    """Constant-time string compare. Returns False for missing values."""
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
 class ChaboHTTPServer(ThreadingHTTPServer):
@@ -91,6 +105,7 @@ def run_server(
     admin_token: str | None = None,
     webhook_secret: str | None = None,
 ) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     server = make_server(
         settings=settings,
         host=host,
@@ -99,13 +114,13 @@ def run_server(
         webhook_secret=webhook_secret,
     )
     bound_host, bound_port = server.server_address
-    print(f"插播 HTTP 服务已启动：http://{bound_host}:{bound_port}")
+    logger.info("server_started host=%s port=%s", bound_host, bound_port)
     for warning in check_token_strength(
         admin_token=server.admin_token,
         webhook_secret=server.webhook_secret,
         host=str(bound_host),
     ):
-        print(warning)
+        logger.warning(warning)
     try:
         server.serve_forever()
     finally:
@@ -116,7 +131,12 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
     server: ChaboHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(json.dumps({"event": "http_request", "client": self.client_address[0], "message": format % args}, ensure_ascii=False))
+        logger.info(
+            json.dumps(
+                {"event": "http_request", "client": self.client_address[0], "message": format % args},
+                ensure_ascii=False,
+            )
+        )
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -201,6 +221,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self._check_content_length():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/telegram/webhook"):
             self._handle_telegram_webhook(parsed.path)
@@ -210,8 +232,12 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         data = self._read_body()
         try:
             result = self._handle_admin_action(parsed.path, data)
-        except Exception as exc:
+        except (ChaboError, ValueError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except Exception:
+            logger.exception("admin_action_failed path=%s", parsed.path)
+            self._send_json({"ok": False, "error": "internal error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         if self._wants_json():
             self._send_json({"ok": True, "result": result})
@@ -224,9 +250,10 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
     def _handle_telegram_webhook(self, path: str) -> None:
         expected = self.server.webhook_secret
         if expected:
-            allowed_path = f"/telegram/webhook/{expected}"
+            prefix = "/telegram/webhook/"
+            path_secret = path[len(prefix):] if path.startswith(prefix) else None
             header_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token")
-            if path != allowed_path and header_secret != expected:
+            if not (_safe_eq(path_secret, expected) or _safe_eq(header_secret, expected)):
                 self._send_json({"ok": False, "error": "invalid webhook secret"}, HTTPStatus.FORBIDDEN)
                 return
         update = self._read_body()
@@ -235,8 +262,9 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             result = self.server.app.update_handler.handle(update)
-        except Exception as exc:
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception:
+            logger.exception("webhook_update_failed")
+            self._send_json({"ok": False, "error": "webhook handler failed"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         self._send_json({"ok": True, "result": result})
 
@@ -257,6 +285,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             if amount_cents is None:
                 return self.server.app.orders.refund_delivery(parts[2], _str_value(data, "reason", "运营后台退款"), note=note)
             return self.server.app.orders.refund_delivery_partial(parts[2], amount_cents, _str_value(data, "reason", "运营后台部分退款"), note=note)
+        if len(parts) == 4 and parts[0] == "admin" and parts[1] == "deliveries" and parts[3] == "report-deletion":
+            return self.server.app.orders.report_publisher_deletion(parts[2], note=note)
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "disputes" and parts[3] == "resolve":
             return self.server.app.disputes.resolve_dispute(
                 dispute_id=parts[2],
@@ -309,6 +339,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             self._summary_card("Open 争议", summary["open_disputes"], alert=summary["open_disputes"] > 0),
             self._summary_card("近 24h 失败", summary["failed_recent"], alert=summary["failed_recent"] > 0),
             self._summary_card("待审入账", summary["pending_topups"], alert=summary["pending_topups"] > 0),
+            self._summary_card("近 24h 按钮追加失败", summary["append_button_failures_24h"], alert=summary["append_button_failures_24h"] > 0),
             "</div>",
             "<div class='bar'>",
             f"<a href='/admin{token_query}'>全部</a> ",
@@ -610,6 +641,11 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             pending_topups = conn.execute(
                 "SELECT COUNT(*) AS n FROM topup_requests WHERE status = 'pending'"
             ).fetchone()["n"]
+            append_button_failures = conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_logs "
+                "WHERE action = 'append_button_failed' "
+                "AND created_at >= datetime('now', '-1 day')"
+            ).fetchone()["n"]
         return {
             "pending_review_orders": pending_review,
             "running_orders": running_orders,
@@ -618,6 +654,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             "failed_recent": failed_recent,
             "scheduled_due": scheduled_due,
             "pending_topups": pending_topups,
+            "append_button_failures_24h": append_button_failures,
         }
 
     def _build_health_payload(self) -> dict[str, Any]:
@@ -631,8 +668,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         try:
             with self.server.app.db.transaction() as conn:
                 conn.execute("SELECT 1").fetchone()
-                payload["db"] = "ok"
-                payload["ops"] = self._ops_summary()
+            payload["db"] = "ok"
+            payload["ops"] = self._ops_summary()
         except Exception as exc:
             payload["ok"] = False
             payload["db"] = "error"
@@ -800,11 +837,25 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         provided = params.get("token", [None])[0]
         bearer = self.headers.get("Authorization", "")
+        bearer_token = bearer[len("Bearer "):] if bearer.startswith("Bearer ") else None
         header_token = self.headers.get("X-Chabo-Admin-Token")
-        if provided == token or header_token == token or bearer == f"Bearer {token}":
+        if _safe_eq(provided, token) or _safe_eq(header_token, token) or _safe_eq(bearer_token, token):
             return True
         self._send_json({"ok": False, "error": "admin token required"}, HTTPStatus.UNAUTHORIZED)
         return False
+
+    def _check_content_length(self) -> bool:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length > MAX_REQUEST_BYTES:
+            self._send_json(
+                {"ok": False, "error": "request body too large"},
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return False
+        return True
 
     def _admin_token_query(self, query: str) -> str:
         token = parse_qs(query).get("token", [None])[0]

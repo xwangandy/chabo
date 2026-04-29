@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from typing import Any
 
 from .config import Settings
 from .db import Database
 from .ids import new_id
+from .money import cents_to_money
 from .services import ChannelService, LedgerService, OrderService, iso, utcnow
 from .telegram import MessageGateway, TelegramError
+
+
+logger = logging.getLogger(__name__)
 
 
 class FulfillmentService:
@@ -153,6 +158,13 @@ class FulfillmentService:
         )
         self._snapshot(conn, order["id"], delivery["id"], "send_log", {"message_id": message_id, "pinned": bool(pinned)})
         self._snapshot(conn, order["id"], delivery["id"], "channel_config", dict(config))
+        self._notify_advertiser_delivered(
+            conn,
+            order=order,
+            channel=channel,
+            delivery_id=delivery["id"],
+            charge_cents=order["unit_price_cents"],
+        )
         self._maybe_notify_budget(conn, order["id"])
         self.orders.maybe_schedule_next(conn, order["id"])
         return {"delivery_id": delivery["id"], "status": "sent", "message_id": message_id}
@@ -248,6 +260,53 @@ class FulfillmentService:
         )
         self._snapshot(conn, order["id"], delivery["id"], "send_failure", {"error": error})
         self.orders.pause_and_release(conn, order["id"], f"插播发布失败：{error}")
+
+    def _notify_advertiser_delivered(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        order: dict[str, Any],
+        channel: sqlite3.Row,
+        delivery_id: str,
+        charge_cents: int,
+    ) -> None:
+        """Push '✅ 已发布' to the advertiser after a successful send.
+
+        Failure to reach Telegram does not affect the delivery transaction —
+        we log and continue. The advertiser can still find the same info
+        under '📣 我的广告'.
+        """
+        account = conn.execute(
+            "SELECT telegram_user_id FROM accounts WHERE id = ?",
+            (order["advertiser_account_id"],),
+        ).fetchone()
+        if not account or not account["telegram_user_id"]:
+            return
+        track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery_id}"
+        remaining_cents = max(0, int(order["reserved_cents"]) - int(charge_cents))
+        text = (
+            "✅ 你的广告已发布\n\n"
+            f"📺 {channel['title']}\n"
+            f"💰 本次扣费 USD {cents_to_money(charge_cents)}\n"
+            f"💵 订单剩余预算 USD {cents_to_money(remaining_cents)}"
+        )
+        keyboard = [
+            [{"text": "🔍 查看详情", "url": track_url}],
+            [{"text": "📣 我的广告", "callback_data": "advertiser:orders"}],
+        ]
+        try:
+            self.gateway.send_private_message(
+                chat_id=account["telegram_user_id"],
+                text=text,
+                inline_keyboard=keyboard,
+            )
+        except TelegramError as exc:
+            logger.warning(
+                "notify_advertiser_delivered_failed order=%s delivery=%s error=%s",
+                order["id"],
+                delivery_id,
+                exc,
+            )
 
     def _maybe_notify_budget(self, conn: sqlite3.Connection, order_id: str) -> None:
         order = self.orders.get_order(conn, order_id)

@@ -226,6 +226,62 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertIsInstance(failures[0], (InvalidState, ChaboError))
 
 
+class AdvertiserNotificationTest(unittest.TestCase):
+    """Verify advertisers get a private message when their ad ships."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.gateway = FakeGateway()
+        self.settings = Settings(
+            db_path=str(Path(self.tmp.name) / "notify.sqlite3"),
+            bot_username="ChaBoTestBot",
+        )
+        self.app = create_app(self.settings, self.gateway)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_advertiser_gets_private_notice_after_delivery(self) -> None:
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100128,
+            title="通知测试频道",
+            username="notify_channel",
+            owner_telegram_user_id=20003,
+            owner_display_name="频道主",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="发布通知测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+
+        before = len(self.gateway.private_messages)
+        delivered = self.app.fulfillment.dispatch_due()
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["status"], "sent")
+
+        new_messages = self.gateway.private_messages[before:]
+        delivery_msgs = [m for m in new_messages if "已发布" in m["text"]]
+        self.assertEqual(len(delivery_msgs), 1, f"expected one '已发布' notice, got {new_messages}")
+        msg = delivery_msgs[0]
+        self.assertEqual(msg["chat_id"], "10001")
+        self.assertIn("通知测试频道", msg["text"])
+        self.assertIn("USD", msg["text"])
+        # Detail deep link must be present so the advertiser can jump to evidence
+        urls = [
+            btn["url"]
+            for row in (msg["inline_keyboard"] or [])
+            for btn in row
+            if "url" in btn
+        ]
+        self.assertTrue(any(u.startswith("https://t.me/ChaBoTestBot?start=ad_") for u in urls), urls)
+
+
 class MigrationTrackingTest(unittest.TestCase):
     """Verify the numbered-migration registry records each id once."""
 

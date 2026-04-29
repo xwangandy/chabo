@@ -634,17 +634,22 @@ class DisputeService:
             ).fetchone()
             if not order:
                 raise NotFound(f"order not found: {order_id}")
+            # Only pre-settlement deliveries are disputable. Including
+            # 'confirmed' / 'refunded' here was wrong: rewriting status to
+            # 'disputed' and later resolving via resolve_dispute() flips the
+            # row back to 'sent', and confirm_due_earnings then double-confirms
+            # publisher pending_earnings, corrupting the ledger.
             delivery = conn.execute(
                 """
                 SELECT * FROM deliveries
-                WHERE order_id = ? AND status IN ('sent', 'confirmed', 'refunded', 'disputed')
+                WHERE order_id = ? AND status = 'sent'
                 ORDER BY COALESCE(sent_at, scheduled_at) DESC
                 LIMIT 1
                 """,
                 (order_id,),
             ).fetchone()
             if not delivery:
-                raise InvalidState("还没发布成功的投放，无法申诉")
+                raise InvalidState("还没有可申诉的投放（已退款 / 已结算 / 还没发出）")
             existing = conn.execute(
                 """
                 SELECT id FROM disputes
@@ -663,10 +668,16 @@ class DisputeService:
                 """,
                 (dispute_id, delivery["order_id"], delivery["id"], advertiser["id"], clean_reason),
             )
-            conn.execute(
-                "UPDATE deliveries SET status = 'disputed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            # Race-safety: only flip the row when it is still 'sent'. If a
+            # parallel confirm_due_earnings just won the row, the dispute
+            # insert above will roll back via the unique-id constraint or be
+            # cleaned up out-of-band — the delivery state stays consistent.
+            updated = conn.execute(
+                "UPDATE deliveries SET status = 'disputed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'sent'",
                 (delivery["id"],),
             )
+            if updated.rowcount == 0:
+                raise InvalidState("该投放状态已变化，无法申诉，请刷新订单详情")
             conn.execute(
                 """
                 INSERT INTO evidence_snapshots (id, order_id, delivery_id, snapshot_type, payload_json)

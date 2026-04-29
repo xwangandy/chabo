@@ -5394,15 +5394,15 @@ class UpdateHandler:
         else:
             lines.append("🚀 暂无发布记录")
 
-        has_sent_delivery = any(
-            d["status"] in {"sent", "confirmed", "refunded", "disputed"} for d in deliveries
-        )
+        # Only 'sent' deliveries are disputable (matches DisputeService rule):
+        # confirmed / refunded are post-settlement, disputed is already in flight.
+        has_disputable_delivery = any(d["status"] == "sent" for d in deliveries)
         has_open_dispute = any(d["status"] == "disputed" for d in deliveries)
         keyboard: list[list[dict[str, str]]] = []
         action_row: list[dict[str, str]] = []
         if order["status"] in self.orders.ADVERTISER_PAUSABLE_STATUSES:
             action_row.append({"text": "⏸ 停止投放", "callback_data": f"advertiser:order:{order['id']}:stop"})
-        if has_sent_delivery and not has_open_dispute:
+        if has_disputable_delivery and not has_open_dispute:
             action_row.append({"text": "🚩 申诉", "callback_data": f"advertiser:order:{order['id']}:dispute"})
         if action_row:
             keyboard.append(action_row)

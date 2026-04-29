@@ -4573,6 +4573,61 @@ class ChaboMvpTest(unittest.TestCase):
                 reason="他人想偷开案",
             )
 
+    def test_advertiser_dispute_blocks_after_full_refund(self) -> None:
+        """bug_008: refunded deliveries must not be re-disputable."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+        # Operator refunds in full → status='refunded'
+        self.app.orders.refund_delivery(
+            delivery_id=delivery["id"],
+            reason="频道主提前删除",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="想再发一次申诉",
+            )
+        # Detail page must NOT offer the 🚩 button either
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post_refund",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+    def test_advertiser_dispute_blocks_after_earnings_confirmed(self) -> None:
+        """bug_008: confirmed deliveries must not be flipped to disputed."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        # Manually confirm earnings (skips the 24h wait)
+        with self.app.db.transaction() as conn:
+            conn.execute(
+                "UPDATE deliveries SET status = 'confirmed' WHERE order_id = ?",
+                (order["id"],),
+            )
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="结算后才发现问题",
+            )
+
     def test_advertiser_dispute_requires_at_least_one_sent_delivery(self) -> None:
         _, order = self.create_approved_order()
         # No dispatch → no sent delivery

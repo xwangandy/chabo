@@ -514,11 +514,16 @@ class Database:
         self.path = path
 
     def connect(self) -> sqlite3.Connection:
-        if self.path != ":memory:":
+        is_memory = self.path == ":memory:"
+        if not is_memory:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        if not is_memory:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def init(self) -> None:
@@ -610,7 +615,7 @@ class Database:
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self.connect()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:

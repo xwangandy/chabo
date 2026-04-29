@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import html
 import json
+import logging
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -10,6 +12,18 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .app import ChaboApp, create_app
 from .config import Settings
 from .money import cents_to_money, money_to_cents
+from .services import ChaboError
+
+
+MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MB cap on POST body
+logger = logging.getLogger(__name__)
+
+
+def _safe_eq(provided: str | None, expected: str | None) -> bool:
+    """Constant-time string compare. Returns False for missing values."""
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
 class ChaboHTTPServer(ThreadingHTTPServer):
@@ -201,6 +215,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self._check_content_length():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/telegram/webhook"):
             self._handle_telegram_webhook(parsed.path)
@@ -210,8 +226,12 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         data = self._read_body()
         try:
             result = self._handle_admin_action(parsed.path, data)
-        except Exception as exc:
+        except (ChaboError, ValueError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except Exception:
+            logger.exception("admin_action_failed path=%s", parsed.path)
+            self._send_json({"ok": False, "error": "internal error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         if self._wants_json():
             self._send_json({"ok": True, "result": result})
@@ -224,9 +244,10 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
     def _handle_telegram_webhook(self, path: str) -> None:
         expected = self.server.webhook_secret
         if expected:
-            allowed_path = f"/telegram/webhook/{expected}"
+            prefix = "/telegram/webhook/"
+            path_secret = path[len(prefix):] if path.startswith(prefix) else None
             header_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token")
-            if path != allowed_path and header_secret != expected:
+            if not (_safe_eq(path_secret, expected) or _safe_eq(header_secret, expected)):
                 self._send_json({"ok": False, "error": "invalid webhook secret"}, HTTPStatus.FORBIDDEN)
                 return
         update = self._read_body()
@@ -235,8 +256,9 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             result = self.server.app.update_handler.handle(update)
-        except Exception as exc:
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception:
+            logger.exception("webhook_update_failed")
+            self._send_json({"ok": False, "error": "webhook handler failed"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         self._send_json({"ok": True, "result": result})
 
@@ -631,8 +653,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         try:
             with self.server.app.db.transaction() as conn:
                 conn.execute("SELECT 1").fetchone()
-                payload["db"] = "ok"
-                payload["ops"] = self._ops_summary()
+            payload["db"] = "ok"
+            payload["ops"] = self._ops_summary()
         except Exception as exc:
             payload["ok"] = False
             payload["db"] = "error"
@@ -800,11 +822,25 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         provided = params.get("token", [None])[0]
         bearer = self.headers.get("Authorization", "")
+        bearer_token = bearer[len("Bearer "):] if bearer.startswith("Bearer ") else None
         header_token = self.headers.get("X-Chabo-Admin-Token")
-        if provided == token or header_token == token or bearer == f"Bearer {token}":
+        if _safe_eq(provided, token) or _safe_eq(header_token, token) or _safe_eq(bearer_token, token):
             return True
         self._send_json({"ok": False, "error": "admin token required"}, HTTPStatus.UNAUTHORIZED)
         return False
+
+    def _check_content_length(self) -> bool:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length > MAX_REQUEST_BYTES:
+            self._send_json(
+                {"ok": False, "error": "request body too large"},
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return False
+        return True
 
     def _admin_token_query(self, query: str) -> str:
         token = parse_qs(query).get("token", [None])[0]

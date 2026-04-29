@@ -1667,10 +1667,13 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_placement_asset_back", "step": previous_step}
 
         if data.startswith("place:slot:"):
+            previous_slot = self.channels.normalize_slot_type(payload.get("slot_type") or "")
             slot_type = self.channels.normalize_slot_type(data.removeprefix("place:slot:"))
             payload["slot_type"] = slot_type
             if slot_type not in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = False
+            if slot_type != previous_slot:
+                self._swap_placement_creative_draft(payload, previous_slot, slot_type)
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
             return {"handled": True, "type": "callback_placement_slot", "slot_type": slot_type}
 
@@ -2821,6 +2824,33 @@ class UpdateHandler:
             ]
 
         return [[{"text": "📁 选择广告", "callback_data": "place:creative"}], [{"text": "🏠 工作台", "callback_data": "menu:home"}]]
+
+    PLACEMENT_CREATIVE_KEYS = (
+        "material_id",
+        "creative_text",
+        "target_url",
+        "button_text",
+        "light_short_text",
+    )
+
+    def _swap_placement_creative_draft(
+        self,
+        payload: dict[str, Any],
+        previous_slot: str,
+        next_slot: str,
+    ) -> None:
+        drafts = payload.setdefault("_slot_drafts", {})
+        if previous_slot:
+            drafts[previous_slot] = {
+                key: payload.get(key) for key in self.PLACEMENT_CREATIVE_KEYS
+            }
+        for key in self.PLACEMENT_CREATIVE_KEYS:
+            payload.pop(key, None)
+        restored = drafts.get(next_slot) or {}
+        for key in self.PLACEMENT_CREATIVE_KEYS:
+            value = restored.get(key)
+            if value:
+                payload[key] = value
 
     def _placement_effective_panel(self, panel: str, payload: dict[str, Any]) -> str:
         if panel not in {"creative", "display", "schedule", "confirm"}:

@@ -3245,6 +3245,84 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
 
+    def test_placement_slot_switch_preserves_per_slot_creative_draft(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播草稿",
+            target_url="https://example.com/std",
+        )
+
+        for cb_id, data in [
+            ("cb_swap_1", f"channel:order:{channel['id']}"),
+            ("cb_swap_2", "place:slot:standard_card"),
+            ("cb_swap_3", "place:creative"),
+            ("cb_swap_4", "place:pick:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        with self.app.db.transaction() as conn:
+            payload_after_pick = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_after_pick["material_id"], std["id"])
+
+        # Switch to 文字插播 — selection must clear so the user can configure the new slot fresh
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_swap_to_light",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:light_tail",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            payload_on_light = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_on_light["slot_type"], "light_tail")
+        self.assertNotIn("material_id", payload_on_light)
+        self.assertNotIn("creative_text", payload_on_light)
+
+        # Flip back to 标准插播 — the previous draft should be restored
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_swap_back",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            payload_restored = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_restored["slot_type"], "standard_card")
+        self.assertEqual(payload_restored["material_id"], std["id"])
+        self.assertEqual(payload_restored["creative_text"], "标准插播草稿")
+        self.assertEqual(payload_restored["target_url"], "https://example.com/std")
+
     def _grant_publisher_access(self, channel: dict, telegram_user_id: int = 20001) -> None:
         """Wire FakeGateway so the publisher passes the get_chat_member check."""
         self.gateway.chat_members[(str(channel["telegram_chat_id"]), str(telegram_user_id))] = {

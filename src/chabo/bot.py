@@ -11,7 +11,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, AdvertiserService, AdvertiserSubscriptionService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
+from .services import AccountService, AdvertiserService, AdvertiserSubscriptionService, ChaboError, ChannelService, DisputeService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
 from .webapi.auth import build_magic_link_url, issue_login_token_conn, sync_portal_access_from_activity
@@ -77,6 +77,7 @@ class UpdateHandler:
         self.stars_payments = StarsPaymentService(db, settings)
         self.advertisers = AdvertiserService(db, settings)
         self.advertiser_subscriptions = AdvertiserSubscriptionService(db, settings)
+        self.disputes = DisputeService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
         if "pre_checkout_query" in update:
@@ -417,6 +418,9 @@ class UpdateHandler:
                 return {"handled": True, "type": "callback_advertiser_order_stop_confirm", "order_id": order_id}
             if action == "stop_yes":
                 return self._advertiser_stop_order(chat_id, user, order_id, message)
+            if action == "dispute":
+                self._begin_advertiser_dispute(chat_id, user, order_id, message)
+                return {"handled": True, "type": "callback_advertiser_dispute_start", "order_id": order_id}
             self._send_advertiser_order_detail(chat_id, user, order_id, message)
             return {"handled": True, "type": "callback_advertiser_order_detail", "order_id": order_id}
         if data == "advertiser:order_help":
@@ -5034,6 +5038,8 @@ class UpdateHandler:
             return self._handle_material_create_message(message, state, text)
         if state["flow"] == "batch_orders":
             return self._handle_batch_orders_message(message, state, text)
+        if state["flow"] == "dispute_open":
+            return self._handle_dispute_open_message(message, state, text)
         if state["flow"] != "create_order":
             return {"handled": False, "reason": "unsupported_conversation"}
         if not text:
@@ -5388,9 +5394,18 @@ class UpdateHandler:
         else:
             lines.append("🚀 暂无发布记录")
 
+        has_sent_delivery = any(
+            d["status"] in {"sent", "confirmed", "refunded", "disputed"} for d in deliveries
+        )
+        has_open_dispute = any(d["status"] == "disputed" for d in deliveries)
         keyboard: list[list[dict[str, str]]] = []
+        action_row: list[dict[str, str]] = []
         if order["status"] in self.orders.ADVERTISER_PAUSABLE_STATUSES:
-            keyboard.append([{"text": "⏸ 停止投放", "callback_data": f"advertiser:order:{order['id']}:stop"}])
+            action_row.append({"text": "⏸ 停止投放", "callback_data": f"advertiser:order:{order['id']}:stop"})
+        if has_sent_delivery and not has_open_dispute:
+            action_row.append({"text": "🚩 申诉", "callback_data": f"advertiser:order:{order['id']}:dispute"})
+        if action_row:
+            keyboard.append(action_row)
         keyboard.append([{"text": "📋 投放订单", "callback_data": "advertiser:orders"}])
         keyboard.append([{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}])
         self._reply_or_edit(
@@ -5497,6 +5512,120 @@ class UpdateHandler:
         # 成功 — pause_and_release 已发了"投放已暂停"私信,这里直接刷回详情让用户立刻看到新状态
         self._send_advertiser_order_detail(chat_id, user, order_id, source_message)
         return {"handled": True, "type": "callback_advertiser_order_stopped", "order_id": order_id}
+
+    def _begin_advertiser_dispute(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        order_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", self._display_name(user)
+            )
+            order = conn.execute(
+                "SELECT id FROM ad_orders WHERE id = ? AND advertiser_account_id = ?",
+                (order_id, account["id"]),
+            ).fetchone()
+            if not order:
+                self._reply_or_edit(
+                    chat_id=chat_id,
+                    source_message=source_message,
+                    text="⚠️ 订单不存在或不属于你。",
+                    inline_keyboard=[
+                        [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                        [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                    ],
+                )
+                return
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                account["id"],
+                "dispute_open",
+                "reason",
+                {"order_id": order_id},
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                "🚩 发起申诉\n\n"
+                "请发送申诉原因（最多 500 字）。\n"
+                "运营会暂停涉事投放、看证据后裁决退款。\n"
+                "举例：频道主提前删除广告 / 修改素材 / 没有发布。"
+            ),
+            inline_keyboard=[
+                [{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}"}],
+            ],
+        )
+
+    def _handle_dispute_open_message(
+        self,
+        message: dict[str, Any],
+        state: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        payload = json.loads(state["payload_json"] or "{}")
+        order_id = payload.get("order_id")
+        if state["step"] != "reason" or not order_id:
+            self._clear_dispute_open_state(chat_id)
+            return {"handled": True, "type": "dispute_invalid_state"}
+        clean_text = (text or "").strip()
+        if not clean_text:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="申诉原因不能为空，请重新发送。",
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}"}]],
+            )
+            return {"handled": True, "type": "dispute_empty"}
+        user_id = user.get("id") or chat_id
+        try:
+            dispute = self.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=user_id,
+                order_id=order_id,
+                reason=clean_text,
+            )
+        except (NotFound, InvalidState) as exc:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text=f"⚠️ 申诉失败：{exc}",
+                inline_keyboard=[[{"text": "📋 订单详情", "callback_data": f"advertiser:order:{order_id}"}]],
+            )
+            self._clear_dispute_open_state(chat_id)
+            return {"handled": True, "type": "dispute_failed", "error": str(exc)}
+        self._clear_dispute_open_state(chat_id)
+        self.gateway.send_private_message(
+            chat_id=chat_id,
+            text=(
+                f"🚩 申诉已提交（{dispute['id']}）\n\n"
+                "运营会复核证据并裁决，结果会在订单详情页和私信通知。"
+            ),
+            inline_keyboard=[
+                [{"text": "📋 订单详情", "callback_data": f"advertiser:order:{order_id}"}],
+                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+        return {"handled": True, "type": "dispute_opened", "dispute_id": dispute["id"], "order_id": order_id}
+
+    def _clear_dispute_open_state(self, chat_id: str | int) -> None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+            if row and row["flow"] == "dispute_open":
+                conn.execute(
+                    "DELETE FROM bot_conversation_states WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
 
     def _delivery_status_icon(self, status: str) -> str:
         return {

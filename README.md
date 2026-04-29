@@ -46,6 +46,15 @@ cp .env.example .env
 chabo init-db
 ```
 
+生产部署前自检（CI / 部署脚本可 gate）：
+
+```bash
+# 任一 critical 项失败时退出码非零
+chabo preflight --host <对外 host>
+```
+
+回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`。
+
 定期备份（推荐 cron）：
 
 ```bash

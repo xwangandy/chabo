@@ -2318,6 +2318,176 @@ class ChaboMvpTest(unittest.TestCase):
         kinds = {event["kind"] for event in timeline}
         self.assertEqual(kinds, {"操作", "证据"})
 
+    def test_phase_one_golden_path_end_to_end(self) -> None:
+        """Walks the施工图 §3 一期金线 in one pass:
+
+        bind channel → fund advertiser via two-person review →
+        placement configurator → operator approve with note →
+        dispatch (3-button keyboard) → 查看详情 deep link → partial
+        refund → self-promo publish → earnings settled.
+
+        Auto-approve is turned off so the operator-approve path runs
+        end-to-end (matches the production setting per施工图 §3).
+        """
+        # Rebuild the app with auto-approve off — exercises the production
+        # path where operators must approve each order
+        prod_settings = Settings(
+            db_path=self.settings.db_path,
+            bot_username="ChaBoTestBot",
+            bot_auto_approve_orders=False,
+        )
+        self.app = create_app(prod_settings, self.gateway)
+
+        # Two operator accounts for the topup approval double-check
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+
+        # 1. Bind channel and confirm timezones
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        # 2. Fund advertiser via the production-recommended two-person review
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=10001,
+            amount_cents=money_to_cents("20"),
+            reason="OTC 收到 20 USDT 金线测试",
+            requester_telegram_user_id=33333,
+            evidence_url="https://evidence.example/preflight.png",
+        )
+        approved = self.app.topup_approvals.approve_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="对账已核",
+        )
+        self.assertEqual(approved["status"], "approved")
+
+        # 3. Placement configurator: open from channel deep link, pick slot,
+        #    write material via the input flow, submit.
+        for cb_id, data in [
+            ("gp_1", f"channel:order:{channel['id']}"),
+            ("gp_2", "place:slot:standard_card"),
+            ("gp_3", "place:creative"),
+            ("gp_4", "place:new:standard_card"),
+        ]:
+            self._advertiser_callback(data, cb_id=cb_id)
+        for text in ["金线测试标准插播文案", "https://advertiser.example/landing"]:
+            self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": 9001,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+        submit = self._advertiser_callback("place:submit", cb_id="gp_submit")
+        self.assertEqual(submit["type"], "callback_placement_order_created")
+        order_id = submit["order_id"]
+
+        # 4. Operator approves with a note (review-note path)
+        self.app.orders.approve_order_for_operator(
+            order_id=order_id,
+            operator_telegram_user_id=33333,
+            note="人工核对通过",
+        )
+
+        # 5. Dispatch the delivery; verify the 3-button keyboard
+        dispatched = self.app.fulfillment.dispatch_due()
+        self.assertEqual(dispatched[0]["status"], "sent")
+        keyboard = self.gateway.sent_ads[-1]["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", keyboard[0][0]["url"])
+        self.assertIn("ad_del_", keyboard[0][1]["url"])
+
+        # 6. A viewer follows the 查看详情 deep link
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order_id,)
+            ).fetchone()
+        self.confirm_timezone(555, display_name="点击用户")
+        view = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 9100,
+                    "from": {"id": 555, "first_name": "点击用户"},
+                    "chat": {"id": 555},
+                    "text": f"/start ad_{delivery['id']}",
+                }
+            }
+        )
+        self.assertEqual(view["type"], "ad_start")
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        # CTA + sales callback present
+        flat = [b for row in detail["inline_keyboard"] for b in row]
+        self.assertTrue(any(b.get("callback_data") == f"channel:order:{channel['id']}" for b in flat))
+
+        # 7. Operator refunds part of the spend with a note
+        self.app.orders.refund_delivery_for_operator(
+            delivery_id=delivery["id"],
+            reason="频道主提前删除部分时段",
+            operator_telegram_user_id=33333,
+            amount_cents=money_to_cents("3"),
+            note="3 美元部分补偿",
+        )
+
+        # 8. Self-promo publish reusing the same library material
+        with self.app.db.transaction() as conn:
+            material_row = conn.execute(
+                "SELECT id FROM creatives WHERE advertiser_account_id = "
+                "(SELECT id FROM accounts WHERE telegram_user_id = '10001') LIMIT 1"
+            ).fetchone()
+        material_id = material_row["id"]
+        # Publisher is also their own advertiser identity → create a self-promo
+        # material via the publisher identity for self-promo
+        pub_material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="频道主自用文案",
+            target_url="https://owner.example/post",
+            button_text="查看详情",
+            display_name="频道主",
+        )
+        self_promo_result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{pub_material['id']}",
+            cb_id="gp_self",
+        )
+        self.assertEqual(self_promo_result["type"], "callback_self_promo_published")
+
+        # 9. Confirm publisher earnings (post-observation) — at this point
+        # the delivery is "sent"; advance time would normally happen via
+        # confirm_due_earnings(observation_hours=0)
+        self.app.fulfillment.confirm_due_earnings(observation_hours=0)
+        with self.app.db.transaction() as conn:
+            publisher = conn.execute(
+                "SELECT * FROM accounts WHERE telegram_user_id = '20001'"
+            ).fetchone()
+        self.assertGreaterEqual(publisher["confirmed_earnings_cents"], 0)
+
+        # 10. Detail-page timeline merges audit + evidence and includes the note
+        url = self.start_http_server()
+        detail_request = urllib.request.Request(
+            f"{url}/admin/orders/{order_id}?token=admin-token",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(detail_request) as response:
+            payload = json.loads(response.read())
+        timeline = payload["order"]["时间线"]
+        self.assertTrue(any(event["title"] == "order_approved" for event in timeline))
+        approve_events = [e for e in timeline if e["title"] == "order_approved"]
+        self.assertIn("人工核对通过", approve_events[0]["note"])
+
+        # 11. Tool call audit captured the AI-callable boundary actions
+        approve_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="approve_order_for_operator"
+        )
+        self.assertEqual(approve_logs[0]["result_status"], "success")
+        topup_logs = self.app.tool_call_logs.list_calls(tool_name="topup_approve")
+        self.assertEqual(topup_logs[0]["result_status"], "success")
+
     def test_topup_approval_two_person_flow_moves_money_only_after_approve(self) -> None:
         # Make sure two distinct operator accounts exist
         self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")

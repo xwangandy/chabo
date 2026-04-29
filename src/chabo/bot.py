@@ -352,6 +352,10 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_role_switch_prompt"}
         if data == "web:open":
             return self._send_web_magic_link(chat_id, user, message)
+        if data.startswith("advertiser:order:"):
+            order_id = data.removeprefix("advertiser:order:")
+            self._send_advertiser_order_detail(chat_id, user, order_id, message)
+            return {"handled": True, "type": "callback_advertiser_order_detail", "order_id": order_id}
         if data == "advertiser:order_help":
             self._send_global_placement(chat_id, user, message, payload=self._default_global_placement_payload(), panel="creative")
             return {"handled": True, "type": "callback_global_placement_started"}
@@ -3926,6 +3930,8 @@ class UpdateHandler:
         self._send_channel_market_browse(chat_id, user, None, payload=payload)
         return {"handled": True, "type": "global_placement_folder_created", "collection_id": collection["id"]}
 
+    ORDER_LIST_NUMBERS = ("①", "②", "③", "④", "⑤")
+
     def _send_advertiser_orders(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
@@ -3974,21 +3980,166 @@ class UpdateHandler:
 
         if rows:
             lines.append("📋 最近订单")
-            for row in rows:
+            for index, row in enumerate(rows):
+                number = self.ORDER_LIST_NUMBERS[index] if index < len(self.ORDER_LIST_NUMBERS) else f"{index + 1}."
                 lines.append(
-                    f"• {row['title']}｜{self._status_label(row['status'])}"
+                    f"{number} {row['title']}｜{self._status_label(row['status'])}"
                     f"｜预算 USD {cents_to_money(int(row['budget_cents']))}"
                     f"｜已花 USD {cents_to_money(int(row['spent_cents']))}"
                 )
         else:
             lines.append("📋 暂无订单\n\n从频道按钮进入即可创建。")
 
+        keyboard: list[list[dict[str, str]]] = []
+        if rows:
+            detail_buttons = [
+                {
+                    "text": f"📄 {self.ORDER_LIST_NUMBERS[i] if i < len(self.ORDER_LIST_NUMBERS) else str(i + 1)}",
+                    "callback_data": f"advertiser:order:{row['id']}",
+                }
+                for i, row in enumerate(rows)
+            ]
+            keyboard.append(detail_buttons)
+        keyboard.append(
+            [{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]
+        )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join(lines),
-            inline_keyboard=[[{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=keyboard,
         )
+
+    def _send_advertiser_order_detail(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        order_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", user.get("first_name") or user.get("username")
+            )
+            order = conn.execute(
+                """
+                SELECT o.*, c.title AS channel_title, s.slot_type
+                FROM ad_orders o
+                JOIN channels c ON c.id = o.channel_id
+                JOIN ad_slots s ON s.id = o.slot_id
+                WHERE o.id = ? AND o.advertiser_account_id = ?
+                """,
+                (order_id, account["id"]),
+            ).fetchone()
+            if not order:
+                self._reply_or_edit(
+                    chat_id=chat_id,
+                    source_message=source_message,
+                    text="⚠️ 订单不存在或不属于你。",
+                    inline_keyboard=[
+                        [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                        [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                    ],
+                )
+                return
+            deliveries = conn.execute(
+                """
+                SELECT id, status, scheduled_at, sent_at, charge_cents, error_message, retry_count
+                FROM deliveries
+                WHERE order_id = ?
+                ORDER BY scheduled_at DESC
+                LIMIT 8
+                """,
+                (order_id,),
+            ).fetchall()
+            click_rows = conn.execute(
+                """
+                SELECT delivery_id, COUNT(*) AS clicks
+                FROM metric_snapshots
+                WHERE delivery_id IN (SELECT id FROM deliveries WHERE order_id = ?)
+                  AND metric_type = 'bot_start'
+                GROUP BY delivery_id
+                """,
+                (order_id,),
+            ).fetchall()
+        clicks_by_delivery = {row["delivery_id"]: row["clicks"] for row in click_rows}
+        tz_name = account.get("timezone") or DEFAULT_USER_TIMEZONE
+
+        slot_label = self._slot_name(order["slot_type"]) if order["slot_type"] else "—"
+        budget_cents = int(order["budget_cents"])
+        spent_cents = int(order["spent_cents"])
+        reserved_cents = int(order["reserved_cents"])
+        lines = [
+            f"📋 订单详情 {order['id']}",
+            "",
+            f"📺 频道：{order['channel_title']}",
+            f"📊 状态：{self._status_label(order['status'])}",
+            f"🧩 展示：{slot_label}",
+            f"💵 预算：USD {cents_to_money(budget_cents)}"
+            f"｜冻结 USD {cents_to_money(reserved_cents)}"
+            f"｜已花 USD {cents_to_money(spent_cents)}",
+            f"🕒 计划开始：{self._format_local_time(order['scheduled_at'], tz_name)}",
+        ]
+        if order["end_at"]:
+            lines.append(f"🕒 计划结束：{self._format_local_time(order['end_at'], tz_name)}")
+        lines.append("")
+        if deliveries:
+            total_clicks = sum(clicks_by_delivery.values())
+            lines.append(f"🚀 发布记录（近 {len(deliveries)} 条，详情页点击合计 {total_clicks}）")
+            for delivery in deliveries:
+                status_icon = self._delivery_status_icon(delivery["status"])
+                when_label = self._format_local_time(delivery["sent_at"] or delivery["scheduled_at"], tz_name)
+                row_parts = [f"{status_icon} {when_label}"]
+                if delivery["status"] in {"sent", "confirmed"} and delivery["charge_cents"]:
+                    row_parts.append(f"扣费 USD {cents_to_money(int(delivery['charge_cents']))}")
+                clicks = clicks_by_delivery.get(delivery["id"], 0)
+                if clicks:
+                    row_parts.append(f"点击 {clicks}")
+                if delivery["error_message"] and delivery["status"] == "failed":
+                    short_err = self._short_title(delivery["error_message"], 32)
+                    row_parts.append(f"原因：{short_err}")
+                if delivery["retry_count"] and delivery["status"] == "failed":
+                    row_parts.append(f"重试 {delivery['retry_count']}")
+                lines.append("• " + " · ".join(row_parts))
+        else:
+            lines.append("🚀 暂无发布记录")
+
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[
+                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    def _delivery_status_icon(self, status: str) -> str:
+        return {
+            "scheduled": "🕒",
+            "sent": "✅",
+            "confirmed": "✅",
+            "failed": "❌",
+            "refunded": "↩️",
+        }.get(status, "•")
+
+    def _format_local_time(self, value: str | None, tz_name: str | None = None) -> str:
+        if not value:
+            return "—"
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        return dt.strftime("%Y-%m-%d %H:%M")
 
     def _send_channel_quote(
         self,

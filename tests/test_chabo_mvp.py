@@ -3245,6 +3245,105 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
 
+    def _last_user_facing_text(self) -> str:
+        """Return the most recent text shown to the user (edits beat new sends)."""
+        edits = list(self.gateway.text_edits)
+        privs = list(self.gateway.private_messages)
+        if not edits and not privs:
+            raise AssertionError("no user-facing message recorded")
+        if edits and not privs:
+            return edits[-1]["text"]
+        if privs and not edits:
+            return privs[-1]["text"]
+        return edits[-1]["text"]  # callback flows always end on an edit
+
+    def _last_user_facing_keyboard(self) -> list[list[dict[str, str]]]:
+        edits = list(self.gateway.text_edits)
+        privs = list(self.gateway.private_messages)
+        if edits:
+            return edits[-1]["inline_keyboard"] or []
+        if privs:
+            return privs[-1]["inline_keyboard"] or []
+        raise AssertionError("no user-facing keyboard recorded")
+
+    def test_advertiser_orders_list_shows_detail_buttons_and_renders_per_order(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        list_result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_orders_list",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:orders",
+                }
+            }
+        )
+        self.assertTrue(list_result["handled"])
+        list_text = self._last_user_facing_text()
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        detail_buttons = [b for b in all_buttons if b["callback_data"].startswith("advertiser:order:")]
+        self.assertEqual(len(detail_buttons), 1)
+        self.assertEqual(detail_buttons[0]["callback_data"], f"advertiser:order:{order['id']}")
+        self.assertIn("①", list_text)
+
+        detail_result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_detail",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        self.assertEqual(detail_result["type"], "callback_advertiser_order_detail")
+        self.assertEqual(detail_result["order_id"], order["id"])
+        detail_text = self._last_user_facing_text()
+        self.assertIn(order["id"], detail_text)
+        self.assertIn("测试频道", detail_text)
+        self.assertIn("已审", detail_text)
+        self.assertIn("发布记录", detail_text)
+
+    def test_advertiser_order_detail_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(99999, display_name="他人")
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_steal",
+                    "from": {"id": 99999, "first_name": "他人"},
+                    "message": {"chat": {"id": 99999}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_detail")
+        self.assertIn("不存在或不属于你", self._last_user_facing_text())
+
+    def test_advertiser_order_detail_surfaces_failed_delivery_reason(self) -> None:
+        self.gateway.fail_send = True
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_failed_detail",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        detail_text = self._last_user_facing_text()
+        self.assertIn("❌", detail_text)
+        self.assertIn("原因", detail_text)
+
     def test_placement_slot_switch_preserves_per_slot_creative_draft(self) -> None:
         channel = self.bind_channel()
         self.confirm_timezone(10001, display_name="广告主")

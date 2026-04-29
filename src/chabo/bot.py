@@ -299,6 +299,17 @@ class UpdateHandler:
         if data == "advertiser:discover":
             self._send_advertiser_discover(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_discover"}
+        if data == "advertiser:saved":
+            self._send_advertiser_saved(chat_id, user, message)
+            return {"handled": True, "type": "callback_advertiser_saved"}
+        if data.startswith("advertiser:save:"):
+            tail = data.removeprefix("advertiser:save:")
+            origin, _, channel_id = tail.partition(":")
+            if not channel_id:
+                # No origin prefix → fall back to library origin
+                channel_id, origin = origin, "library"
+            self._toggle_saved_channel(chat_id, user, channel_id, origin, message)
+            return {"handled": True, "type": "callback_advertiser_save_toggle", "channel_id": channel_id, "origin": origin}
         if data == "advertiser:material:new":
             self._send_material_format_picker(chat_id, user, message)
             return {"handled": True, "type": "callback_material_new_picker"}
@@ -634,7 +645,7 @@ class UpdateHandler:
                 f"🔒 冻结：USD {reserved:.2f}"
             ),
             inline_keyboard=[
-                [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}],
+                [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}, {"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
                 [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
                 [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
                 [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
@@ -685,6 +696,11 @@ class UpdateHandler:
             )
             return
 
+        try:
+            saved_ids = {row["channel_id"] for row in self.advertisers.list_saved_channels(user_id)}
+        except Exception:
+            saved_ids = set()
+
         for index, channel in enumerate(channels):
             number = self.DISCOVER_LIST_NUMBERS[index] if index < len(self.DISCOVER_LIST_NUMBERS) else f"{index + 1}."
             risk_emoji = self.DISCOVER_RISK_EMOJI.get(channel.get("risk_level"), "⚪️")
@@ -692,7 +708,8 @@ class UpdateHandler:
             subscribers = int(channel.get("subscribers") or 0)
             views = int(channel.get("median_24h_views") or 0)
             price = cents_to_money(int(channel.get("list_price_cents") or 0))
-            lines.append(f"{number} {channel['title']}")
+            saved_mark = " ⭐" if channel["channel_id"] in saved_ids else ""
+            lines.append(f"{number} {channel['title']}{saved_mark}")
             lines.append(
                 f"   🏷 {category_label} · {risk_emoji} 风控 · ⭐ {channel.get('score') or 0}"
             )
@@ -700,7 +717,7 @@ class UpdateHandler:
                 f"   👥 {subscribers:,} 订阅 · 📈 {views:,} 浏览/24h · 💵 标准插播 USD {price}"
             )
         lines.append("")
-        lines.append("点 ▶ 进入投放配置（也可从频道帖按钮进入）。")
+        lines.append("▶ 进入投放配置｜⭐ 收藏频道。")
 
         action_buttons = [
             {
@@ -709,7 +726,18 @@ class UpdateHandler:
             }
             for i, channel in enumerate(channels)
         ]
-        keyboard = [action_buttons]
+        save_buttons = [
+            {
+                "text": ("🌟 " if channel["channel_id"] in saved_ids else "⭐ ")
+                + (self.DISCOVER_LIST_NUMBERS[i] if i < len(self.DISCOVER_LIST_NUMBERS) else str(i + 1)),
+                "callback_data": f"advertiser:save:disc:{channel['channel_id']}",
+            }
+            for i, channel in enumerate(channels)
+        ]
+        keyboard = [action_buttons, save_buttons]
+        keyboard.append([
+            {"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"},
+        ])
         keyboard.append([
             {"text": "📣 我的广告", "callback_data": "role:advertiser"},
             {"text": "🏠 主菜单", "callback_data": "menu:home"},
@@ -720,6 +748,106 @@ class UpdateHandler:
             text="\n".join(lines),
             inline_keyboard=keyboard,
         )
+
+    def _send_advertiser_saved(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            saved = self.advertisers.list_saved_channels(user_id)
+        except Exception as exc:
+            logger.warning("list_saved_channels_failed user=%s error=%s", user_id, exc)
+            saved = []
+        lines = ["⭐ 我的收藏", ""]
+        if not saved:
+            lines.extend([
+                "还没有收藏频道。",
+                "在「🔍 找频道」里看到合适的就按 ⭐ 收藏。",
+            ])
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="\n".join(lines),
+                inline_keyboard=[
+                    [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}],
+                    [{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+
+        play_buttons: list[dict[str, str]] = []
+        unsave_buttons: list[dict[str, str]] = []
+        for index, row in enumerate(saved[: len(self.DISCOVER_LIST_NUMBERS)]):
+            number = self.DISCOVER_LIST_NUMBERS[index]
+            label = row["title"] or row.get("username") or row["channel_id"]
+            note = (row.get("note") or "").strip()
+            line = f"{number} {label}"
+            if note:
+                line += f" · 备注：{note}"
+            lines.append(line)
+            play_buttons.append({
+                "text": f"▶ {number}",
+                "callback_data": f"channel:order:{row['channel_id']}",
+            })
+            unsave_buttons.append({
+                "text": f"❌ {number}",
+                "callback_data": f"advertiser:save:saved:{row['channel_id']}",
+            })
+
+        keyboard = [play_buttons, unsave_buttons]
+        keyboard.append([
+            {"text": "🔍 找频道", "callback_data": "advertiser:discover"},
+            {"text": "🏠 主菜单", "callback_data": "menu:home"},
+        ])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _toggle_saved_channel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_id: str,
+        origin: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            already = self.advertisers.is_saved_channel(
+                advertiser_telegram_user_id=user_id,
+                channel_id=channel_id,
+            )
+            if already:
+                self.advertisers.remove_saved_channel(
+                    advertiser_telegram_user_id=user_id,
+                    channel_id=channel_id,
+                )
+            else:
+                self.advertisers.save_channel(
+                    advertiser_telegram_user_id=user_id,
+                    channel_id=channel_id,
+                )
+        except (NotFound, InvalidState) as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 操作失败：{exc}",
+                inline_keyboard=[
+                    [{"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
+                    [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}],
+                ],
+            )
+            return
+        if origin == "saved":
+            self._send_advertiser_saved(chat_id, user, source_message)
+        else:
+            self._send_advertiser_discover(chat_id, user, source_message)
 
     def _send_channel_sales_landing(
         self,

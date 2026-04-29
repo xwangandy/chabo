@@ -748,6 +748,45 @@ class AdvertiserService:
                 ).fetchone()
             )
 
+    def remove_saved_channel(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        channel_id: str,
+    ) -> bool:
+        """Remove a saved-channel pin. Returns True if a row was deleted."""
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                return False
+            cursor = conn.execute(
+                "DELETE FROM advertiser_saved_channels WHERE advertiser_account_id = ? AND channel_id = ?",
+                (advertiser["id"], channel_id),
+            )
+            return cursor.rowcount > 0
+
+    def is_saved_channel(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        channel_id: str,
+    ) -> bool:
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                return False
+            row = conn.execute(
+                "SELECT 1 FROM advertiser_saved_channels WHERE advertiser_account_id = ? AND channel_id = ? LIMIT 1",
+                (advertiser["id"], channel_id),
+            ).fetchone()
+            return row is not None
+
     def list_saved_channels(self, advertiser_telegram_user_id: str | int) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
             advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")

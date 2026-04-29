@@ -2225,6 +2225,224 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("❌", detail_text)
         self.assertIn("原因", detail_text)
 
+    def _seed_two_assessed_channels(self) -> tuple[dict, dict]:
+        channel_a = self.bind_channel()
+        channel_b = self.app.channels.bind_channel(
+            telegram_chat_id=-100124,
+            title="测试频道B",
+            username="test_channel_b",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主B",
+        )
+        for ch in (channel_a, channel_b):
+            self.app.pricing.assess_channel(
+                channel_id=ch["id"],
+                category="software",
+                median_24h_views=20_000,
+                subscribers=50_000,
+                light_clicks_30d=180,
+                light_unique_clickers_30d=120,
+                repeat_purchase_count=2,
+                dispute_count=0,
+                risk_level="normal",
+            )
+            self.app.pricing.apply_quotes_to_rate_cards(ch["id"])
+        return channel_a, channel_b
+
+    def test_library_exposes_batch_button_per_material(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量待投素材",
+            target_url="https://example.com",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        batch_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:batch:start:")
+        ]
+        self.assertEqual(len(batch_buttons), 1)
+        self.assertEqual(batch_buttons[0]["callback_data"], f"advertiser:batch:start:{material['id']}")
+
+    def test_batch_flow_toggle_select_and_submit_creates_orders(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        # Standard_card list prices in our seed are ~USD 118; top up enough for two
+        self.topup_advertiser("500")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量素材文案",
+            target_url="https://example.com/batch",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+
+        # Start batch
+        start = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        self.assertEqual(start["type"], "callback_batch_start")
+        body = self._last_user_facing_text()
+        self.assertIn("批量投放", body)
+        self.assertIn(channel_a["title"], body)
+        self.assertIn(channel_b["title"], body)
+
+        # Bump per-channel budget above the standard_card list price by sending a budget message
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_budget_prompt",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:budget",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "150",
+                }
+            }
+        )
+
+        # Toggle both channels
+        for cb_id, ch in (("cb_t_a", channel_a), ("cb_t_b", channel_b)):
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": f"advertiser:batch:toggle:{ch['id']}",
+                    }
+                }
+            )
+
+        # Confirm 2 selected & submit
+        body_after = self._last_user_facing_text()
+        self.assertIn("已选：2", body_after)
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:submit",
+                }
+            }
+        )
+        self.assertEqual(submit["type"], "callback_batch_submitted")
+        self.assertEqual(submit["created_count"], 2)
+        self.assertEqual(submit["failed_count"], 0)
+
+        # Both new orders use the same creative_id (the library material)
+        with self.app.db.transaction() as conn:
+            creative_ids = [
+                row["creative_id"]
+                for row in conn.execute(
+                    "SELECT creative_id FROM ad_orders WHERE advertiser_account_id IN (SELECT id FROM accounts WHERE telegram_user_id = '10001')"
+                ).fetchall()
+            ]
+        self.assertEqual(set(creative_ids), {material["id"]})
+
+        # Conversation cleaned
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state is None or state["flow"] != "batch_orders")
+
+    def test_batch_flow_blocks_archived_material(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="即将归档",
+            target_url="https://example.com",
+        )
+        self.app.materials.archive_material(material["id"], advertiser_telegram_user_id=10001)
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_arch",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        self.assertIn("已归档", self._last_user_facing_text())
+
+    def test_batch_flow_for_free_user_fails_with_friendly_message(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="想批量但没买套餐",
+            target_url="https://example.com",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+        # Start
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        # Toggle
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_toggle",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:toggle:{channel_a['id']}",
+                }
+            }
+        )
+        # Submit — service should reject for missing batch_orders feature
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:submit",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_batch_failed")
+
     def test_advertiser_menu_exposes_discover_entry_point(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         self.app.update_handler.handle(

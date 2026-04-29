@@ -421,6 +421,10 @@ class UpdateHandler:
             if action == "dispute":
                 self._begin_advertiser_dispute(chat_id, user, order_id, message)
                 return {"handled": True, "type": "callback_advertiser_dispute_start", "order_id": order_id}
+            if action == "dispute_cancel":
+                self._clear_dispute_open_state(chat_id)
+                self._send_advertiser_order_detail(chat_id, user, order_id, message)
+                return {"handled": True, "type": "callback_advertiser_dispute_cancel", "order_id": order_id}
             self._send_advertiser_order_detail(chat_id, user, order_id, message)
             return {"handled": True, "type": "callback_advertiser_order_detail", "order_id": order_id}
         if data == "advertiser:order_help":
@@ -5558,7 +5562,7 @@ class UpdateHandler:
                 "举例：频道主提前删除广告 / 修改素材 / 没有发布。"
             ),
             inline_keyboard=[
-                [{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}"}],
+                [{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}:dispute_cancel"}],
             ],
         )
 
@@ -5583,7 +5587,7 @@ class UpdateHandler:
             self.gateway.send_private_message(
                 chat_id=chat_id,
                 text="申诉原因不能为空，请重新发送。",
-                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}"}]],
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}:dispute_cancel"}]],
             )
             return {"handled": True, "type": "dispute_empty"}
         user_id = user.get("id") or chat_id

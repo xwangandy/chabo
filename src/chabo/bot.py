@@ -9,7 +9,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
+from .services import AccountService, AdvertiserService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
 
@@ -55,6 +55,7 @@ class UpdateHandler:
         self.orders = OrderService(db, settings, gateway=gateway)
         self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
+        self.advertisers = AdvertiserService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
         if "pre_checkout_query" in update:
@@ -1845,12 +1846,48 @@ class UpdateHandler:
                 """,
                 (account["id"],),
             ).fetchall()
+
+        # P1-8: aggregate report header so advertiser sees totals at a glance
+        try:
+            report = self.advertisers.report(user_id)
+        except Exception:
+            report = None
+
+        lines: list[str] = []
+        if report:
+            lines.append("📊 投放总览")
+            lines.append(
+                f"• 订单 {report['orders_count']}｜已发 {report['sent_count']}/{report['deliveries_count']}"
+            )
+            lines.append(
+                f"• 总预算 USD {cents_to_money(report['total_budget_cents'])}"
+                f"｜已扣费 USD {cents_to_money(report['charged_cents'])}"
+            )
+            lines.append(f"• 详情页点击 {report['bot_starts']}")
+            if report.get("by_channel") and not report.get("limited"):
+                lines.append("")
+                lines.append("📺 频道分布")
+                for channel_row in report["by_channel"][:5]:
+                    lines.append(
+                        f"• {channel_row['title']}｜{channel_row['orders_count']} 单｜"
+                        f"已扣费 USD {cents_to_money(channel_row['charged_cents'])}"
+                    )
+            elif report.get("limited"):
+                lines.append("")
+                lines.append("ℹ️ 频道分布与完整报表需要 Pro / Enterprise 套餐。")
+            lines.append("")
+
         if rows:
-            lines = ["📋 最近订单"]
+            lines.append("📋 最近订单")
             for row in rows:
-                lines.append(f"• {row['title']}｜{self._status_label(row['status'])}｜预算 {row['budget_cents'] / 100:.2f}｜已花 {row['spent_cents'] / 100:.2f}")
+                lines.append(
+                    f"• {row['title']}｜{self._status_label(row['status'])}"
+                    f"｜预算 USD {cents_to_money(int(row['budget_cents']))}"
+                    f"｜已花 USD {cents_to_money(int(row['spent_cents']))}"
+                )
         else:
-            lines = ["📋 暂无订单\n\n从频道按钮进入即可创建。"]
+            lines.append("📋 暂无订单\n\n从频道按钮进入即可创建。")
+
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,

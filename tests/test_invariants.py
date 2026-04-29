@@ -427,6 +427,25 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("软件 (商业价值 高)", text)
         self.assertIn("风控", text)
 
+    def test_advertiser_orders_page_includes_aggregate_report(self) -> None:
+        # P1-8: "📣 我的广告" 现在带"投放总览" + "频道分布" + "最近订单"
+        ctx = self._setup_one_running_delivery()
+        # Trigger the advertiser orders rendering
+        before = len(self.gateway.private_messages) + len(self.gateway.text_edits)
+        self.app.update_handler._send_advertiser_orders(
+            chat_id="10001",
+            user={"id": "10001", "first_name": "广告主"},
+            source_message=None,
+        )
+        sent = self.gateway.private_messages[-1]
+        text = sent["text"]
+        self.assertIn("📊 投放总览", text)
+        self.assertIn("订单 1", text)
+        self.assertIn("已发", text)
+        self.assertIn("详情页点击", text)
+        self.assertIn("最近订单", text)
+        self.assertIn(ctx["channel"]["title"], text)
+
     def test_placement_top_block_no_assessment_no_quality_lines(self) -> None:
         self.app.ledger.manual_topup(10001, money_to_cents("100"), display_name="广告主")
         channel = self.app.channels.bind_channel(

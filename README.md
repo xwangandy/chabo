@@ -32,6 +32,9 @@
 - 广告主高级服务：优质频道发现、频道收藏、新频道提醒、批量投放、投放报表、套餐权限和到期限制。
 - 同一 Telegram 用户可同时作为广告主和频道主，账户角色会合并为 `mixed`。
 - 真实频道联测已验证：频道帖自动追加入口、deep link 归因、自助下单、审核、发布、扣费、低预算提醒、广告详情点击归因、争议和退款。
+- 广告库服务层：广告素材（creatives）按广告主独立归属、按形态（文字/标准/定制）分类、可归档；`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都自带归属校验。下单、批量下单、砍价成交都已经走同一套素材创建路径。
+- 人工入账双人复核：`request-topup` 写一行 pending 不动账本；`approve-topup` 必须由不同账号执行才会调 `manual_topup` 入账；`reject-topup` 不动钱。`/admin` 顶部"待审入账"一栏、CLI 列表都能看到全部待审请求；所有动作都进 `tool_call_logs` 审计。
+- 生产部署样例：`DOC/部署/systemd-chabo.service`、`DOC/部署/nginx-chabo.conf`、`DOC/部署/token-rotation.md` 给出 systemd 服务 / nginx 反向代理 / admin & webhook secret 轮换的完整样板和应急清单。
 
 ## 快速开始
 
@@ -43,10 +46,52 @@ cp .env.example .env
 chabo init-db
 ```
 
-创建广告主并人工入账：
+生产部署前自检（CI / 部署脚本可 gate）：
+
+```bash
+# 任一 critical 项失败时退出码非零
+chabo preflight --host <对外 host>
+```
+
+回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`。
+
+定期备份（推荐 cron）：
+
+```bash
+# 自动写到 <db_dir>/backups/chabo-YYYYMMDD-HHMMSS.sqlite3
+chabo backup-db
+# 或显式路径
+chabo backup-db --target /var/backups/chabo/snapshot.sqlite3
+```
+
+创建广告主并人工入账（开发 / 单人入账走 `topup`；生产推荐走双人复核）：
 
 ```bash
 chabo topup --telegram-user-id 10001 --display-name "广告主A" --amount 100
+```
+
+生产环境的人工入账走双人复核，运营 A 提交、运营 B 审批：
+
+```bash
+chabo request-topup \
+  --recipient-telegram-user-id 10001 \
+  --amount 100 \
+  --reason "OTC 收到 100 USDT，转入插播余额" \
+  --requester-telegram-user-id <运营A_TG_ID> \
+  --evidence-url "https://evidence.example/screenshot.png"
+
+chabo list-topup-requests --status pending
+
+chabo approve-topup \
+  --request-id <treq_id> \
+  --approver-telegram-user-id <运营B_TG_ID> \
+  --note "对账已核"
+# approve 调用必须由不同的运营员执行；同一账号 approve 会被服务层拒绝。
+
+chabo reject-topup \
+  --request-id <treq_id> \
+  --approver-telegram-user-id <运营B_TG_ID> \
+  --note "金额对不上凭证"
 ```
 
 绑定频道并查看插播入口：
@@ -175,9 +220,41 @@ chabo show-stars-payment-intent <intent_id_or_payload>
 
 Stars 支付会先创建 `stars_payment_intents`，再发送 `currency=XTR` 的发票；Bot 收到 `pre_checkout_query` 时校验用户、金额和状态，收到 `successful_payment` 后按支付意图充值余额或开通订阅。`CHABO_STAR_CREDIT_CENTS` 用于配置 1 Star 折算多少内部余额 cents，默认 1。
 
+把素材保存到广告库并复用：
+
+```bash
+chabo create-material \
+  --advertiser-telegram-user-id 10001 \
+  --format-type standard_card \
+  --text "标准插播文案 v1" \
+  --target-url "https://example.com"
+
+chabo create-material \
+  --advertiser-telegram-user-id 10001 \
+  --format-type light_tail \
+  --light-short-text "想投这里？" \
+  --text "完整文字插播详情文案" \
+  --target-url "https://example.com"
+
+chabo list-materials --advertiser-telegram-user-id 10001
+chabo show-material --material-id <material_id> --advertiser-telegram-user-id 10001
+chabo archive-material --material-id <material_id> --advertiser-telegram-user-id 10001
+```
+
+`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都按 `advertiser_telegram_user_id` 校验归属。文字插播必须配 2-15 字短入口；标准/定制插播不带短入口。归档后的素材不能再用于新订单，但仍能通过 `--include-archived` 看到。
+
 创建订单、审核并调度：
 
 ```bash
+# 直接复用广告库素材
+chabo create-order \
+  --advertiser-telegram-user-id 10001 \
+  --channel-token <ref_token> \
+  --slot-type standard_card \
+  --material-id <material_id> \
+  --budget 20
+
+# 仍兼容内联文案路径；新建的素材会自动进入广告库
 chabo create-order \
   --advertiser-telegram-user-id 10001 \
   --channel-token <ref_token> \
@@ -204,12 +281,14 @@ chabo resolve-dispute --dispute-id <dispute_id> --resolution "证据不足，恢
 
 插播现在内置一个标准库 HTTP 服务，不额外引入 Web 框架。它提供：
 
-- `GET /health`：健康检查。
+- `GET /health`：健康检查；带 DB ping 和运营计数（`pending_review_orders / running_orders / sent_today / scheduled_due / open_disputes / failed_recent`）。可被 LB 或监控系统直接用作 readiness 信号。
 - `POST /telegram/webhook/<secret>`：Telegram webhook update 入口。
-- `GET /admin?token=<admin_token>`：轻量运营后台页面。
+- `GET /admin?token=<admin_token>`：轻量运营后台页面，顶部有六张运营摘要卡片（与 `/health` 同一组数据），告警计数会高亮成红色。
 - `GET /admin/orders|disputes|deliveries`：运营 JSON 查询。
 - `GET /admin/orders/<order_id>|deliveries/<delivery_id>|disputes/<dispute_id>`：详情页，包含关联对象、证据链和账本流水。
 - `POST /admin/orders/<order_id>/approve|reject`、`POST /admin/deliveries/<delivery_id>/refund`、`POST /admin/dispatch-due`、`POST /admin/confirm-earnings`：运营动作。
+
+`run-web` 启动时会跑 `check_token_strength`：loopback 绑定可零配置；外部 IP 上缺 `CHABO_ADMIN_TOKEN` / `CHABO_WEBHOOK_SECRET`，或 token 短于 16 字符或包含 `test/demo/changeme/secret` 等弱关键字，启动日志会打印明确告警，提示生产前换强随机值。
 
 投放退款支持两种方式：不传 `amount` 时退还该投放剩余可退金额；传 `amount` 时执行部分退款，并按比例回滚频道主待确认收益和平台服务费。
 

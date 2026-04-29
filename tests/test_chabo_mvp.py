@@ -15,6 +15,7 @@ from chabo.app import create_app
 from chabo.config import Settings
 from chabo.money import money_to_cents
 from chabo.polling import PollingRunner
+from chabo.services import InvalidState, NotFound
 from chabo.telegram import TelegramError
 from chabo.web import make_server
 
@@ -38,7 +39,7 @@ class FakeGateway:
         self.chat_members = {}
         self.chat_administrators = {}
 
-    def send_ad(self, *, chat_id: str, text: str, button_text: str, button_url: str) -> str:
+    def send_ad(self, *, chat_id: str, text: str, inline_keyboard: list[list[dict[str, str]]]) -> str:
         if self.fail_send:
             raise TelegramError("send failed")
         self.next_message_id += 1
@@ -47,8 +48,7 @@ class FakeGateway:
             {
                 "chat_id": chat_id,
                 "text": text,
-                "button_text": button_text,
-                "button_url": button_url,
+                "inline_keyboard": inline_keyboard,
                 "message_id": message_id,
             }
         )
@@ -891,8 +891,10 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
         self.assertEqual(result["type"], "ad_start")
-        self.assertIn("完整广告详情", self.gateway.private_messages[-1]["text"])
-        self.assertIn("https://light.example", self.gateway.private_messages[-1]["text"])
+        last_message = self.gateway.private_messages[-1]
+        self.assertIn("完整广告详情", last_message["text"])
+        keyboard_urls = [b.get("url") for row in last_message["inline_keyboard"] for b in row]
+        self.assertIn("https://light.example", keyboard_urls)
 
     def test_account_becomes_mixed_when_same_user_is_advertiser_and_publisher(self) -> None:
         with self.app.db.transaction() as conn:
@@ -971,7 +973,11 @@ class ChaboMvpTest(unittest.TestCase):
             delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
         order_detail = self.http_json("GET", f"{base_url}/admin/orders/{order['id']}?token=admin-token")
         self.assertEqual(order_detail["order"]["订单"]["id"], order["id"])
-        self.assertGreaterEqual(len(order_detail["order"]["证据链"]), 1)
+        self.assertGreaterEqual(len(order_detail["order"]["时间线"]), 1)
+        # The audit log for the operator approve action should be on the timeline
+        self.assertTrue(
+            any(event["title"] == "order_approved" for event in order_detail["order"]["时间线"])
+        )
         partial = self.http_json(
             "POST",
             f"{base_url}/admin/deliveries/{delivery['id']}/refund?token=admin-token",
@@ -1210,8 +1216,16 @@ class ChaboMvpTest(unittest.TestCase):
         dispatched = self.app.fulfillment.dispatch_due()
 
         self.assertEqual(dispatched[0]["status"], "sent")
-        self.assertEqual(self.gateway.sent_ads[0]["button_text"], "查看详情")
-        self.assertIn("ad_del_", self.gateway.sent_ads[0]["button_url"])
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual(len(keyboard), 2)
+        top_row_texts = [b["text"] for b in keyboard[0]]
+        self.assertIn("📣 频道招商", top_row_texts)
+        self.assertIn("🔍 查看详情", top_row_texts)
+        sales_button = next(b for b in keyboard[0] if b["text"] == "📣 频道招商")
+        detail_button = next(b for b in keyboard[0] if b["text"] == "🔍 查看详情")
+        self.assertIn("ch_", sales_button["url"])
+        self.assertIn("ad_del_", detail_button["url"])
+        self.assertEqual(keyboard[1][0]["text"], "查看详情")
 
         with self.app.db.transaction() as conn:
             advertiser = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
@@ -1252,7 +1266,9 @@ class ChaboMvpTest(unittest.TestCase):
         with self.app.db.transaction() as conn:
             metric = conn.execute("SELECT * FROM metric_snapshots WHERE delivery_id = ?", (delivery["id"],)).fetchone()
         self.assertEqual(metric["metric_type"], "bot_start")
-        self.assertIn("https://example.com", self.gateway.private_messages[-1]["text"])
+        last_message = self.gateway.private_messages[-1]
+        keyboard_urls = [b.get("url") for row in last_message["inline_keyboard"] for b in row]
+        self.assertIn("https://example.com", keyboard_urls)
 
     def test_send_failure_pauses_order_and_releases_budget(self) -> None:
         self.gateway.fail_send = True
@@ -1879,6 +1895,1768 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(report["sent_count"], 2)
         self.assertEqual(report["bot_starts"], 1)
         self.assertEqual(len(report["by_channel"]), 2)
+
+
+    # --------- Ad library / MaterialService ---------
+
+    def test_material_library_creates_three_formats_with_ownership(self) -> None:
+        light = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="完整文字插播详情文案",
+            target_url="https://example.com/detail",
+            light_short_text="想投这里？",
+            display_name="广告主",
+        )
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播文案 v1",
+            target_url="https://example.com/std",
+        )
+        custom = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制插播文案",
+            target_url="https://example.com/strong",
+            button_text="立即下载",
+        )
+        self.assertEqual(light["format_type"], "light_tail")
+        self.assertEqual(light["light_short_text"], "想投这里？")
+        self.assertIsNone(std["light_short_text"])
+        self.assertEqual(custom["button_text"], "立即下载")
+
+        listed = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(len(listed), 3)
+        light_only = self.app.materials.list_materials(
+            advertiser_telegram_user_id=10001, format_type="light_tail"
+        )
+        self.assertEqual([item["id"] for item in light_only], [light["id"]])
+
+        # Foreign user cannot read another advertiser's material
+        with self.assertRaises(NotFound):
+            self.app.materials.get_material(
+                std["id"], advertiser_telegram_user_id=99999
+            )
+
+    def test_material_library_validates_format_and_short_text(self) -> None:
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="pin24h",
+                text="不合法",
+                target_url="https://example.com",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="light_tail",
+                text="缺少短入口",
+                target_url="https://example.com",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="light_tail",
+                text="详情",
+                target_url="https://example.com",
+                light_short_text="超过十五个字的短入口测试一二三四五",
+            )
+
+    def test_create_order_reuses_library_material_and_blocks_archived(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="可复用的标准插播文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.assertEqual(order["creative_id"], material["id"])
+
+        # Foreign advertiser cannot use someone else's material_id
+        with self.assertRaises(NotFound):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=99999,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10"),
+            )
+
+        # Archive the material — subsequent orders should be rejected
+        self.app.materials.archive_material(
+            material["id"], advertiser_telegram_user_id=10001
+        )
+        with self.assertRaises(InvalidState):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=10001,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10"),
+            )
+
+        # Default list excludes archived; include_archived shows it again
+        active = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertNotIn(material["id"], [m["id"] for m in active])
+        with_archived = self.app.materials.list_materials(
+            advertiser_telegram_user_id=10001, include_archived=True
+        )
+        self.assertIn(material["id"], [m["id"] for m in with_archived])
+
+    def test_inline_create_order_populates_library(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            text="inline 文案",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        listed = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in listed], [order["creative_id"]])
+        self.assertEqual(listed[0]["format_type"], "standard_card")
+
+    def test_placement_creative_panel_filters_by_format_and_skips_archived(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准素材-A",
+            target_url="https://example.com/a",
+        )
+        self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制素材-不该出现",
+            target_url="https://example.com/b",
+        )
+        std_archived = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="已归档-不该出现",
+            target_url="https://example.com/c",
+        )
+        self.app.materials.archive_material(
+            std_archived["id"], advertiser_telegram_user_id=10001
+        )
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_lib_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:creative",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        payload = json.loads(state["payload_json"])
+        self.assertEqual(payload["creative_ids"], [std["id"]])
+
+    def test_placement_pick_then_submit_reuses_library_material(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="可复用的标准插播文案",
+            target_url="https://example.com",
+        )
+
+        for cb_id, data in [
+            ("cb_pick_1", f"channel:order:{channel['id']}"),
+            ("cb_pick_2", "place:slot:standard_card"),
+            ("cb_pick_3", "place:creative"),
+            ("cb_pick_4", "place:pick:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:submit",
+                }
+            }
+        )
+
+        self.assertEqual(submit["type"], "callback_placement_order_created")
+        with self.app.db.transaction() as conn:
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ?", (submit["order_id"],)
+            ).fetchone()
+        self.assertEqual(order["creative_id"], material["id"])
+
+        # Library should still have only one material — pick reuses, not duplicates
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in items], [material["id"]])
+
+    def test_placement_archive_callback_archives_and_clears_selection(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        first = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="素材-A",
+            target_url="https://example.com/a",
+        )
+        second = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="素材-B",
+            target_url="https://example.com/b",
+        )
+
+        for cb_id, data in [
+            ("cb_arch_1", f"channel:order:{channel['id']}"),
+            ("cb_arch_2", "place:slot:standard_card"),
+            ("cb_arch_3", "place:creative"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        # Whichever order the bot listed, pick index 0 (selection) and then archive index 0
+        with self.app.db.transaction() as conn:
+            state_before = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        ordered_ids = json.loads(state_before["payload_json"])["creative_ids"]
+        self.assertEqual(set(ordered_ids), {first["id"], second["id"]})
+        archive_target_id = ordered_ids[0]
+        keep_id = ordered_ids[1]
+
+        for cb_id, data in [
+            ("cb_arch_pick", "place:pick:0"),
+            ("cb_arch_back", "place:creative"),
+            ("cb_arch_archive", "place:archive:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        active = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in active], [keep_id])
+        archived = self.app.materials.get_material(archive_target_id)
+        self.assertIsNotNone(archived["archived_at"])
+
+        with self.app.db.transaction() as conn:
+            state_after = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        payload_after = json.loads(state_after["payload_json"])
+        self.assertNotIn("material_id", payload_after)
+        self.assertEqual(payload_after["creative_ids"], [keep_id])
+
+    def _grant_publisher_access(self, channel: dict, telegram_user_id: int = 20001) -> None:
+        """Wire FakeGateway so the publisher passes the get_chat_member check."""
+        self.gateway.chat_members[(str(channel["telegram_chat_id"]), str(telegram_user_id))] = {
+            "status": "creator",
+            "can_post_messages": True,
+            "can_edit_messages": True,
+            "can_pin_messages": True,
+        }
+
+    def _publisher_callback(self, data: str, *, telegram_user_id: int = 20001, cb_id: str = "cb_pub") -> dict:
+        return self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": cb_id,
+                    "from": {"id": telegram_user_id, "first_name": "频道主"},
+                    "message": {"chat": {"id": telegram_user_id}},
+                    "data": data,
+                }
+            }
+        )
+
+    # ---------- AI-callable service-layer surface ----------
+
+    def test_review_notes_land_on_audit_log_payload(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="审核备注测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"], note="素材已人工核对，符合插播规范")
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT payload_json FROM audit_logs WHERE entity_type = 'ad_order' "
+                "AND entity_id = ? AND action = 'order_approved'",
+                (order["id"],),
+            ).fetchone()
+        self.assertIsNotNone(audit)
+        self.assertIn("素材已人工核对", audit["payload_json"])
+
+    def test_review_notes_land_on_refund_audit_log(self) -> None:
+        channel, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
+        self.app.orders.refund_delivery_partial(
+            delivery["id"], money_to_cents("3.00"), "频道主提前删除", note="3 美金部分补偿，频道主同意"
+        )
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT payload_json FROM audit_logs WHERE entity_type = 'delivery' "
+                "AND entity_id = ? AND action = 'delivery_partially_refunded'",
+                (delivery["id"],),
+            ).fetchone()
+        self.assertIn("3 美金部分补偿", audit["payload_json"])
+
+    def test_admin_detail_timeline_merges_audit_and_evidence(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="时间线测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        url = self.start_http_server()
+        # Approve with a note via HTTP form body, exercising the same path
+        # the rendered <form> takes
+        body = "note=人工核对通过".encode("utf-8")
+        request = urllib.request.Request(
+            f"{url}/admin/orders/{order['id']}/approve?token=admin-token",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request) as response:
+            response.read()
+        detail_request = urllib.request.Request(
+            f"{url}/admin/orders/{order['id']}?token=admin-token",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(detail_request) as response:
+            detail = json.loads(response.read())
+        timeline = detail["order"]["时间线"]
+        self.assertTrue(any(event["title"] == "order_approved" for event in timeline))
+        approve_events = [event for event in timeline if event["title"] == "order_approved"]
+        self.assertIn("人工核对通过", approve_events[0]["note"])
+        # Evidence and audit kinds both appear on the same timeline
+        kinds = {event["kind"] for event in timeline}
+        self.assertEqual(kinds, {"操作", "证据"})
+
+    def test_phase_one_golden_path_end_to_end(self) -> None:
+        """Walks the施工图 §3 一期金线 in one pass:
+
+        bind channel → fund advertiser via two-person review →
+        placement configurator → operator approve with note →
+        dispatch (3-button keyboard) → 查看详情 deep link → partial
+        refund → self-promo publish → earnings settled.
+
+        Auto-approve is turned off so the operator-approve path runs
+        end-to-end (matches the production setting per施工图 §3).
+        """
+        # Rebuild the app with auto-approve off — exercises the production
+        # path where operators must approve each order
+        prod_settings = Settings(
+            db_path=self.settings.db_path,
+            bot_username="ChaBoTestBot",
+            bot_auto_approve_orders=False,
+        )
+        self.app = create_app(prod_settings, self.gateway)
+
+        # Two operator accounts for the topup approval double-check
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+
+        # 1. Bind channel and confirm timezones
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        # 2. Fund advertiser via the production-recommended two-person review
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=10001,
+            amount_cents=money_to_cents("20"),
+            reason="OTC 收到 20 USDT 金线测试",
+            requester_telegram_user_id=33333,
+            evidence_url="https://evidence.example/preflight.png",
+        )
+        approved = self.app.topup_approvals.approve_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="对账已核",
+        )
+        self.assertEqual(approved["status"], "approved")
+
+        # 3. Placement configurator: open from channel deep link, pick slot,
+        #    write material via the input flow, submit.
+        for cb_id, data in [
+            ("gp_1", f"channel:order:{channel['id']}"),
+            ("gp_2", "place:slot:standard_card"),
+            ("gp_3", "place:creative"),
+            ("gp_4", "place:new:standard_card"),
+        ]:
+            self._advertiser_callback(data, cb_id=cb_id)
+        for text in ["金线测试标准插播文案", "https://advertiser.example/landing"]:
+            self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": 9001,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+        submit = self._advertiser_callback("place:submit", cb_id="gp_submit")
+        self.assertEqual(submit["type"], "callback_placement_order_created")
+        order_id = submit["order_id"]
+
+        # 4. Operator approves with a note (review-note path)
+        self.app.orders.approve_order_for_operator(
+            order_id=order_id,
+            operator_telegram_user_id=33333,
+            note="人工核对通过",
+        )
+
+        # 5. Dispatch the delivery; verify the 3-button keyboard
+        dispatched = self.app.fulfillment.dispatch_due()
+        self.assertEqual(dispatched[0]["status"], "sent")
+        keyboard = self.gateway.sent_ads[-1]["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", keyboard[0][0]["url"])
+        self.assertIn("ad_del_", keyboard[0][1]["url"])
+
+        # 6. A viewer follows the 查看详情 deep link
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order_id,)
+            ).fetchone()
+        self.confirm_timezone(555, display_name="点击用户")
+        view = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 9100,
+                    "from": {"id": 555, "first_name": "点击用户"},
+                    "chat": {"id": 555},
+                    "text": f"/start ad_{delivery['id']}",
+                }
+            }
+        )
+        self.assertEqual(view["type"], "ad_start")
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        # CTA + sales callback present
+        flat = [b for row in detail["inline_keyboard"] for b in row]
+        self.assertTrue(any(b.get("callback_data") == f"channel:order:{channel['id']}" for b in flat))
+
+        # 7. Operator refunds part of the spend with a note
+        self.app.orders.refund_delivery_for_operator(
+            delivery_id=delivery["id"],
+            reason="频道主提前删除部分时段",
+            operator_telegram_user_id=33333,
+            amount_cents=money_to_cents("3"),
+            note="3 美元部分补偿",
+        )
+
+        # 8. Self-promo publish reusing the same library material
+        with self.app.db.transaction() as conn:
+            material_row = conn.execute(
+                "SELECT id FROM creatives WHERE advertiser_account_id = "
+                "(SELECT id FROM accounts WHERE telegram_user_id = '10001') LIMIT 1"
+            ).fetchone()
+        material_id = material_row["id"]
+        # Publisher is also their own advertiser identity → create a self-promo
+        # material via the publisher identity for self-promo
+        pub_material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="频道主自用文案",
+            target_url="https://owner.example/post",
+            button_text="查看详情",
+            display_name="频道主",
+        )
+        self_promo_result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{pub_material['id']}",
+            cb_id="gp_self",
+        )
+        self.assertEqual(self_promo_result["type"], "callback_self_promo_published")
+
+        # 9. Confirm publisher earnings (post-observation) — at this point
+        # the delivery is "sent"; advance time would normally happen via
+        # confirm_due_earnings(observation_hours=0)
+        self.app.fulfillment.confirm_due_earnings(observation_hours=0)
+        with self.app.db.transaction() as conn:
+            publisher = conn.execute(
+                "SELECT * FROM accounts WHERE telegram_user_id = '20001'"
+            ).fetchone()
+        self.assertGreaterEqual(publisher["confirmed_earnings_cents"], 0)
+
+        # 10. Detail-page timeline merges audit + evidence and includes the note
+        url = self.start_http_server()
+        detail_request = urllib.request.Request(
+            f"{url}/admin/orders/{order_id}?token=admin-token",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(detail_request) as response:
+            payload = json.loads(response.read())
+        timeline = payload["order"]["时间线"]
+        self.assertTrue(any(event["title"] == "order_approved" for event in timeline))
+        approve_events = [e for e in timeline if e["title"] == "order_approved"]
+        self.assertIn("人工核对通过", approve_events[0]["note"])
+
+        # 11. Tool call audit captured the AI-callable boundary actions
+        approve_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="approve_order_for_operator"
+        )
+        self.assertEqual(approve_logs[0]["result_status"], "success")
+        topup_logs = self.app.tool_call_logs.list_calls(tool_name="topup_approve")
+        self.assertEqual(topup_logs[0]["result_status"], "success")
+
+    def test_topup_approval_two_person_flow_moves_money_only_after_approve(self) -> None:
+        # Make sure two distinct operator accounts exist
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=10001,
+            amount_cents=money_to_cents("12.34"),
+            reason="OTC 收到 USDT 12.34，转入插播余额",
+            requester_telegram_user_id=33333,
+            evidence_url="https://evidence.example/screenshot.png",
+        )
+        # Pending request must NOT have moved money yet
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertIsNone(row)  # recipient account does not exist yet
+
+        # Same-actor approval must be rejected — two-person rule
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.approve_topup(
+                request_id=request["id"],
+                approver_telegram_user_id=33333,
+            )
+        # Approved by a different operator → ledger moves
+        approved = self.app.topup_approvals.approve_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="对账已核",
+        )
+        self.assertEqual(approved["status"], "approved")
+        with self.app.db.transaction() as conn:
+            recipient = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertEqual(recipient["available_balance_cents"], 1234)
+
+        # Re-approving the same request must fail
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.approve_topup(
+                request_id=request["id"],
+                approver_telegram_user_id=44444,
+            )
+
+    def test_topup_approval_reject_path_blocks_money_and_logs(self) -> None:
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        self.app.ledger.manual_topup(44444, money_to_cents("0.01"), display_name="审批人")
+        request = self.app.topup_approvals.request_topup(
+            recipient_telegram_user_id=20001,
+            amount_cents=money_to_cents("99.00"),
+            reason="疑似重复入账",
+            requester_telegram_user_id=33333,
+        )
+        rejected = self.app.topup_approvals.reject_topup(
+            request_id=request["id"],
+            approver_telegram_user_id=44444,
+            approval_note="申请人金额对不上凭证",
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        # Recipient (20001) account was never created — no money moved
+        with self.app.db.transaction() as conn:
+            recipient = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '20001'"
+            ).fetchone()
+        self.assertIsNone(recipient)
+
+        # Reject log lands in tool_call_logs as success (the action succeeded)
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=44444, tool_name="topup_reject"
+        )
+        self.assertEqual(logs[0]["result_status"], "success")
+
+    def test_topup_request_validates_amount_and_reason(self) -> None:
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="申请人")
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=0,
+                reason="x",
+                requester_telegram_user_id=33333,
+            )
+        with self.assertRaises(InvalidState):
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=money_to_cents("1.00"),
+                reason="   ",
+                requester_telegram_user_id=33333,
+            )
+        with self.assertRaises(NotFound):
+            # Requester account does not exist
+            self.app.topup_approvals.request_topup(
+                recipient_telegram_user_id=10001,
+                amount_cents=money_to_cents("1.00"),
+                reason="ok",
+                requester_telegram_user_id=99999,
+            )
+
+    def test_database_backup_writes_a_consistent_snapshot(self) -> None:
+        # Seed some state, then back up
+        self.bind_channel()
+        self.app.ledger.manual_topup(10001, money_to_cents("5.00"), display_name="广告主")
+        target = Path(self.tmp.name) / "backups" / "snapshot.sqlite3"
+        written = self.app.db.backup_to(str(target))
+        self.assertTrue(Path(written).exists())
+        # The backup must contain the same data
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(str(target)) as conn:
+            row = conn.execute(
+                "SELECT available_balance_cents FROM accounts WHERE telegram_user_id = '10001'"
+            ).fetchone()
+        self.assertEqual(row[0], 500)
+
+    def test_health_endpoint_includes_db_status_and_ops_counters(self) -> None:
+        url = self.start_http_server()
+        with urllib.request.urlopen(f"{url}/health") as response:
+            payload = json.loads(response.read())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["db"], "ok")
+        self.assertIn("ops", payload)
+        for key in (
+            "pending_review_orders",
+            "running_orders",
+            "sent_today",
+            "open_disputes",
+            "failed_recent",
+            "scheduled_due",
+        ):
+            self.assertIn(key, payload["ops"])
+
+    def test_admin_landing_renders_summary_cards(self) -> None:
+        # Create an order in pending_review so the alert variant lights up
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="待审核测试",
+            target_url="https://example.com",
+        )
+        self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        url = self.start_http_server()
+        request = urllib.request.Request(f"{url}/admin?token=admin-token")
+        with urllib.request.urlopen(request) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn("待审核订单", html)
+        self.assertIn("Open 争议", html)
+        # Pending order should land in the alert variant
+        self.assertIn("summary-card alert", html)
+
+    def test_token_strength_check_flags_weak_and_loopback_safe(self) -> None:
+        from chabo.web import check_token_strength
+        # On a public host, missing tokens should warn
+        warns = check_token_strength(admin_token=None, webhook_secret=None, host="0.0.0.0")
+        self.assertEqual(len(warns), 2)
+        # Loopback gives no warnings on missing config
+        warns = check_token_strength(admin_token=None, webhook_secret=None, host="127.0.0.1")
+        self.assertEqual(warns, [])
+        # Weak (short) token warns regardless of host
+        warns = check_token_strength(admin_token="short", webhook_secret="changeme-pls", host="127.0.0.1")
+        self.assertEqual(len(warns), 2)
+        # Strong tokens give no warnings
+        strong_admin = "x9k2L7m4Pq8rT5wYzNbFjC3Hd"
+        strong_secret = "4Yh8m2KpW3qX9zV6cR1nB7tJfL5g"
+        warns = check_token_strength(admin_token=strong_admin, webhook_secret=strong_secret, host="0.0.0.0")
+        self.assertEqual(warns, [])
+
+    def test_create_order_logs_via_tool_call_audit(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="工具调用埋点订单",
+            target_url="https://example.com",
+        )
+        # AI session creates an order
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+            actor_kind="ai",
+            session_id="sess_order_x1",
+        )
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_order"
+        )
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["session_id"], "sess_order_x1")
+        self.assertEqual(logs[0]["result_status"], "success")
+        self.assertIn(order["id"], logs[0]["result_summary"])
+
+        # Failure path: missing budget triggers InsufficientBalance via reserve
+        # → logged as error
+        from chabo.services import InsufficientBalance, ChaboError  # local import for the test
+        with self.assertRaises(ChaboError):
+            self.app.orders.create_order(
+                advertiser_telegram_user_id=10001,
+                channel_token=channel["ref_token"],
+                slot_type="standard_card",
+                material_id=material["id"],
+                budget_cents=money_to_cents("10000"),  # blow past balance
+                actor_kind="ai",
+                session_id="sess_order_x2",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_order"
+        )
+        error_log = next(row for row in all_logs if row["result_status"] == "error")
+        self.assertEqual(error_log["session_id"], "sess_order_x2")
+        self.assertIn(error_log["error_type"], {"InsufficientBalance", "InvalidState"})
+
+    def test_self_promo_prepare_publish_logs_via_tool_call_audit(self) -> None:
+        channel = self.bind_channel()
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用埋点测试",
+            target_url="https://example.com",
+        )
+        prepared = self.app.self_promos.prepare_publish(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            material_id=material["id"],
+            actor_kind="ai",
+            session_id="sess_sp_x1",
+        )
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="self_promo_prepare_publish"
+        )
+        self.assertEqual(logs[0]["session_id"], "sess_sp_x1")
+        self.assertIn(prepared["self_promo_id"], logs[0]["result_summary"])
+
+        # Foreign user → NotFound logged as error
+        with self.assertRaises(NotFound):
+            self.app.self_promos.prepare_publish(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                material_id=material["id"],
+                actor_kind="ai",
+                session_id="sess_sp_x2",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            tool_name="self_promo_prepare_publish"
+        )
+        statuses = {row["result_status"] for row in all_logs}
+        self.assertIn("error", statuses)
+
+    def test_manual_topup_logs_via_tool_call_audit(self) -> None:
+        # Default actor_kind is admin since manual_topup is operator-driven
+        result = self.app.ledger.manual_topup(
+            10001,
+            money_to_cents("12.34"),
+            display_name="广告主",
+            actor_telegram_user_id=33333,
+            session_id="sess_topup_x1",
+        )
+        self.assertEqual(result["available_balance_cents"], 1234)
+        logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="manual_topup"
+        )
+        self.assertEqual(logs[0]["actor_kind"], "admin")
+        self.assertEqual(logs[0]["session_id"], "sess_topup_x1")
+        self.assertIn("1234", logs[0]["result_summary"])
+        # If the caller does not provide actor_telegram_user_id, the recipient's id is used
+        self.app.ledger.manual_topup(20001, money_to_cents("1.00"))
+        fallback = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="manual_topup"
+        )
+        self.assertEqual(fallback[0]["actor_kind"], "admin")
+
+    def test_instrumented_services_log_success_and_failure(self) -> None:
+        # Success path: AI session calls create_material
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="AI 自动创建的素材",
+            target_url="https://example.com",
+            actor_kind="ai",
+            session_id="sess_ai_x1",
+        )
+        success_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_material"
+        )
+        self.assertEqual(len(success_logs), 1)
+        self.assertEqual(success_logs[0]["actor_kind"], "ai")
+        self.assertEqual(success_logs[0]["session_id"], "sess_ai_x1")
+        self.assertEqual(success_logs[0]["result_status"], "success")
+        self.assertIn(material["id"], success_logs[0]["result_summary"])
+
+        # Failure path: bad format_type triggers InvalidState and produces an error log
+        with self.assertRaises(InvalidState):
+            self.app.materials.create_material(
+                advertiser_telegram_user_id=10001,
+                format_type="pin24h",
+                text="bad",
+                target_url="https://example.com",
+                actor_kind="ai",
+                session_id="sess_ai_x1",
+            )
+        all_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=10001, tool_name="create_material"
+        )
+        self.assertEqual(len(all_logs), 2)
+        error_log = next(row for row in all_logs if row["result_status"] == "error")
+        self.assertEqual(error_log["error_type"], "InvalidState")
+        self.assertEqual(error_log["session_id"], "sess_ai_x1")
+
+        # Operator wrapper logs as actor_kind=admin by default
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="运营员")
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order_for_operator(
+            order_id=order["id"],
+            operator_telegram_user_id=33333,
+        )
+        op_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=33333, tool_name="approve_order_for_operator"
+        )
+        self.assertEqual(op_logs[0]["actor_kind"], "admin")
+        self.assertEqual(op_logs[0]["result_status"], "success")
+        self.assertIn(order["id"], op_logs[0]["result_summary"])
+
+        # Publisher wrapper logs the band switch
+        self.app.channels.set_format_policy_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            format_type="standard_card",
+            enabled=True,
+            owner_price_band="high",
+            actor_kind="ai",
+            session_id="sess_pub_y1",
+        )
+        pub_logs = self.app.tool_call_logs.list_calls(
+            actor_telegram_user_id=20001, tool_name="set_format_policy_for_publisher"
+        )
+        self.assertEqual(pub_logs[0]["session_id"], "sess_pub_y1")
+        self.assertIn("high", pub_logs[0]["result_summary"])
+
+    def test_tool_call_log_service_records_and_filters(self) -> None:
+        # No actor → still recorded with NULL actor_account_id
+        log_a = self.app.tool_call_logs.log_call(
+            tool_name="create_material",
+            actor_telegram_user_id=10001,
+            actor_kind="ai",
+            session_id="sess_1",
+            arguments={"format_type": "standard_card", "text_preview": "..."},
+            result_status="success",
+            result_summary="created cre_xxx",
+        )
+        log_b = self.app.tool_call_logs.log_call(
+            tool_name="approve_order",
+            actor_telegram_user_id=99999,
+            actor_kind="admin",
+            arguments={"order_id": "ord_xxx"},
+            result_status="error",
+            error_type="InvalidState",
+            result_summary="order already approved",
+        )
+        self.assertIsNone(log_a["actor_account_id"])  # 10001 has no account yet
+        self.assertEqual(log_a["actor_kind"], "ai")
+        self.assertEqual(log_b["result_status"], "error")
+        self.assertEqual(log_b["error_type"], "InvalidState")
+
+        # Filter by actor
+        rows = self.app.tool_call_logs.list_calls(actor_telegram_user_id=10001)
+        self.assertEqual({row["id"] for row in rows}, {log_a["id"]})
+
+        # Filter by tool_name
+        rows = self.app.tool_call_logs.list_calls(tool_name="approve_order")
+        self.assertEqual({row["id"] for row in rows}, {log_b["id"]})
+
+        # Filter by result_status
+        rows = self.app.tool_call_logs.list_calls(result_status="error")
+        self.assertEqual({row["id"] for row in rows}, {log_b["id"]})
+
+        # Validation
+        with self.assertRaises(InvalidState):
+            self.app.tool_call_logs.log_call(tool_name="bad", actor_kind="robot")
+        with self.assertRaises(InvalidState):
+            self.app.tool_call_logs.log_call(tool_name="bad", result_status="maybe")
+
+    def test_order_service_operator_wrappers_route_through_actor_account(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        # Make sure the operator has a real account (so the wrapper can resolve it)
+        self.app.ledger.manual_topup(33333, money_to_cents("0.01"), display_name="运营员")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="审核测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+
+        approved = self.app.orders.approve_order_for_operator(
+            order_id=order["id"],
+            operator_telegram_user_id=33333,
+        )
+        self.assertEqual(approved["status"], "approved")
+
+        # audit_logs should record actor_account_id pointing at the operator's account
+        with self.app.db.transaction() as conn:
+            operator = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = '33333'"
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT * FROM audit_logs WHERE entity_type = 'ad_order' AND entity_id = ? "
+                "AND action = 'order_approved'",
+                (order["id"],),
+            ).fetchone()
+        self.assertEqual(audit["actor_account_id"], operator["id"])
+
+        # Unknown operator must NotFound rather than fall through to None actor
+        with self.assertRaises(NotFound):
+            self.app.orders.reject_order_for_operator(
+                order_id=order["id"],
+                reason="x",
+                operator_telegram_user_id=8888888,
+            )
+
+    def test_channel_service_publisher_write_apis_enforce_ownership(self) -> None:
+        channel = self.bind_channel()
+        # Owner (20001) can change band
+        result = self.app.channels.set_format_policy_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            format_type="standard_card",
+            enabled=True,
+            owner_price_band="high",
+        )
+        self.assertEqual(result["owner_price_band"], "high")
+
+        # Owner (20001) can change daily limit
+        cfg = self.app.channels.set_daily_ad_limit_for_publisher(
+            publisher_telegram_user_id=20001,
+            channel_id=channel["id"],
+            daily_ad_limit=5,
+        )
+        self.assertEqual(cfg["daily_ad_limit"], 5)
+
+        # Foreign user cannot — must raise NotFound (not InvalidState), per the
+        # AI tool boundary contract: never confirm a resource exists to non-owners.
+        with self.assertRaises(NotFound):
+            self.app.channels.set_format_policy_for_publisher(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                format_type="standard_card",
+                enabled=False,
+                owner_price_band="low",
+            )
+        with self.assertRaises(NotFound):
+            self.app.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=99999,
+                channel_id=channel["id"],
+                daily_ad_limit=1,
+            )
+        # Non-existent telegram_user_id (no account) — same NotFound
+        with self.assertRaises(NotFound):
+            self.app.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=12345678,
+                channel_id=channel["id"],
+                daily_ad_limit=1,
+            )
+
+        # Original limits left intact for the owner
+        with self.app.db.transaction() as conn:
+            cfg_row = conn.execute(
+                "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+            policy_row = conn.execute(
+                "SELECT owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = 'standard_card'",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(cfg_row["daily_ad_limit"], 5)
+        self.assertEqual(policy_row["owner_price_band"], "high")
+
+    def test_order_service_list_and_view_enforce_ownership(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="AI 工具调用测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+
+        listed = self.app.orders.list_orders(advertiser_telegram_user_id=10001)
+        self.assertEqual([row["id"] for row in listed], [order["id"]])
+        self.assertEqual(listed[0]["channel_title"], channel["title"])
+
+        # Foreign user gets empty list
+        self.assertEqual(self.app.orders.list_orders(advertiser_telegram_user_id=99999), [])
+
+        view = self.app.orders.get_order_view(order["id"], advertiser_telegram_user_id=10001)
+        self.assertEqual(view["id"], order["id"])
+        self.assertEqual(view["creative"]["text"], "AI 工具调用测试文案")
+        self.assertEqual(view["channel"]["ref_token"], channel["ref_token"])
+        self.assertEqual(view["slot_type"], "standard_card")
+
+        with self.assertRaises(NotFound):
+            self.app.orders.get_order_view(order["id"], advertiser_telegram_user_id=99999)
+
+    def test_channel_service_view_bundles_config_policies_rates_and_stats(self) -> None:
+        channel = self.bind_channel()
+        # ensure rates / policies are seeded by triggering a quote
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="news",
+            median_24h_views=10_000,
+            light_unique_clickers_30d=10,
+            risk_level="normal",
+        )
+
+        listed = self.app.channels.list_publisher_channels(publisher_telegram_user_id=20001)
+        self.assertEqual([row["id"] for row in listed], [channel["id"]])
+        self.assertEqual(self.app.channels.list_publisher_channels(publisher_telegram_user_id=88888), [])
+
+        view = self.app.channels.get_channel_view(
+            channel["id"], publisher_telegram_user_id=20001
+        )
+        self.assertEqual(view["id"], channel["id"])
+        self.assertIsNotNone(view["config"])
+        format_types = {p["format_type"] for p in view["format_policies"]}
+        self.assertIn("standard_card", format_types)
+        self.assertTrue(view["rate_cards"])
+        self.assertEqual(view["today_ads"], 0)
+
+        with self.assertRaises(NotFound):
+            self.app.channels.get_channel_view(channel["id"], publisher_telegram_user_id=88888)
+
+    def test_ledger_service_summaries_match_account_state(self) -> None:
+        # Wallet summary from advertiser-only top up
+        self.app.ledger.manual_topup(10001, money_to_cents("12.50"), display_name="广告主")
+        wallet = self.app.ledger.get_wallet_summary(telegram_user_id=10001)
+        self.assertEqual(wallet["available_balance_cents"], 1250)
+        self.assertEqual(wallet["reserved_balance_cents"], 0)
+
+        # Unknown user returns zeros
+        empty = self.app.ledger.get_wallet_summary(telegram_user_id=77777)
+        self.assertEqual(empty["available_balance_cents"], 0)
+        self.assertNotIn("account_id", empty)
+
+        # Earnings summary from a delivered ad
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="收益服务测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        earnings = self.app.ledger.get_earnings_summary(telegram_user_id=20001)
+        self.assertGreater(earnings["pending_earnings_cents"], 0)
+
+        breakdown = self.app.ledger.list_channel_earnings(publisher_telegram_user_id=20001)
+        self.assertEqual([row["channel_id"] for row in breakdown], [channel["id"]])
+        self.assertEqual(breakdown[0]["pending_cents"], earnings["pending_earnings_cents"])
+        self.assertEqual(breakdown[0]["delivery_count"], 1)
+        self.assertEqual(self.app.ledger.list_channel_earnings(publisher_telegram_user_id=88888), [])
+
+    def _advertiser_callback(self, data: str, *, telegram_user_id: int = 10001, cb_id: str = "cb_adv") -> dict:
+        return self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": cb_id,
+                    "from": {"id": telegram_user_id, "first_name": "广告主"},
+                    "message": {"chat": {"id": telegram_user_id}},
+                    "data": data,
+                }
+            }
+        )
+
+    def test_publisher_earnings_page_offers_channel_and_statement_entries(self) -> None:
+        self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        result = self._publisher_callback("publisher:earnings", cb_id="cb_earn_open")
+        self.assertEqual(result["type"], "callback_publisher_earnings")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("我的收益", message["text"])
+        callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn("earnings:channels", callbacks)
+        self.assertIn("earnings:statement", callbacks)
+
+    def test_earnings_channels_lists_per_channel_breakdown(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Create one delivery so the channel has an entry
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="频道分布测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback("earnings:channels", cb_id="cb_earn_channels")
+        self.assertEqual(result["type"], "callback_earnings_channels")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("频道分布", message["text"])
+        self.assertIn(channel["title"], message["text"])
+        self.assertIn("待确认", message["text"])
+        callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn(f"pub:channel:{channel['ref_token']}", callbacks)
+
+    def test_earnings_statement_filters_to_publisher_side_entries(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Mixed user — also takes a manual topup so the wallet-side ledger has entries
+        self.app.ledger.manual_topup(20001, money_to_cents("10"), display_name="频道主")
+        # Generate a delivery so publisher_pending_earning is recorded
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="收益流水测试",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback("earnings:statement", cb_id="cb_earn_stmt")
+        self.assertEqual(result["type"], "callback_earnings_statement")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("收益流水", text)
+        self.assertIn("频道入账", text)
+        # manual_topup belongs to wallet side and must NOT appear here
+        self.assertNotIn("人工入账", text)
+
+    def test_wallet_balance_page_offers_topup_reserved_statement_buttons(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+        result = self._advertiser_callback("advertiser:balance", cb_id="cb_wallet_open")
+        self.assertEqual(result["type"], "callback_advertiser_balance")
+        callbacks = [
+            b.get("callback_data")
+            for row in self.gateway.private_messages[-1]["inline_keyboard"]
+            for b in row
+        ]
+        self.assertIn("wallet:topup", callbacks)
+        self.assertIn("wallet:reserved", callbacks)
+        self.assertIn("wallet:statement", callbacks)
+
+    def test_wallet_topup_pick_sends_stars_invoice(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        result = self._advertiser_callback("wallet:topup:500", cb_id="cb_wallet_topup_500")
+        self.assertEqual(result["type"], "callback_wallet_topup_invoice_sent")
+        self.assertEqual(result["stars_amount"], 500)
+        invoice = self.gateway.invoices[-1]
+        self.assertEqual(invoice["chat_id"], "10001")
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertEqual(invoice["prices"][0]["amount"], 500)
+        with self.app.db.transaction() as conn:
+            intent = conn.execute(
+                "SELECT * FROM stars_payment_intents WHERE buyer_account_id = (SELECT id FROM accounts WHERE telegram_user_id = '10001')"
+            ).fetchone()
+        self.assertEqual(intent["stars_amount"], 500)
+        self.assertEqual(intent["status"], "pending")
+
+    def test_wallet_reserved_lists_active_reserved_orders(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="冻结测试文案",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        result = self._advertiser_callback("wallet:reserved", cb_id="cb_wallet_reserved")
+        self.assertEqual(result["type"], "callback_wallet_reserved")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("冻结明细", text)
+        self.assertIn(channel["title"], text)
+        self.assertIn(order["id"], text)
+
+    def test_wallet_statement_lists_recent_transactions(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("15")
+        result = self._advertiser_callback("wallet:statement", cb_id="cb_wallet_statement")
+        self.assertEqual(result["type"], "callback_wallet_statement")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("账单流水", text)
+        self.assertIn("人工入账", text)
+        self.assertIn("15.00", text)
+
+    def test_placement_submit_insufficient_balance_offers_topup_button(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        # No topup → insufficient balance
+        for cb_id, data in [
+            ("cb_ins_open", f"channel:order:{channel['id']}"),
+            ("cb_ins_slot", "place:slot:standard_card"),
+            ("cb_ins_creative", "place:creative"),
+            ("cb_ins_new", "place:new:standard_card"),
+        ]:
+            self._advertiser_callback(data, cb_id=cb_id)
+        # Send creative text and url to finish material creation
+        for text in ["这是预算不足测试的文案", "https://example.com"]:
+            self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": 99,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+        submit = self._advertiser_callback("place:submit", cb_id="cb_ins_submit")
+        self.assertEqual(submit["type"], "callback_placement_submit_failed")
+        callbacks = [
+            b.get("callback_data")
+            for row in self.gateway.private_messages[-1]["inline_keyboard"]
+            for b in row
+        ]
+        self.assertIn("wallet:topup", callbacks)
+
+    def test_publisher_self_promo_panel_lists_publishable_materials(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # publisher (20001) creates a standard_card material via the merged advertiser identity
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用频道运营内容",
+            target_url="https://owner.example/post",
+            button_text="去看看",
+            display_name="频道主",
+        )
+        # light_tail materials are filtered out
+        self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="light_tail",
+            text="文字插播详情",
+            target_url="https://owner.example/light",
+            light_short_text="去看看",
+        )
+
+        result = self._publisher_callback(f"pub:self:{channel['ref_token']}", cb_id="cb_self_open")
+        self.assertEqual(result["type"], "callback_publisher_self_promo")
+        message = self.gateway.private_messages[-1]
+        self.assertIn("自用发布", message["text"])
+        button_callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
+        self.assertIn(f"pub:self:pick:{channel['ref_token']}:{material['id']}", button_callbacks)
+        # light_tail material should not appear
+        self.assertNotIn(
+            any(material["id"] in (b.get("callback_data") or "") for row in message["inline_keyboard"] for b in row if "light" in (b.get("text") or "")),
+            [True],
+        )
+
+    def test_publisher_self_promo_publishes_and_records_row(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用标准插播文案",
+            target_url="https://owner.example/landing",
+            button_text="立即购买",
+        )
+
+        result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+            cb_id="cb_self_publish",
+        )
+        self.assertEqual(result["type"], "callback_self_promo_published")
+
+        sent = self.gateway.sent_ads[-1]
+        self.assertEqual(sent["chat_id"], str(channel["telegram_chat_id"]))
+        self.assertEqual(sent["text"], "自用标准插播文案")
+        keyboard = sent["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", keyboard[0][0]["url"])
+        self.assertIn(f"sp_{result['self_promo_id']}", keyboard[0][1]["url"])
+        self.assertEqual(keyboard[1], [{"text": "立即购买", "url": "https://owner.example/landing"}])
+
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?",
+                (result["self_promo_id"],),
+            ).fetchone()
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual(row["channel_id"], channel["id"])
+        self.assertEqual(row["creative_id"], material["id"])
+        self.assertEqual(row["message_id"], sent["message_id"])
+
+    def test_self_promo_deep_link_renders_detail_page(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=20001,
+            format_type="standard_card",
+            text="自用文案",
+            target_url="https://owner.example/landing",
+            button_text="立即查看",
+        )
+        publish = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+            cb_id="cb_self_publish_for_detail",
+        )
+
+        self.confirm_timezone(444, display_name="点击用户")
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 88,
+                    "from": {"id": 444, "first_name": "点击用户"},
+                    "chat": {"id": 444},
+                    "text": f"/start sp_{publish['self_promo_id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "self_promo_start")
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        self.assertIn(channel["title"], detail["text"])
+        flat = [b for row in detail["inline_keyboard"] for b in row]
+        self.assertTrue(any("立即查看" == b.get("text") and b.get("url") == "https://owner.example/landing" for b in flat))
+        self.assertTrue(any(b.get("callback_data") == f"channel:order:{channel['id']}" for b in flat))
+
+    def test_publisher_self_promo_rejects_foreign_channel(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Material owned by a different user
+        foreign_material = self.app.materials.create_material(
+            advertiser_telegram_user_id=99999,
+            format_type="standard_card",
+            text="外部素材",
+            target_url="https://other.example",
+        )
+        result = self._publisher_callback(
+            f"pub:self:pick:{channel['ref_token']}:{foreign_material['id']}",
+            cb_id="cb_self_foreign",
+        )
+        self.assertEqual(result["type"], "callback_self_promo_failed")
+        self.assertEqual(self.gateway.sent_ads, [])
+
+    def test_publisher_channel_dashboard_renders_status_card_and_grid(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+        # Generate one delivery so today_ads = 1 and pending earnings > 0
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="测试投放",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback(f"pub:channel:{channel['ref_token']}")
+        self.assertEqual(result["type"], "callback_publisher_channel")
+        message = self.gateway.private_messages[-1]
+        text = message["text"]
+        self.assertIn("今日广告：1 / 3", text)
+        self.assertIn("可投形态：", text)
+        self.assertIn("当前档位：中档", text)
+        self.assertIn("待确认收益：USD", text)
+
+        button_texts = [b["text"] for row in message["inline_keyboard"] for b in row]
+        for label in [
+            "⚙️ 接广告设置",
+            "💵 价格档位",
+            "🧩 展示形态",
+            "⏱ 频控时间",
+            "🪧 自用发布",
+            "📊 数据",
+            "💸 收益明细",
+        ]:
+            self.assertIn(label, button_texts)
+
+    def test_publisher_band_picker_switches_owner_price_band(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        # Open picker
+        result = self._publisher_callback(f"pub:band:{channel['ref_token']}", cb_id="cb_band_open")
+        self.assertEqual(result["type"], "callback_publisher_band_picker")
+        self.assertIn("中档 1.0x", self.gateway.private_messages[-1]["text"])
+
+        # Switch standard_card to high
+        switch = self._publisher_callback(
+            f"pub:band:set:{channel['ref_token']}:standard_card:high",
+            cb_id="cb_band_high",
+        )
+        self.assertEqual(switch["type"], "callback_publisher_band_set")
+
+        with self.app.db.transaction() as conn:
+            policy = conn.execute(
+                "SELECT owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = 'standard_card'",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(policy["owner_price_band"], "high")
+        self.assertIn("高档 1.25x", self.gateway.private_messages[-1]["text"])
+
+    def test_publisher_limit_panel_adjusts_daily_limit(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        result = self._publisher_callback(f"pub:limit:{channel['ref_token']}", cb_id="cb_limit_open")
+        self.assertEqual(result["type"], "callback_publisher_limit_panel")
+        self.assertIn("每日最多：3 条", self.gateway.private_messages[-1]["text"])
+
+        bumped = self._publisher_callback(f"pub:limit:set:{channel['ref_token']}:5", cb_id="cb_limit_5")
+        self.assertEqual(bumped["type"], "callback_publisher_limit_set")
+        self.assertIn("每日最多：5 条", self.gateway.private_messages[-1]["text"])
+
+        with self.app.db.transaction() as conn:
+            cfg = conn.execute(
+                "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+        self.assertEqual(cfg["daily_ad_limit"], 5)
+
+    def test_publisher_channel_earnings_shows_channel_scoped_total(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(20001, role="publisher", display_name="频道主")
+        self._grant_publisher_access(channel)
+
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="测试投放",
+            target_url="https://example.com",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        result = self._publisher_callback(f"pub:earnings:{channel['ref_token']}", cb_id="cb_earn")
+        self.assertEqual(result["type"], "callback_publisher_channel_earnings")
+        text = self.gateway.private_messages[-1]["text"]
+        self.assertIn("收益明细", text)
+        self.assertIn(channel["title"], text)
+        self.assertIn("待确认", text)
+        self.assertIn("已确认", text)
+        self.assertIn("平台已收", text)
+
+    def test_view_detail_deep_link_renders_full_ad_page(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播完整文案，点击查看详情后展示。",
+            target_url="https://advertiser.example/landing",
+            button_text="立即购买",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+
+        self.confirm_timezone(333, display_name="点击用户")
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 77,
+                    "from": {"id": 333, "first_name": "点击用户"},
+                    "chat": {"id": 333},
+                    "text": f"/start ad_{delivery['id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "ad_start")
+
+        detail = self.gateway.private_messages[-1]
+        self.assertIn("插播广告详情", detail["text"])
+        self.assertIn("标准插播完整文案", detail["text"])
+        self.assertIn(channel["title"], detail["text"])
+
+        keyboard = detail["inline_keyboard"]
+        flat = [b for row in keyboard for b in row]
+        cta = next((b for b in flat if b.get("text") == "立即购买"), None)
+        self.assertIsNotNone(cta)
+        self.assertEqual(cta["url"], "https://advertiser.example/landing")
+
+        sales = next((b for b in flat if "想在这个频道投广告" in b.get("text", "")), None)
+        self.assertIsNotNone(sales)
+        self.assertEqual(sales["callback_data"], f"channel:order:{channel['id']}")
+
+        with self.app.db.transaction() as conn:
+            metric = conn.execute(
+                "SELECT * FROM metric_snapshots WHERE delivery_id = ? AND metric_type = 'bot_start'",
+                (delivery["id"],),
+            ).fetchone()
+        self.assertIsNotNone(metric)
+
+    def test_standard_placement_publishes_three_button_keyboard(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("10")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播文案",
+            target_url="https://advertiser.example/landing",
+            button_text="立即购买",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        dispatched = self.app.fulfillment.dispatch_due()
+        self.assertEqual(dispatched[0]["status"], "sent")
+
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual(len(keyboard), 2)
+        top_row = keyboard[0]
+        self.assertEqual([b["text"] for b in top_row], ["📣 频道招商", "🔍 查看详情"])
+        self.assertIn(f"ch_{channel['ref_token']}", top_row[0]["url"])
+        self.assertIn("ad_del_", top_row[1]["url"])
+        self.assertEqual(keyboard[1], [{"text": "立即购买", "url": "https://advertiser.example/landing"}])
+
+    def test_strong_placement_also_publishes_three_buttons(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="strong_post",
+            text="定制插播文案",
+            target_url="https://advertiser.example/strong",
+            button_text="开始使用",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="strong_post",
+            material_id=material["id"],
+            budget_cents=money_to_cents("20"),
+        )
+        self.app.orders.approve_order(order["id"])
+        self.app.fulfillment.dispatch_due()
+
+        keyboard = self.gateway.sent_ads[0]["inline_keyboard"]
+        self.assertEqual([b["text"] for b in keyboard[0]], ["📣 频道招商", "🔍 查看详情"])
+        self.assertEqual(keyboard[1][0]["text"], "开始使用")
+
+    def test_offer_acceptance_records_library_material(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("20")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="news",
+            median_24h_views=10_000,
+            light_unique_clickers_30d=20,
+            risk_level="normal",
+        )
+        offer = self.app.price_offers.create_offer(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+            slot_type="standard_card",
+            offered_price_cents=money_to_cents("3"),
+            creative_text="砍价插播文案",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("3"),
+            message="3 美金试试",
+        )
+        result = self.app.price_offers.respond_offer(offer["id"], accepted=True)
+        self.assertEqual(result["status"], "accepted")
+        order_id = result["accepted_order_id"]
+        with self.app.db.transaction() as conn:
+            order_row = conn.execute(
+                "SELECT creative_id FROM ad_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            creative_row = conn.execute(
+                "SELECT advertiser_account_id, format_type FROM creatives WHERE id = ?",
+                (order_row["creative_id"],),
+            ).fetchone()
+        self.assertIsNotNone(creative_row["advertiser_account_id"])
+        self.assertEqual(creative_row["format_type"], "standard_card")
 
 
 if __name__ == "__main__":

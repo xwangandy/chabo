@@ -44,6 +44,19 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _audit_payload_with_note(base: dict[str, Any], note: str | None) -> dict[str, Any]:
+    """Merge an operator note into an audit payload.
+
+    Notes are written into ``audit_logs.payload_json["note"]`` so detail
+    pages and exports can render them on the same timeline as the rest of
+    the action's payload. Empty / whitespace-only notes are dropped.
+    """
+    cleaned = (note or "").strip()
+    if not cleaned:
+        return base
+    return {**base, "note": cleaned}
+
+
 class AccountService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -117,6 +130,7 @@ class LedgerService:
         self.db = db
         self.settings = settings
         self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def _record(
         self,
@@ -163,6 +177,144 @@ class LedgerService:
             ),
         )
 
+    def get_wallet_summary(
+        self,
+        *,
+        telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id, available_balance_cents, reserved_balance_cents, "
+                "       spent_balance_cents "
+                "FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return {
+                    "telegram_user_id": str(telegram_user_id),
+                    "available_balance_cents": 0,
+                    "reserved_balance_cents": 0,
+                    "spent_balance_cents": 0,
+                }
+            return {
+                "telegram_user_id": str(telegram_user_id),
+                "account_id": account["id"],
+                "available_balance_cents": account["available_balance_cents"],
+                "reserved_balance_cents": account["reserved_balance_cents"],
+                "spent_balance_cents": account["spent_balance_cents"],
+            }
+
+    def get_earnings_summary(
+        self,
+        *,
+        telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id, pending_earnings_cents, confirmed_earnings_cents, "
+                "       releasable_earnings_cents "
+                "FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return {
+                    "telegram_user_id": str(telegram_user_id),
+                    "pending_earnings_cents": 0,
+                    "confirmed_earnings_cents": 0,
+                    "releasable_earnings_cents": 0,
+                }
+            return {
+                "telegram_user_id": str(telegram_user_id),
+                "account_id": account["id"],
+                "pending_earnings_cents": account["pending_earnings_cents"],
+                "confirmed_earnings_cents": account["confirmed_earnings_cents"],
+                "releasable_earnings_cents": account["releasable_earnings_cents"],
+            }
+
+    def list_channel_earnings(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id AS channel_id,
+                    c.title AS title,
+                    c.ref_token AS ref_token,
+                    COALESCE(SUM(CASE WHEN d.status = 'sent' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS pending_cents,
+                    COALESCE(SUM(CASE WHEN d.status = 'confirmed' THEN d.publisher_net_cents - d.publisher_reversed_cents ELSE 0 END), 0) AS confirmed_cents,
+                    COALESCE(SUM(d.platform_fee_cents - d.platform_fee_reversed_cents), 0) AS platform_fee_cents,
+                    COUNT(d.id) AS delivery_count
+                FROM channels c
+                LEFT JOIN deliveries d ON d.channel_id = c.id AND d.status IN ('sent', 'confirmed')
+                WHERE c.owner_account_id = ?
+                GROUP BY c.id, c.title, c.ref_token
+                ORDER BY c.created_at DESC
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_transactions(
+        self,
+        *,
+        telegram_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, type, amount_cents, currency, memo, created_at, order_id, delivery_id
+                FROM ledger_transactions
+                WHERE account_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (account["id"], int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_reserved_orders(
+        self,
+        *,
+        telegram_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT o.id AS order_id, o.status, o.reserved_cents, o.budget_cents, o.spent_cents,
+                       o.currency, c.title AS channel_title
+                FROM ad_orders o
+                LEFT JOIN channels c ON c.id = o.channel_id
+                WHERE o.advertiser_account_id = ? AND o.reserved_cents > 0
+                ORDER BY o.created_at DESC
+                LIMIT ?
+                """,
+                (account["id"], int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def manual_topup(
         self,
         telegram_user_id: str | int,
@@ -170,19 +322,47 @@ class LedgerService:
         *,
         display_name: str | None = None,
         memo: str = "人工入账",
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
-            conn.execute(
-                """
-                UPDATE accounts
-                SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (amount_cents, account["id"]),
+        audit_args = {
+            "telegram_user_id": str(telegram_user_id),
+            "amount_cents": amount_cents,
+            "memo_preview": (memo or "")[:80],
+        }
+        try:
+            with self.db.transaction() as conn:
+                account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (amount_cents, account["id"]),
+                )
+                self._record(conn, account["id"], "manual_topup", amount_cents, memo=memo)
+                result = self.accounts.get(conn, account["id"])
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="manual_topup",
+                actor_telegram_user_id=actor_telegram_user_id if actor_telegram_user_id is not None else telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
             )
-            self._record(conn, account["id"], "manual_topup", amount_cents, memo=memo)
-            return self.accounts.get(conn, account["id"])
+            raise
+        self.tool_calls.log_success(
+            tool_name="manual_topup",
+            actor_telegram_user_id=actor_telegram_user_id if actor_telegram_user_id is not None else telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"+{amount_cents} cents to {telegram_user_id}",
+        )
+        return result
 
     def stars_topup(
         self,
@@ -609,6 +789,7 @@ class ChannelService:
         self.db = db
         self.settings = settings
         self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def bind_channel(
         self,
@@ -884,6 +1065,137 @@ class ChannelService:
             ).fetchone()
             return dict(row)
 
+    def _verify_publisher_owns_channel(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+    ) -> None:
+        account = conn.execute(
+            "SELECT id FROM accounts WHERE telegram_user_id = ?",
+            (str(publisher_telegram_user_id),),
+        ).fetchone()
+        if not account:
+            raise NotFound(f"频道不存在：{channel_id}")
+        channel = conn.execute(
+            "SELECT owner_account_id FROM channels WHERE id = ?", (channel_id,)
+        ).fetchone()
+        if not channel or channel["owner_account_id"] != account["id"]:
+            raise NotFound(f"频道不存在：{channel_id}")
+
+    def set_format_policy_for_publisher(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        format_type: str,
+        enabled: bool,
+        owner_price_band: str = "medium",
+        platform_promo_enabled: bool = True,
+        custom_multiplier_bps: int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "channel_id": channel_id,
+            "format_type": format_type,
+            "enabled": enabled,
+            "owner_price_band": owner_price_band,
+            "platform_promo_enabled": platform_promo_enabled,
+        }
+        try:
+            with self.db.transaction() as conn:
+                self._verify_publisher_owns_channel(
+                    conn,
+                    publisher_telegram_user_id=publisher_telegram_user_id,
+                    channel_id=channel_id,
+                )
+            policy = self.set_format_policy(
+                channel_id,
+                format_type,
+                enabled=enabled,
+                owner_price_band=owner_price_band,
+                platform_promo_enabled=platform_promo_enabled,
+                custom_multiplier_bps=custom_multiplier_bps,
+            )
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="set_format_policy_for_publisher",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="set_format_policy_for_publisher",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"{format_type} → {owner_price_band}, enabled={int(enabled)}",
+        )
+        return policy
+
+    def set_daily_ad_limit_for_publisher(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        daily_ad_limit: int,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {"channel_id": channel_id, "daily_ad_limit": daily_ad_limit}
+        try:
+            with self.db.transaction() as conn:
+                self._verify_publisher_owns_channel(
+                    conn,
+                    publisher_telegram_user_id=publisher_telegram_user_id,
+                    channel_id=channel_id,
+                )
+            cfg = self.set_daily_ad_limit(channel_id, daily_ad_limit)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="set_daily_ad_limit_for_publisher",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="set_daily_ad_limit_for_publisher",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"daily_ad_limit → {daily_ad_limit}",
+        )
+        return cfg
+
+    def set_daily_ad_limit(self, channel_id: str, daily_ad_limit: int) -> dict[str, Any]:
+        if daily_ad_limit < 1 or daily_ad_limit > 24:
+            raise InvalidState("每日广告条数需要在 1 到 24 之间")
+        with self.db.transaction() as conn:
+            self.get_channel(conn, channel_id)
+            conn.execute(
+                """
+                UPDATE channel_configs
+                SET daily_ad_limit = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE channel_id = ?
+                """,
+                (daily_ad_limit, channel_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM channel_configs WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            return dict(row)
+
     def update_rate(self, channel_id: str, slot_type: str, unit_price_cents: int) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
         with self.db.transaction() as conn:
@@ -917,6 +1229,90 @@ class ChannelService:
         if not row:
             raise NotFound(f"channel not found: {channel_id}")
         return dict(row)
+
+    def list_publisher_channels(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, telegram_chat_id, title, username, ref_token, status,
+                       created_at, updated_at
+                FROM channels
+                WHERE owner_account_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_channel_view(
+        self,
+        channel_id: str,
+        *,
+        publisher_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            channel = conn.execute(
+                "SELECT * FROM channels WHERE id = ?", (channel_id,)
+            ).fetchone()
+            if not channel:
+                raise NotFound(f"频道不存在：{channel_id}")
+            channel_dict = dict(channel)
+            if publisher_telegram_user_id is not None:
+                account = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(publisher_telegram_user_id),),
+                ).fetchone()
+                if not account or channel_dict["owner_account_id"] != account["id"]:
+                    raise NotFound(f"频道不存在：{channel_id}")
+            self._ensure_default_rate_cards(conn, channel_id)
+            self._ensure_default_format_policies(conn, channel_id)
+            config = conn.execute(
+                "SELECT * FROM channel_configs WHERE channel_id = ?", (channel_id,)
+            ).fetchone()
+            policies = conn.execute(
+                "SELECT format_type, enabled, owner_price_band, platform_promo_enabled, "
+                "       custom_multiplier_bps "
+                "FROM channel_ad_format_policies WHERE channel_id = ? ORDER BY format_type",
+                (channel_id,),
+            ).fetchall()
+            rates = conn.execute(
+                """
+                SELECT s.slot_type, r.unit_price_cents, r.currency, r.pricing_unit
+                FROM ad_slots s
+                JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+                WHERE s.channel_id = ?
+                ORDER BY s.slot_type
+                """,
+                (channel_id,),
+            ).fetchall()
+            today_ads = conn.execute(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE channel_id = ? "
+                "AND status IN ('sent', 'confirmed') AND DATE(sent_at) = DATE('now')",
+                (channel_id,),
+            ).fetchone()["n"]
+            pending = conn.execute(
+                "SELECT COALESCE(SUM(publisher_net_cents - publisher_reversed_cents), 0) AS n "
+                "FROM deliveries WHERE channel_id = ? AND status IN ('sent', 'confirmed')",
+                (channel_id,),
+            ).fetchone()["n"]
+            return {
+                **channel_dict,
+                "config": dict(config) if config else None,
+                "format_policies": [dict(row) for row in policies],
+                "rate_cards": [dict(row) for row in rates],
+                "today_ads": today_ads,
+                "pending_earnings_cents": pending,
+            }
 
     def get_rate(self, conn: sqlite3.Connection, channel_id: str, slot_type: str) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
@@ -958,6 +1354,370 @@ class ChannelService:
         )
 
 
+class MaterialService:
+    """Independent ad material (creative) library.
+
+    Stable boundary for Bot, CLI, Admin and future AI tool calls. All
+    public methods validate ownership through advertiser_telegram_user_id.
+    Format codes are internal: light_tail (文字插播), standard_card (标准插播),
+    strong_post (定制插播); display layers translate to Chinese product names.
+    """
+
+    SUPPORTED_FORMATS = ("light_tail", "standard_card", "strong_post")
+    LIGHT_SHORT_TEXT_MIN = 2
+    LIGHT_SHORT_TEXT_MAX = 15
+    LIBRARY_CAMPAIGN_NAME = "插播素材库"
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
+
+    def create_material(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str = "查看详情",
+        category: str = "general",
+        light_short_text: str | None = None,
+        display_name: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "format_type": format_type,
+            "target_url": target_url,
+            "category": category,
+            "text_preview": (text or "")[:60],
+            "has_light_short_text": bool(light_short_text),
+        }
+        try:
+            format_type = self._normalize_format(format_type)
+            text, target_url, button_text, category = self._normalize_text_fields(
+                text, target_url, button_text, category
+            )
+            if format_type == "light_tail":
+                short = (light_short_text or "").strip()
+                if len(short) < self.LIGHT_SHORT_TEXT_MIN:
+                    raise InvalidState(
+                        f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
+                    )
+                if len(short) > self.LIGHT_SHORT_TEXT_MAX:
+                    raise InvalidState(
+                        f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
+                    )
+                light_short_text = short
+            else:
+                light_short_text = None
+
+            with self.db.transaction() as conn:
+                advertiser = self.accounts.get_or_create_by_telegram(
+                    conn,
+                    advertiser_telegram_user_id,
+                    "advertiser",
+                    display_name=display_name,
+                )
+                material_id = self._insert_material(
+                    conn,
+                    advertiser_account_id=advertiser["id"],
+                    format_type=format_type,
+                    text=text,
+                    target_url=target_url,
+                    button_text=button_text,
+                    category=category,
+                    light_short_text=light_short_text,
+                )
+                material = self._fetch_material(conn, material_id)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="create_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="create_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"created {material['id']}",
+        )
+        return material
+
+    def list_materials(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        format_type: str | None = None,
+        include_archived: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                return []
+            sql = "SELECT * FROM creatives WHERE advertiser_account_id = ?"
+            params: list[Any] = [advertiser["id"]]
+            if format_type is not None:
+                sql += " AND format_type = ?"
+                params.append(self._normalize_format(format_type))
+            if not include_archived:
+                sql += " AND archived_at IS NULL"
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM creatives WHERE id = ?",
+                (material_id,),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            material = dict(row)
+            if advertiser_telegram_user_id is not None:
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser or material["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+            return material
+
+    def archive_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {"material_id": material_id}
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?",
+                    (material_id,),
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser or row["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if row["archived_at"]:
+                    material = dict(row)
+                    already_archived = True
+                else:
+                    conn.execute(
+                        "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (iso(), material_id),
+                    )
+                    material = self._fetch_material(conn, material_id)
+                    already_archived = False
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="archive_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="archive_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=("already archived" if already_archived else f"archived {material_id}"),
+        )
+        return material
+
+    # ------ helpers reusable from OrderService inside an open transaction ------
+
+    def insert_material_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str = "查看详情",
+        category: str = "general",
+        light_short_text: str | None = None,
+        campaign_id: str | None = None,
+    ) -> str:
+        format_type = self._normalize_format(format_type)
+        text, target_url, button_text, category = self._normalize_text_fields(
+            text, target_url, button_text, category
+        )
+        if format_type == "light_tail" and light_short_text:
+            light_short_text = light_short_text.strip() or None
+        else:
+            light_short_text = None
+        return self._insert_material(
+            conn,
+            advertiser_account_id=advertiser_account_id,
+            format_type=format_type,
+            text=text,
+            target_url=target_url,
+            button_text=button_text,
+            category=category,
+            light_short_text=light_short_text,
+            campaign_id=campaign_id,
+        )
+
+    def list_materials_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str | None = None,
+        include_archived: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM creatives WHERE advertiser_account_id = ?"
+        params: list[Any] = [advertiser_account_id]
+        if format_type is not None:
+            sql += " AND format_type = ?"
+            params.append(self._normalize_format(format_type))
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
+        sql += " ORDER BY updated_at DESC, created_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def archive_material_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        material_id: str,
+        advertiser_account_id: str,
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            "SELECT * FROM creatives WHERE id = ?", (material_id,)
+        ).fetchone()
+        if not row or row["advertiser_account_id"] != advertiser_account_id:
+            raise NotFound(f"广告素材不存在：{material_id}")
+        if row["archived_at"]:
+            return dict(row)
+        conn.execute(
+            "UPDATE creatives SET archived_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (iso(), material_id),
+        )
+        return self._fetch_material(conn, material_id)
+
+    def ensure_library_campaign(
+        self, conn: sqlite3.Connection, advertiser_account_id: str
+    ) -> str:
+        row = conn.execute(
+            "SELECT id FROM campaigns WHERE advertiser_account_id = ? AND name = ? LIMIT 1",
+            (advertiser_account_id, self.LIBRARY_CAMPAIGN_NAME),
+        ).fetchone()
+        if row:
+            return row["id"]
+        campaign_id = new_id("camp")
+        conn.execute(
+            "INSERT INTO campaigns (id, advertiser_account_id, name) VALUES (?, ?, ?)",
+            (campaign_id, advertiser_account_id, self.LIBRARY_CAMPAIGN_NAME),
+        )
+        return campaign_id
+
+    # ----------------------------- internals -----------------------------
+
+    def _insert_material(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_account_id: str,
+        format_type: str,
+        text: str,
+        target_url: str,
+        button_text: str,
+        category: str,
+        light_short_text: str | None,
+        campaign_id: str | None = None,
+    ) -> str:
+        if not text:
+            raise InvalidState("广告素材文案不能为空")
+        if not target_url:
+            raise InvalidState("广告素材必须包含目标链接")
+        if campaign_id is None:
+            campaign_id = self.ensure_library_campaign(conn, advertiser_account_id)
+        material_id = new_id("cre")
+        content_hash = hashlib.sha256(
+            f"{format_type}|{light_short_text or ''}|{text}|{target_url}|{button_text}".encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO creatives (
+                id, campaign_id, advertiser_account_id, format_type,
+                text, target_url, button_text, category, light_short_text,
+                status, content_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)
+            """,
+            (
+                material_id,
+                campaign_id,
+                advertiser_account_id,
+                format_type,
+                text,
+                target_url,
+                button_text,
+                category,
+                light_short_text,
+                content_hash,
+            ),
+        )
+        return material_id
+
+    def _fetch_material(self, conn: sqlite3.Connection, material_id: str) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM creatives WHERE id = ?", (material_id,)).fetchone()
+        return dict(row)
+
+    def _normalize_format(self, format_type: str) -> str:
+        if format_type not in self.SUPPORTED_FORMATS:
+            raise InvalidState(
+                "不支持的素材形态："
+                f"{format_type}（仅支持 light_tail / standard_card / strong_post）"
+            )
+        return format_type
+
+    def _normalize_text_fields(
+        self, text: str, target_url: str, button_text: str, category: str
+    ) -> tuple[str, str, str, str]:
+        text = (text or "").strip()
+        target_url = (target_url or "").strip()
+        button_text = (button_text or "查看详情").strip() or "查看详情"
+        category = (category or "general").strip() or "general"
+        return text, target_url, button_text, category
+
+
 class OrderService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -965,6 +1725,8 @@ class OrderService:
         self.accounts = AccountService(db, settings)
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
+        self.materials = MaterialService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
 
     def create_order(
         self,
@@ -972,20 +1734,95 @@ class OrderService:
         advertiser_telegram_user_id: str | int,
         channel_token: str,
         slot_type: str,
-        text: str,
-        target_url: str,
         budget_cents: int,
+        text: str | None = None,
+        target_url: str | None = None,
         button_text: str = "查看详情",
         category: str = "general",
+        light_short_text: str | None = None,
+        material_id: str | None = None,
         scheduled_at: datetime | None = None,
         end_at: datetime | None = None,
         frequency_per_day: int = 1,
         campaign_name: str = "插播广告",
         unit_price_override_cents: int | None = None,
         price_offer_id: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "channel_token": channel_token,
+            "slot_type": slot_type,
+            "budget_cents": budget_cents,
+            "material_id": material_id,
+            "has_inline_text": bool(text),
+            "has_end_at": end_at is not None,
+            "frequency_per_day": frequency_per_day,
+            "price_offer_id": price_offer_id,
+        }
+        try:
+            order = self._create_order_impl(
+                advertiser_telegram_user_id=advertiser_telegram_user_id,
+                channel_token=channel_token,
+                slot_type=slot_type,
+                budget_cents=budget_cents,
+                text=text,
+                target_url=target_url,
+                button_text=button_text,
+                category=category,
+                light_short_text=light_short_text,
+                material_id=material_id,
+                scheduled_at=scheduled_at,
+                end_at=end_at,
+                frequency_per_day=frequency_per_day,
+                campaign_name=campaign_name,
+                unit_price_override_cents=unit_price_override_cents,
+                price_offer_id=price_offer_id,
+            )
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="create_order",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="create_order",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"created {order['id']}",
+        )
+        return order
+
+    def _create_order_impl(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        channel_token: str,
+        slot_type: str,
+        budget_cents: int,
+        text: str | None,
+        target_url: str | None,
+        button_text: str,
+        category: str,
+        light_short_text: str | None,
+        material_id: str | None,
+        scheduled_at: datetime | None,
+        end_at: datetime | None,
+        frequency_per_day: int,
+        campaign_name: str,
+        unit_price_override_cents: int | None,
+        price_offer_id: str | None,
     ) -> dict[str, Any]:
         scheduled_at = scheduled_at or utcnow()
         slot_type = self.channels.normalize_slot_type(slot_type)
+        if material_id is None and not (text and target_url):
+            raise InvalidState("创建订单需要提供 material_id 或者 text+target_url")
         with self.db.transaction() as conn:
             advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
             channel = self.channels.get_by_token(conn, channel_token)
@@ -1016,9 +1853,7 @@ class OrderService:
             if budget_cents < unit_price_cents:
                 raise InvalidState("插播预算低于该广告位单次刊例价")
             campaign_id = new_id("camp")
-            creative_id = new_id("cre")
             order_id = new_id("ord")
-            content_hash = hashlib.sha256(f"{text}|{target_url}|{button_text}".encode("utf-8")).hexdigest()
             conn.execute(
                 """
                 INSERT INTO campaigns (id, advertiser_account_id, name)
@@ -1026,15 +1861,48 @@ class OrderService:
                 """,
                 (campaign_id, advertiser["id"], campaign_name),
             )
-            conn.execute(
-                """
-                INSERT INTO creatives (
-                    id, campaign_id, text, target_url, button_text, category, content_hash
+            if material_id is not None:
+                material = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?", (material_id,)
+                ).fetchone()
+                if not material or material["advertiser_account_id"] != advertiser["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if material["archived_at"]:
+                    raise InvalidState("广告素材已归档，请先恢复或选择其他素材")
+                creative_id = material["id"]
+                creative_snapshot = {
+                    "text": material["text"],
+                    "target_url": material["target_url"],
+                    "button_text": material["button_text"],
+                    "format_type": material["format_type"],
+                    "light_short_text": material["light_short_text"],
+                    "material_id": material["id"],
+                }
+            else:
+                material_format = (
+                    slot_type
+                    if slot_type in MaterialService.SUPPORTED_FORMATS
+                    else "standard_card"
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (creative_id, campaign_id, text, target_url, button_text, category, content_hash),
-            )
+                creative_id = self.materials.insert_material_in_conn(
+                    conn,
+                    advertiser_account_id=advertiser["id"],
+                    format_type=material_format,
+                    text=text or "",
+                    target_url=target_url or "",
+                    button_text=button_text,
+                    category=category,
+                    light_short_text=light_short_text,
+                    campaign_id=campaign_id,
+                )
+                creative_snapshot = {
+                    "text": text,
+                    "target_url": target_url,
+                    "button_text": button_text,
+                    "format_type": material_format,
+                    "light_short_text": light_short_text,
+                    "material_id": creative_id,
+                }
             conn.execute(
                 """
                 INSERT INTO ad_orders (
@@ -1062,12 +1930,141 @@ class OrderService:
                 ),
             )
             self.ledger.reserve_budget(conn, advertiser["id"], order_id, budget_cents, rate["currency"])
-            self._snapshot(conn, order_id, None, "creative", {"text": text, "target_url": target_url, "button_text": button_text})
+            self._snapshot(conn, order_id, None, "creative", creative_snapshot)
             self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": unit_price_cents, "price_offer_id": price_offer_id})
             self._snapshot(conn, order_id, None, "channel", channel)
             return self.get_order(conn, order_id)
 
-    def approve_order(self, order_id: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def approve_order_for_operator(
+        self,
+        *,
+        order_id: str,
+        operator_telegram_user_id: str | int,
+        note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {"order_id": order_id, "has_note": bool((note or "").strip())}
+        try:
+            order = self.approve_order(order_id, self._operator_account_id(operator_telegram_user_id), note=note)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="approve_order_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="approve_order_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"approved {order_id}",
+        )
+        return order
+
+    def reject_order_for_operator(
+        self,
+        *,
+        order_id: str,
+        reason: str,
+        operator_telegram_user_id: str | int,
+        note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "order_id": order_id,
+            "reason_preview": (reason or "")[:80],
+            "has_note": bool((note or "").strip()),
+        }
+        try:
+            order = self.reject_order(order_id, reason, self._operator_account_id(operator_telegram_user_id), note=note)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="reject_order_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="reject_order_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"rejected {order_id}",
+        )
+        return order
+
+    def refund_delivery_for_operator(
+        self,
+        *,
+        delivery_id: str,
+        reason: str,
+        operator_telegram_user_id: str | int,
+        amount_cents: int | None = None,
+        note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        audit_args = {
+            "delivery_id": delivery_id,
+            "amount_cents": amount_cents,
+            "reason_preview": (reason or "")[:80],
+            "has_note": bool((note or "").strip()),
+        }
+        try:
+            actor = self._operator_account_id(operator_telegram_user_id)
+            if amount_cents is None:
+                delivery = self.refund_delivery(delivery_id, reason, actor, note=note)
+            else:
+                delivery = self.refund_delivery_partial(delivery_id, amount_cents, reason, actor, note=note)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="refund_delivery_for_operator",
+                actor_telegram_user_id=operator_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        kind = "full" if amount_cents is None else f"partial {amount_cents}"
+        self.tool_calls.log_success(
+            tool_name="refund_delivery_for_operator",
+            actor_telegram_user_id=operator_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"{kind} refund on {delivery_id}",
+        )
+        return delivery
+
+    def _operator_account_id(self, telegram_user_id: str | int) -> str:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(telegram_user_id),),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"操作员账号不存在：{telegram_user_id}")
+            return row["id"]
+
+    def approve_order(
+        self,
+        order_id: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
             if order["status"] not in {"pending_review", "paused"}:
@@ -1082,10 +2079,18 @@ class OrderService:
                 (order_id,),
             )
             self._ensure_delivery(conn, order_id, order["scheduled_at"])
-            self._audit(conn, actor_account_id, "order_approved", "ad_order", order_id, {})
+            payload = _audit_payload_with_note({}, note)
+            self._audit(conn, actor_account_id, "order_approved", "ad_order", order_id, payload)
             return self.get_order(conn, order_id)
 
-    def reject_order(self, order_id: str, reason: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def reject_order(
+        self,
+        order_id: str,
+        reason: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
             if order["spent_cents"] > 0:
@@ -1112,14 +2117,22 @@ class OrderService:
                 (order_id,),
             )
             self._snapshot(conn, order_id, None, "order_rejected", {"reason": reason})
-            self._audit(conn, actor_account_id, "order_rejected", "ad_order", order_id, {"reason": reason})
+            payload = _audit_payload_with_note({"reason": reason}, note)
+            self._audit(conn, actor_account_id, "order_rejected", "ad_order", order_id, payload)
             return self.get_order(conn, order_id)
 
-    def refund_delivery(self, delivery_id: str, reason: str, actor_account_id: str | None = None) -> dict[str, Any]:
+    def refund_delivery(
+        self,
+        delivery_id: str,
+        reason: str,
+        actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             delivery = self._refundable_delivery(conn, delivery_id)
             refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
-            return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id)
+            return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id, note=note)
 
     def refund_delivery_partial(
         self,
@@ -1127,6 +2140,8 @@ class OrderService:
         amount_cents: int,
         reason: str,
         actor_account_id: str | None = None,
+        *,
+        note: str | None = None,
     ) -> dict[str, Any]:
         if amount_cents <= 0:
             raise InvalidState("退款金额必须大于 0")
@@ -1135,7 +2150,7 @@ class OrderService:
             refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
             if amount_cents > refundable_cents:
                 raise InvalidState("退款金额超过该投放可退款余额")
-            return self._refund_delivery_locked(conn, delivery, reason, amount_cents, actor_account_id)
+            return self._refund_delivery_locked(conn, delivery, reason, amount_cents, actor_account_id, note=note)
 
     def _refundable_delivery(self, conn: sqlite3.Connection, delivery_id: str) -> sqlite3.Row:
         delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
@@ -1156,6 +2171,8 @@ class OrderService:
         reason: str,
         amount_cents: int,
         actor_account_id: str | None,
+        *,
+        note: str | None = None,
     ) -> dict[str, Any]:
         order = self.get_order(conn, delivery["order_id"])
         channel = conn.execute("SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)).fetchone()
@@ -1242,7 +2259,10 @@ class OrderService:
             "delivery_refunded" if full_refund else "delivery_partially_refunded",
             "delivery",
             delivery["id"],
-            {"reason": reason, "refund_cents": amount_cents, "full_refund": full_refund},
+            _audit_payload_with_note(
+                {"reason": reason, "refund_cents": amount_cents, "full_refund": full_refund},
+                note,
+            ),
         )
         return {
             "order": self.get_order(conn, order["id"]),
@@ -1295,6 +2315,82 @@ class OrderService:
         if not row:
             raise NotFound(f"order not found: {order_id}")
         return dict(row)
+
+    def list_orders(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            sql = (
+                "SELECT o.*, c.title AS channel_title, c.ref_token AS channel_ref_token, "
+                "       cr.format_type AS creative_format, cr.text AS creative_text "
+                "FROM ad_orders o "
+                "LEFT JOIN channels c ON c.id = o.channel_id "
+                "LEFT JOIN creatives cr ON cr.id = o.creative_id "
+                "WHERE o.advertiser_account_id = ?"
+            )
+            params: list[Any] = [account["id"]]
+            if status is not None:
+                sql += " AND o.status = ?"
+                params.append(status)
+            sql += " ORDER BY o.created_at DESC LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_order_view(
+        self,
+        order_id: str,
+        *,
+        advertiser_telegram_user_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order:
+                raise NotFound(f"订单不存在：{order_id}")
+            order_dict = dict(order)
+            if advertiser_telegram_user_id is not None:
+                account = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not account or order_dict["advertiser_account_id"] != account["id"]:
+                    raise NotFound(f"订单不存在：{order_id}")
+            channel = conn.execute(
+                "SELECT id, title, ref_token, username FROM channels WHERE id = ?",
+                (order_dict["channel_id"],),
+            ).fetchone()
+            creative = conn.execute(
+                "SELECT id, format_type, text, target_url, button_text, light_short_text "
+                "FROM creatives WHERE id = ?",
+                (order_dict["creative_id"],),
+            ).fetchone()
+            slot = conn.execute(
+                "SELECT slot_type FROM ad_slots WHERE id = ?", (order_dict["slot_id"],)
+            ).fetchone()
+            deliveries = conn.execute(
+                "SELECT id, status, scheduled_at, sent_at, charge_cents, message_id "
+                "FROM deliveries WHERE order_id = ? ORDER BY scheduled_at ASC",
+                (order_id,),
+            ).fetchall()
+            return {
+                **order_dict,
+                "channel": dict(channel) if channel else None,
+                "creative": dict(creative) if creative else None,
+                "slot_type": slot["slot_type"] if slot else None,
+                "deliveries": [dict(row) for row in deliveries],
+            }
 
     def _ensure_delivery(self, conn: sqlite3.Connection, order_id: str, scheduled_at: str) -> str:
         existing = conn.execute(
@@ -1473,6 +2569,7 @@ class DisputeService:
         dispute_id: str,
         resolution: str,
         actor_account_id: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             dispute = conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone()
@@ -1493,12 +2590,13 @@ class DisputeService:
                     "UPDATE deliveries SET status = 'sent', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'disputed'",
                     (dispute["delivery_id"],),
                 )
+            payload = _audit_payload_with_note({"resolution": resolution}, note)
             conn.execute(
                 """
                 INSERT INTO audit_logs (id, actor_account_id, action, entity_type, entity_id, payload_json)
                 VALUES (?, ?, 'dispute_resolved', 'dispute', ?, ?)
                 """,
-                (new_id("aud"), actor_account_id, dispute_id, json.dumps({"resolution": resolution}, ensure_ascii=False)),
+                (new_id("aud"), actor_account_id, dispute_id, json.dumps(payload, ensure_ascii=False)),
             )
             return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
 
@@ -1929,6 +3027,592 @@ class AdvertiserSubscriptionService:
             """,
             (advertiser_account_id, iso()),
         )
+
+
+class TopupApprovalService:
+    """Two-person approval workflow for manual top-ups.
+
+    The requester and the approver must be different accounts. Approval
+    triggers `LedgerService.manual_topup` with the approver recorded as
+    the actor; rejection leaves balances untouched. The status enum is
+    deliberately small (`pending / approved / rejected`) — `approved` is
+    only set after the ledger write succeeds, so anything in `pending`
+    is auditable but not yet impactful.
+    """
+
+    STATUSES = ("pending", "approved", "rejected")
+    MAX_REASON_LEN = 500
+    MAX_NOTE_LEN = 500
+    MAX_URL_LEN = 1000
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+        self.ledger = LedgerService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
+
+    def request_topup(
+        self,
+        *,
+        recipient_telegram_user_id: str | int,
+        amount_cents: int,
+        reason: str,
+        requester_telegram_user_id: str | int,
+        evidence_url: str | None = None,
+        currency: str = "USD",
+        request_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        if amount_cents <= 0:
+            raise InvalidState("入账金额必须大于 0")
+        cleaned_reason = (reason or "").strip()
+        if not cleaned_reason:
+            raise InvalidState("入账请求必须填写原因 / 凭证摘要")
+        if len(cleaned_reason) > self.MAX_REASON_LEN:
+            raise InvalidState(f"原因最长 {self.MAX_REASON_LEN} 字")
+        cleaned_evidence = (evidence_url or "").strip() or None
+        if cleaned_evidence and len(cleaned_evidence) > self.MAX_URL_LEN:
+            raise InvalidState(f"凭证链接最长 {self.MAX_URL_LEN} 字")
+        cleaned_request_note = (request_note or "").strip() or None
+        if cleaned_request_note and len(cleaned_request_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"申请备注最长 {self.MAX_NOTE_LEN} 字")
+        request_id = new_id("treq")
+        try:
+            with self.db.transaction() as conn:
+                requester = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(requester_telegram_user_id),),
+                ).fetchone()
+                if not requester:
+                    raise NotFound(f"申请人账号不存在：{requester_telegram_user_id}")
+                recipient_row = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(recipient_telegram_user_id),),
+                ).fetchone()
+                recipient_account_id = recipient_row["id"] if recipient_row else None
+                conn.execute(
+                    """
+                    INSERT INTO topup_requests (
+                        id, recipient_telegram_user_id, recipient_account_id,
+                        amount_cents, currency, reason, evidence_url, status,
+                        requester_account_id, request_note
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        request_id,
+                        str(recipient_telegram_user_id),
+                        recipient_account_id,
+                        amount_cents,
+                        currency,
+                        cleaned_reason,
+                        cleaned_evidence,
+                        requester["id"],
+                        cleaned_request_note,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                request = dict(row)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_request",
+                actor_telegram_user_id=requester_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={
+                    "recipient": str(recipient_telegram_user_id),
+                    "amount_cents": amount_cents,
+                },
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_request",
+            actor_telegram_user_id=requester_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={
+                "recipient": str(recipient_telegram_user_id),
+                "amount_cents": amount_cents,
+                "has_evidence": bool(cleaned_evidence),
+            },
+            result_summary=f"requested {request_id}",
+        )
+        return request
+
+    def approve_topup(
+        self,
+        *,
+        request_id: str,
+        approver_telegram_user_id: str | int,
+        approval_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        cleaned_note = (approval_note or "").strip() or None
+        if cleaned_note and len(cleaned_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"审批备注最长 {self.MAX_NOTE_LEN} 字")
+        request_snapshot: dict[str, Any] | None = None
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"入账请求不存在：{request_id}")
+                if row["status"] != "pending":
+                    raise InvalidState(f"入账请求当前状态不能审批：{row['status']}")
+                approver = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(approver_telegram_user_id),),
+                ).fetchone()
+                if not approver:
+                    raise NotFound(f"审批人账号不存在：{approver_telegram_user_id}")
+                if approver["id"] == row["requester_account_id"]:
+                    raise InvalidState("审批人必须与申请人是不同账号（双人复核）")
+                request_snapshot = dict(row)
+                approver_id = approver["id"]
+            self.ledger.manual_topup(
+                request_snapshot["recipient_telegram_user_id"],
+                request_snapshot["amount_cents"],
+                memo=f"人工入账：{request_snapshot['reason']}",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+            )
+            with self.db.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE topup_requests
+                    SET status = 'approved',
+                        approver_account_id = ?,
+                        approval_note = ?,
+                        settled_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (approver_id, cleaned_note, request_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                final = dict(row)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_approve",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_approve",
+            actor_telegram_user_id=approver_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+            result_summary=f"approved {request_id}",
+        )
+        return final
+
+    def reject_topup(
+        self,
+        *,
+        request_id: str,
+        approver_telegram_user_id: str | int,
+        approval_note: str | None = None,
+        actor_kind: str = "admin",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        cleaned_note = (approval_note or "").strip() or None
+        if cleaned_note and len(cleaned_note) > self.MAX_NOTE_LEN:
+            raise InvalidState(f"审批备注最长 {self.MAX_NOTE_LEN} 字")
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"入账请求不存在：{request_id}")
+                if row["status"] != "pending":
+                    raise InvalidState(f"入账请求当前状态不能拒绝：{row['status']}")
+                approver = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(approver_telegram_user_id),),
+                ).fetchone()
+                if not approver:
+                    raise NotFound(f"审批人账号不存在：{approver_telegram_user_id}")
+                if approver["id"] == row["requester_account_id"]:
+                    raise InvalidState("审批人必须与申请人是不同账号（双人复核）")
+                conn.execute(
+                    """
+                    UPDATE topup_requests
+                    SET status = 'rejected',
+                        approver_account_id = ?,
+                        approval_note = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (approver["id"], cleaned_note, request_id),
+                )
+                final = dict(conn.execute(
+                    "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+                ).fetchone())
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="topup_reject",
+                actor_telegram_user_id=approver_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="topup_reject",
+            actor_telegram_user_id=approver_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={"request_id": request_id, "has_note": bool(cleaned_note)},
+            result_summary=f"rejected {request_id}",
+        )
+        return final
+
+    def list_requests(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if status is not None and status not in self.STATUSES:
+            raise InvalidState(f"非法 status：{status}")
+        sql = "SELECT * FROM topup_requests"
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self.db.transaction() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_request(self, request_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"入账请求不存在：{request_id}")
+            return dict(row)
+
+
+class ToolCallLogService:
+    """Audit log for AI tool calls and operator actions.
+
+    Designed as a single sink that any AI-callable service method or
+    Bot/Admin action can write to. Records who initiated the call (by
+    telegram_user_id when available), what tool was invoked, the
+    arguments summary, and the result status / error type. The log is
+    append-only; callers are expected to redact sensitive fields from
+    `arguments` before passing them in.
+    """
+
+    ACTOR_KINDS = ("human", "ai", "admin", "system")
+    RESULT_STATUSES = ("success", "error")
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+
+    def log_call(
+        self,
+        *,
+        tool_name: str,
+        result_status: str = "success",
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        result_summary: str | None = None,
+        error_type: str | None = None,
+    ) -> dict[str, Any]:
+        if actor_kind not in self.ACTOR_KINDS:
+            raise InvalidState(f"非法 actor_kind：{actor_kind}")
+        if result_status not in self.RESULT_STATUSES:
+            raise InvalidState(f"非法 result_status：{result_status}")
+        log_id = new_id("tool")
+        with self.db.transaction() as conn:
+            actor_account_id: str | None = None
+            if actor_telegram_user_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(actor_telegram_user_id),),
+                ).fetchone()
+                if row:
+                    actor_account_id = row["id"]
+            conn.execute(
+                """
+                INSERT INTO tool_call_logs (
+                    id, actor_account_id, actor_telegram_user_id, actor_kind,
+                    session_id, tool_name, arguments_json,
+                    result_status, result_summary, error_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    log_id,
+                    actor_account_id,
+                    str(actor_telegram_user_id) if actor_telegram_user_id is not None else None,
+                    actor_kind,
+                    session_id,
+                    tool_name,
+                    json.dumps(arguments or {}, ensure_ascii=False),
+                    result_status,
+                    result_summary,
+                    error_type,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM tool_call_logs WHERE id = ?", (log_id,)
+            ).fetchone()
+            return dict(row)
+
+    def list_calls(
+        self,
+        *,
+        actor_telegram_user_id: str | int | None = None,
+        tool_name: str | None = None,
+        result_status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM tool_call_logs WHERE 1 = 1"
+        params: list[Any] = []
+        if actor_telegram_user_id is not None:
+            sql += " AND actor_telegram_user_id = ?"
+            params.append(str(actor_telegram_user_id))
+        if tool_name is not None:
+            sql += " AND tool_name = ?"
+            params.append(tool_name)
+        if result_status is not None:
+            if result_status not in self.RESULT_STATUSES:
+                raise InvalidState(f"非法 result_status：{result_status}")
+            sql += " AND result_status = ?"
+            params.append(result_status)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        with self.db.transaction() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_call(self, log_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tool_call_logs WHERE id = ?", (log_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"工具调用日志不存在：{log_id}")
+            return dict(row)
+
+    def log_success(
+        self,
+        *,
+        tool_name: str,
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        result_summary: str | None = None,
+    ) -> dict[str, Any]:
+        return self.log_call(
+            tool_name=tool_name,
+            actor_telegram_user_id=actor_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=arguments,
+            result_status="success",
+            result_summary=result_summary,
+        )
+
+    def log_failure(
+        self,
+        *,
+        tool_name: str,
+        actor_telegram_user_id: str | int | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        error: BaseException,
+        result_summary: str | None = None,
+    ) -> dict[str, Any]:
+        return self.log_call(
+            tool_name=tool_name,
+            actor_telegram_user_id=actor_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=arguments,
+            result_status="error",
+            error_type=type(error).__name__,
+            result_summary=result_summary or str(error)[:200],
+        )
+
+
+class SelfPromoService:
+    """Channel owners' free self-publishing entry — same 3-button layout as
+    paid placements, but no money moves and no advertiser/order is created.
+
+    Each publish is recorded so the 查看详情 deep link (start=sp_<id>) can
+    render the full ad page later, and so dashboards can audit the channel's
+    self-promo history.
+    """
+
+    PUBLISHABLE_FORMATS = {"standard_card", "strong_post"}
+
+    def __init__(self, db: Database, settings: Settings):
+        self.db = db
+        self.settings = settings
+        self.accounts = AccountService(db, settings)
+        self.channels = ChannelService(db, settings)
+        self.tool_calls = ToolCallLogService(db, settings)
+
+    def list_publishable_materials(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            account = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(publisher_telegram_user_id),),
+            ).fetchone()
+            if not account:
+                return []
+            rows = conn.execute(
+                """
+                SELECT * FROM creatives
+                WHERE advertiser_account_id = ?
+                  AND archived_at IS NULL
+                  AND format_type IN ('standard_card', 'strong_post')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 20
+                """,
+                (account["id"],),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_self_promo(self, self_promo_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"自用发布记录不存在：{self_promo_id}")
+            return dict(row)
+
+    def prepare_publish(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        material_id: str,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a pending self-promo row and return all data needed to send.
+
+        The actual `gateway.send_ad` call happens outside the DB transaction;
+        the caller writes the resulting message_id back via mark_sent /
+        mark_failed.
+        """
+        audit_args = {"channel_id": channel_id, "material_id": material_id}
+        try:
+            with self.db.transaction() as conn:
+                channel = self.channels.get_channel(conn, channel_id)
+                publisher = conn.execute(
+                    "SELECT * FROM accounts WHERE telegram_user_id = ?",
+                    (str(publisher_telegram_user_id),),
+                ).fetchone()
+                if not publisher or publisher["id"] != channel["owner_account_id"]:
+                    raise NotFound(f"频道不属于该用户：{channel_id}")
+                material = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ?", (material_id,)
+                ).fetchone()
+                if not material or material["advertiser_account_id"] != publisher["id"]:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if material["archived_at"]:
+                    raise InvalidState("广告素材已归档，无法用于自用发布")
+                if material["format_type"] not in self.PUBLISHABLE_FORMATS:
+                    raise InvalidState("自用发布暂只支持标准插播或定制插播素材")
+                self_promo_id = new_id("sp")
+                conn.execute(
+                    """
+                    INSERT INTO self_promo_publishes (
+                        id, channel_id, creative_id, publisher_account_id, status
+                    )
+                    VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (self_promo_id, channel["id"], material["id"], publisher["id"]),
+                )
+                prepared = {
+                    "self_promo_id": self_promo_id,
+                    "channel": dict(channel),
+                    "material": dict(material),
+                }
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="self_promo_prepare_publish",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="self_promo_prepare_publish",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"prepared {prepared['self_promo_id']}",
+        )
+        return prepared
+
+    def mark_sent(self, self_promo_id: str, *, message_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE self_promo_publishes
+                SET status = 'sent', message_id = ?, sent_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (message_id, iso(), self_promo_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            return dict(row)
+
+    def mark_failed(self, self_promo_id: str, *, error: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE self_promo_publishes
+                SET status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, self_promo_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+            ).fetchone()
+            return dict(row)
 
 
 class StarsPaymentService:
@@ -2861,6 +4545,7 @@ class PriceOfferService:
         self.channels = ChannelService(db, settings)
         self.pricing = PricingService(db, settings)
         self.ledger = LedgerService(db, settings)
+        self.materials = MaterialService(db, settings)
 
     def create_offer(
         self,
@@ -2974,11 +4659,7 @@ class PriceOfferService:
             raise InsufficientBalance("广告主插播余额不足，接受砍价后无法冻结预算")
 
         campaign_id = new_id("camp")
-        creative_id = new_id("cre")
         order_id = new_id("ord")
-        content_hash = hashlib.sha256(
-            f"{offer['creative_text']}|{offer['target_url']}|{offer['button_text']}".encode("utf-8")
-        ).hexdigest()
         scheduled_at = offer["scheduled_at"] or iso()
         conn.execute(
             """
@@ -2987,22 +4668,20 @@ class PriceOfferService:
             """,
             (campaign_id, offer["advertiser_account_id"], "砍价成交插播广告"),
         )
-        conn.execute(
-            """
-            INSERT INTO creatives (
-                id, campaign_id, text, target_url, button_text, category, content_hash
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                creative_id,
-                campaign_id,
-                offer["creative_text"],
-                offer["target_url"],
-                offer["button_text"],
-                offer["category"],
-                content_hash,
-            ),
+        material_format = (
+            offer["slot_type"]
+            if offer["slot_type"] in MaterialService.SUPPORTED_FORMATS
+            else "standard_card"
+        )
+        creative_id = self.materials.insert_material_in_conn(
+            conn,
+            advertiser_account_id=offer["advertiser_account_id"],
+            format_type=material_format,
+            text=offer["creative_text"],
+            target_url=offer["target_url"],
+            button_text=offer["button_text"],
+            category=offer["category"],
+            campaign_id=campaign_id,
         )
         conn.execute(
             """
@@ -3031,7 +4710,19 @@ class PriceOfferService:
             ),
         )
         self.ledger.reserve_budget(conn, offer["advertiser_account_id"], order_id, budget_cents, rate["currency"])
-        self._snapshot(conn, order_id, None, "creative", {"text": offer["creative_text"], "target_url": offer["target_url"], "button_text": offer["button_text"]})
+        self._snapshot(
+            conn,
+            order_id,
+            None,
+            "creative",
+            {
+                "text": offer["creative_text"],
+                "target_url": offer["target_url"],
+                "button_text": offer["button_text"],
+                "format_type": material_format,
+                "material_id": creative_id,
+            },
+        )
         self._snapshot(conn, order_id, None, "accepted_price_offer", dict(offer))
         self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": offer["offered_price_cents"], "price_offer_id": offer["id"]})
         self._snapshot(conn, order_id, None, "channel", channel)

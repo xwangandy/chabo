@@ -273,12 +273,16 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE TABLE IF NOT EXISTS creatives (
     id TEXT PRIMARY KEY,
     campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    advertiser_account_id TEXT REFERENCES accounts(id),
+    format_type TEXT NOT NULL DEFAULT 'standard_card',
     text TEXT NOT NULL,
     target_url TEXT NOT NULL,
     button_text TEXT NOT NULL DEFAULT '查看详情',
     category TEXT NOT NULL DEFAULT 'general',
+    light_short_text TEXT,
     status TEXT NOT NULL DEFAULT 'pending_review',
     content_hash TEXT NOT NULL,
+    archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -417,6 +421,65 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS topup_requests (
+    id TEXT PRIMARY KEY,
+    recipient_telegram_user_id TEXT NOT NULL,
+    recipient_account_id TEXT REFERENCES accounts(id),
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'USD',
+    reason TEXT NOT NULL,
+    evidence_url TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requester_account_id TEXT NOT NULL REFERENCES accounts(id),
+    request_note TEXT,
+    approver_account_id TEXT REFERENCES accounts(id),
+    approval_note TEXT,
+    settled_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (amount_cents > 0),
+    CHECK (status IN ('pending', 'approved', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_topup_requests_status ON topup_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_topup_requests_recipient ON topup_requests(recipient_telegram_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tool_call_logs (
+    id TEXT PRIMARY KEY,
+    actor_account_id TEXT REFERENCES accounts(id),
+    actor_telegram_user_id TEXT,
+    actor_kind TEXT NOT NULL DEFAULT 'human',
+    session_id TEXT,
+    tool_name TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    result_status TEXT NOT NULL,
+    result_summary TEXT,
+    error_type TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (actor_kind IN ('human', 'ai', 'admin', 'system')),
+    CHECK (result_status IN ('success', 'error'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_actor ON tool_call_logs(actor_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_telegram ON tool_call_logs(actor_telegram_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_call_logs_tool ON tool_call_logs(tool_name, created_at);
+
+CREATE TABLE IF NOT EXISTS self_promo_publishes (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    creative_id TEXT NOT NULL REFERENCES creatives(id),
+    publisher_account_id TEXT NOT NULL REFERENCES accounts(id),
+    message_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (status IN ('pending', 'sent', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_promo_channel ON self_promo_publishes(channel_id, created_at);
+
 CREATE TABLE IF NOT EXISTS bot_conversation_states (
     chat_id TEXT PRIMARY KEY,
     account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
@@ -463,6 +526,22 @@ class Database:
             conn.executescript(SCHEMA)
             self._migrate(conn)
 
+    def backup_to(self, target_path: str) -> str:
+        """Dump the live SQLite DB to target_path using the online backup API.
+
+        Returns the absolute path of the written file. Safe to run while the
+        primary process is serving — SQLite holds locks long enough to
+        get a consistent snapshot but does not block writers for the full
+        duration of the copy.
+        """
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target.unlink()
+        with self.connect() as source, sqlite3.connect(str(target)) as backup:
+            source.backup(backup)
+        return str(target.resolve())
+
     def _migrate(self, conn: sqlite3.Connection) -> None:
         statements = [
             "ALTER TABLE price_offers ADD COLUMN budget_cents INTEGER",
@@ -480,6 +559,10 @@ class Database:
             "ALTER TABLE deliveries ADD COLUMN platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE accounts ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
             "ALTER TABLE accounts ADD COLUMN timezone_confirmed_at TEXT",
+            "ALTER TABLE creatives ADD COLUMN advertiser_account_id TEXT REFERENCES accounts(id)",
+            "ALTER TABLE creatives ADD COLUMN format_type TEXT NOT NULL DEFAULT 'standard_card'",
+            "ALTER TABLE creatives ADD COLUMN light_short_text TEXT",
+            "ALTER TABLE creatives ADD COLUMN archived_at TEXT",
         ]
         for statement in statements:
             try:
@@ -487,6 +570,41 @@ class Database:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        self._backfill_creative_library(conn)
+
+    def _backfill_creative_library(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE creatives
+            SET advertiser_account_id = (
+                SELECT advertiser_account_id FROM campaigns
+                WHERE campaigns.id = creatives.campaign_id
+            )
+            WHERE advertiser_account_id IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE creatives
+            SET format_type = COALESCE((
+                SELECT ad_slots.slot_type FROM ad_orders
+                JOIN ad_slots ON ad_slots.id = ad_orders.slot_id
+                WHERE ad_orders.creative_id = creatives.id
+                ORDER BY ad_orders.created_at ASC
+                LIMIT 1
+            ), 'standard_card')
+            WHERE format_type = 'standard_card'
+              AND EXISTS (
+                SELECT 1 FROM ad_orders WHERE ad_orders.creative_id = creatives.id
+              )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creatives_advertiser ON creatives(advertiser_account_id, archived_at, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creatives_format ON creatives(advertiser_account_id, format_type, archived_at)"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

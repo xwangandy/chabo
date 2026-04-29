@@ -13,11 +13,15 @@ from .services import (
     DisputeService,
     LedgerService,
     LightProbeService,
+    MaterialService,
     OrderService,
     PriceOfferService,
     PricingService,
+    SelfPromoService,
     StarsPaymentService,
     SubscriptionService,
+    ToolCallLogService,
+    TopupApprovalService,
 )
 from .telegram import BotApiClient, MessageGateway, NullGateway
 
@@ -29,6 +33,7 @@ class ChaboApp:
     gateway: MessageGateway
     channels: ChannelService
     ledger: LedgerService
+    materials: MaterialService
     orders: OrderService
     disputes: DisputeService
     pricing: PricingService
@@ -36,6 +41,9 @@ class ChaboApp:
     subscriptions: SubscriptionService
     stars_payments: StarsPaymentService
     light_probes: LightProbeService
+    self_promos: SelfPromoService
+    tool_call_logs: ToolCallLogService
+    topup_approvals: TopupApprovalService
     advertiser_subscriptions: AdvertiserSubscriptionService
     advertisers: AdvertiserService
     fulfillment: FulfillmentService
@@ -54,6 +62,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         gateway=gateway,
         channels=ChannelService(db, settings),
         ledger=LedgerService(db, settings),
+        materials=MaterialService(db, settings),
         orders=OrderService(db, settings),
         disputes=DisputeService(db, settings),
         pricing=PricingService(db, settings),
@@ -61,6 +70,9 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         subscriptions=SubscriptionService(db, settings),
         stars_payments=StarsPaymentService(db, settings),
         light_probes=LightProbeService(db, settings),
+        self_promos=SelfPromoService(db, settings),
+        tool_call_logs=ToolCallLogService(db, settings),
+        topup_approvals=TopupApprovalService(db, settings),
         advertiser_subscriptions=AdvertiserSubscriptionService(db, settings),
         advertisers=AdvertiserService(db, settings),
         fulfillment=FulfillmentService(db, settings, gateway),

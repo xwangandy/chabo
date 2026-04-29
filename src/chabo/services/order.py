@@ -1177,6 +1177,51 @@ class OrderService:
             platform_fee_cents = amount_cents - publisher_net_cents
         return publisher_net_cents, platform_fee_cents
 
+    ADVERTISER_PAUSABLE_STATUSES = ("pending_review", "approved", "running")
+
+    def advertiser_pause_order(
+        self,
+        *,
+        order_id: str,
+        advertiser_telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        """Advertiser-initiated pause: refunds reserved budget on a live order.
+
+        Reuses ``pause_and_release`` so the existing ledger release + paused
+        notification fire identically. Ownership is enforced by joining on
+        the requester's account_id; terminal-status orders are rejected
+        (paused/done/refunded/budget_exhausted/rejected).
+        """
+        with self.db.transaction() as conn:
+            account_row = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not account_row:
+                raise NotFound(f"account not found: {advertiser_telegram_user_id}")
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ? AND advertiser_account_id = ?",
+                (order_id, account_row["id"]),
+            ).fetchone()
+            if not order:
+                raise NotFound(f"order not found: {order_id}")
+            previous_status = order["status"]
+            if previous_status not in self.ADVERTISER_PAUSABLE_STATUSES:
+                raise InvalidState(
+                    f"订单当前状态「{previous_status}」无法停止"
+                )
+            reason = "广告主主动停止投放"
+            self.pause_and_release(conn, order_id, reason)
+            self._audit(
+                conn,
+                account_row["id"],
+                "order_paused_by_advertiser",
+                "ad_order",
+                order_id,
+                {"reason": reason, "previous_status": previous_status},
+            )
+            return self.get_order(conn, order_id)
+
     def pause_and_release(self, conn: sqlite3.Connection, order_id: str, reason: str) -> None:
         order = self.get_order(conn, order_id)
         remaining = order["reserved_cents"]

@@ -300,7 +300,13 @@ class UpdateHandler:
             self._send_advertiser_orders(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_orders"}
         if data.startswith("advertiser:order:"):
-            order_id = data.removeprefix("advertiser:order:")
+            tail = data.removeprefix("advertiser:order:")
+            order_id, _, action = tail.partition(":")
+            if action == "stop":
+                self._send_advertiser_order_stop_confirm(chat_id, user, order_id, message)
+                return {"handled": True, "type": "callback_advertiser_order_stop_confirm", "order_id": order_id}
+            if action == "stop_yes":
+                return self._advertiser_stop_order(chat_id, user, order_id, message)
             self._send_advertiser_order_detail(chat_id, user, order_id, message)
             return {"handled": True, "type": "callback_advertiser_order_detail", "order_id": order_id}
         if data == "advertiser:order_help":
@@ -2042,15 +2048,115 @@ class UpdateHandler:
         else:
             lines.append("🚀 暂无发布记录")
 
+        keyboard: list[list[dict[str, str]]] = []
+        if order["status"] in self.orders.ADVERTISER_PAUSABLE_STATUSES:
+            keyboard.append([{"text": "⏸ 停止投放", "callback_data": f"advertiser:order:{order['id']}:stop"}])
+        keyboard.append([{"text": "📋 投放订单", "callback_data": "advertiser:orders"}])
+        keyboard.append([{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}])
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _send_advertiser_order_stop_confirm(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        order_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", user.get("first_name") or user.get("username")
+            )
+            order = conn.execute(
+                """
+                SELECT o.id, o.status, o.reserved_cents, c.title AS channel_title
+                FROM ad_orders o
+                JOIN channels c ON c.id = o.channel_id
+                WHERE o.id = ? AND o.advertiser_account_id = ?
+                """,
+                (order_id, account["id"]),
+            ).fetchone()
+        if not order:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 订单不存在或不属于你。",
+                inline_keyboard=[
+                    [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+        if order["status"] not in self.orders.ADVERTISER_PAUSABLE_STATUSES:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"ℹ️ 订单当前状态「{self._status_label(order['status'])}」无法停止。",
+                inline_keyboard=[
+                    [{"text": "📋 订单详情", "callback_data": f"advertiser:order:{order_id}"}],
+                    [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                ],
+            )
+            return
+        text = (
+            "⏸ 停止投放？\n\n"
+            f"📺 频道：{order['channel_title']}\n"
+            f"💵 将退回冻结预算 USD {cents_to_money(int(order['reserved_cents']))}\n\n"
+            "停止后已发布的广告不会撤回，仅取消未发的剩余排期。"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
             inline_keyboard=[
-                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
-                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "✅ 确认停止", "callback_data": f"advertiser:order:{order_id}:stop_yes"}],
+                [{"text": "↩️ 不停止，返回详情", "callback_data": f"advertiser:order:{order_id}"}],
             ],
         )
+
+    def _advertiser_stop_order(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        order_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = user.get("id") or chat_id
+        try:
+            self.orders.advertiser_pause_order(
+                order_id=order_id,
+                advertiser_telegram_user_id=user_id,
+            )
+        except NotFound:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 订单不存在或不属于你。",
+                inline_keyboard=[
+                    [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return {"handled": True, "type": "callback_advertiser_order_stop_not_found", "order_id": order_id}
+        except InvalidState as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"ℹ️ 无法停止：{exc}",
+                inline_keyboard=[
+                    [{"text": "📋 订单详情", "callback_data": f"advertiser:order:{order_id}"}],
+                    [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                ],
+            )
+            return {"handled": True, "type": "callback_advertiser_order_stop_invalid", "order_id": order_id}
+        # 成功 — pause_and_release 已发了"投放已暂停"私信,这里直接刷回详情让用户立刻看到新状态
+        self._send_advertiser_order_detail(chat_id, user, order_id, source_message)
+        return {"handled": True, "type": "callback_advertiser_order_stopped", "order_id": order_id}
 
     def _delivery_status_icon(self, status: str) -> str:
         return {

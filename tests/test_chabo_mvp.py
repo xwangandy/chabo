@@ -2167,6 +2167,126 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("❌", detail_text)
         self.assertIn("原因", detail_text)
 
+    def test_advertiser_can_stop_running_order_and_get_budget_back(self) -> None:
+        _, order = self.create_approved_order(budget="10")
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Detail view should expose the stop button while order is approvable
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_detail_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard_before = self._last_user_facing_keyboard()
+        stop_buttons = [
+            b for row in keyboard_before for b in row if b["callback_data"].endswith(":stop")
+        ]
+        self.assertEqual(len(stop_buttons), 1)
+
+        # Tap stop → second confirmation page mentions refund amount
+        confirm = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_confirm",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop",
+                }
+            }
+        )
+        self.assertEqual(confirm["type"], "callback_advertiser_order_stop_confirm")
+        self.assertIn("USD 10.00", self._last_user_facing_text())
+
+        # Confirm stop → status becomes paused, budget refunded, paused notification fires
+        self.gateway.private_messages.clear()
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_yes",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stopped")
+
+        with self.app.db.transaction() as conn:
+            saved = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (order["id"],)).fetchone()
+            advertiser = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["reserved_cents"], 0)
+        self.assertEqual(advertiser["available_balance_cents"], 1000)
+
+        # Pause notification should have been sent
+        pause_notifs = [m for m in self.gateway.private_messages if "投放已暂停" in m["text"]]
+        self.assertEqual(len(pause_notifs), 1)
+        self.assertIn("广告主主动停止投放", pause_notifs[0]["text"])
+
+        # Detail page no longer shows stop button (terminal state)
+        keyboard_after = self._last_user_facing_keyboard()
+        stop_buttons_after = [
+            b for row in keyboard_after for b in row if b["callback_data"].endswith(":stop")
+        ]
+        self.assertEqual(stop_buttons_after, [])
+
+        # Audit row recorded
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT * FROM audit_logs WHERE entity_id = ? AND action = 'order_paused_by_advertiser'",
+                (order["id"],),
+            ).fetchone()
+        self.assertIsNotNone(audit)
+
+    def test_advertiser_stop_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(99999, display_name="他人")
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_steal",
+                    "from": {"id": 99999, "first_name": "他人"},
+                    "message": {"chat": {"id": 99999}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stop_not_found")
+
+        # Original order should be untouched
+        with self.app.db.transaction() as conn:
+            saved = conn.execute("SELECT status FROM ad_orders WHERE id = ?", (order["id"],)).fetchone()
+        self.assertEqual(saved["status"], "approved")
+
+    def test_advertiser_stop_blocks_already_paused_order(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        # First stop succeeds
+        self.app.orders.advertiser_pause_order(
+            order_id=order["id"],
+            advertiser_telegram_user_id=10001,
+        )
+
+        # Trying again must be rejected with a friendly message
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_again",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stop_invalid")
+        self.assertIn("无法停止", self._last_user_facing_text())
+
     def test_placement_slot_switch_preserves_per_slot_creative_draft(self) -> None:
         channel = self.bind_channel()
         self.confirm_timezone(10001, display_name="广告主")

@@ -238,6 +238,129 @@ class MaterialService:
         )
         return material
 
+    EDITABLE_FIELDS = ("text", "target_url", "button_text", "light_short_text")
+
+    def update_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int,
+        text: str | None = None,
+        target_url: str | None = None,
+        button_text: str | None = None,
+        light_short_text: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update editable fields of an active (non-archived) material.
+
+        Pass None to leave a field untouched; the format_type is immutable
+        (different formats = different products). Existing orders carry
+        creative snapshots written at create-time, so this only affects
+        future placements that pick the material.
+        """
+        provided = {
+            "text": text,
+            "target_url": target_url,
+            "button_text": button_text,
+            "light_short_text": light_short_text,
+        }
+        audit_args = {
+            "material_id": material_id,
+            "updated_fields": [k for k, v in provided.items() if v is not None],
+        }
+        try:
+            if not any(v is not None for v in provided.values()):
+                raise InvalidState("没有可更新的字段")
+            with self.db.transaction() as conn:
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                row = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ? AND advertiser_account_id = ?",
+                    (material_id, advertiser["id"]),
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if row["archived_at"]:
+                    raise InvalidState("已归档的素材无法编辑，请新建一条素材。")
+
+                new_text = row["text"] if text is None else (text or "").strip()
+                new_target_url = (
+                    row["target_url"] if target_url is None else (target_url or "").strip()
+                )
+                if button_text is None:
+                    new_button_text = row["button_text"]
+                else:
+                    new_button_text = (button_text or "").strip() or "查看详情"
+
+                if not new_text:
+                    raise InvalidState("广告素材文案不能为空")
+                if not new_target_url:
+                    raise InvalidState("广告素材必须包含目标链接")
+
+                if row["format_type"] == "light_tail":
+                    if light_short_text is None:
+                        new_short = row["light_short_text"]
+                    else:
+                        short = (light_short_text or "").strip()
+                        if len(short) < self.LIGHT_SHORT_TEXT_MIN:
+                            raise InvalidState(
+                                f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
+                            )
+                        if len(short) > self.LIGHT_SHORT_TEXT_MAX:
+                            raise InvalidState(
+                                f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
+                            )
+                        new_short = short
+                else:
+                    new_short = None
+
+                content_hash = hashlib.sha256(
+                    f"{row['format_type']}|{new_short or ''}|{new_text}|{new_target_url}|{new_button_text}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                conn.execute(
+                    """
+                    UPDATE creatives
+                    SET text = ?, target_url = ?, button_text = ?, light_short_text = ?,
+                        content_hash = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        new_text,
+                        new_target_url,
+                        new_button_text,
+                        new_short,
+                        content_hash,
+                        material_id,
+                    ),
+                )
+                material = self._fetch_material(conn, material_id)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="update_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="update_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"updated {material_id}",
+        )
+        return material
+
     # ------ helpers reusable from OrderService inside an open transaction ------
 
     def insert_material_in_conn(

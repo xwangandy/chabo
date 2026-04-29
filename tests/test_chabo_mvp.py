@@ -2167,6 +2167,169 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("❌", detail_text)
         self.assertIn("原因", detail_text)
 
+    def test_material_edit_text_via_bot_updates_creative_and_renders_panel(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始文案",
+            target_url="https://example.com/orig",
+        )
+
+        # Library page → tap ✏️
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        edit_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:material:edit:")
+        ]
+        self.assertEqual(len(edit_buttons), 1)
+        self.assertEqual(edit_buttons[0]["callback_data"], f"advertiser:material:edit:{material['id']}")
+
+        # Edit panel
+        panel = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_edit_panel",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:material:edit:{material['id']}",
+                }
+            }
+        )
+        self.assertEqual(panel["type"], "callback_material_edit_panel")
+        panel_text = self._last_user_facing_text()
+        self.assertIn("编辑素材", panel_text)
+        self.assertIn("原始文案", panel_text)
+
+        # Tap 文案
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_edit_field_text",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:material:field:{material['id']}:text",
+                }
+            }
+        )
+        self.assertIn("请发送新的广告文案", self._last_user_facing_text())
+
+        # Send replacement text
+        send_result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "全新升级文案",
+                }
+            }
+        )
+        self.assertEqual(send_result["type"], "material_edit_saved")
+
+        refreshed = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed["text"], "全新升级文案")
+        self.assertEqual(refreshed["target_url"], "https://example.com/orig")
+        self.assertNotEqual(refreshed["content_hash"], material["content_hash"])
+
+    def test_material_edit_does_not_alter_existing_order_snapshot(self) -> None:
+        channel, order = self.create_approved_order()
+        # The order's creative came from inline create_order; locate it
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT creative_id FROM ad_orders WHERE id = ?", (order["id"],)
+            ).fetchone()
+            material_id = row["creative_id"]
+            snapshot_before = conn.execute(
+                "SELECT payload_json FROM evidence_snapshots WHERE order_id = ? AND snapshot_type = 'creative'",
+                (order["id"],),
+            ).fetchone()["payload_json"]
+
+        self.app.materials.update_material(
+            material_id,
+            advertiser_telegram_user_id=10001,
+            text="修改后的文案",
+        )
+
+        with self.app.db.transaction() as conn:
+            snapshot_after = conn.execute(
+                "SELECT payload_json FROM evidence_snapshots WHERE order_id = ? AND snapshot_type = 'creative'",
+                (order["id"],),
+            ).fetchone()["payload_json"]
+        self.assertEqual(snapshot_before, snapshot_after)
+        refreshed = self.app.materials.get_material(material_id)
+        self.assertEqual(refreshed["text"], "修改后的文案")
+
+    def test_material_edit_blocks_archived_material(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="将被归档",
+            target_url="https://example.com/x",
+        )
+        self.app.materials.archive_material(material["id"], advertiser_telegram_user_id=10001)
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                text="不能改",
+            )
+
+    def test_material_edit_rejects_other_users_material(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="A 的素材",
+            target_url="https://example.com/a",
+        )
+        with self.assertRaises(NotFound):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=99999,
+                text="B 想偷改",
+            )
+        unchanged = self.app.materials.get_material(material["id"])
+        self.assertEqual(unchanged["text"], "A 的素材")
+
+    def test_material_edit_light_short_text_validates_length(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="文字插播完整文案",
+            target_url="https://example.com",
+            light_short_text="想投广告？",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                light_short_text="x",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                light_short_text="一" * 16,
+            )
+        # within bounds OK
+        self.app.materials.update_material(
+            material["id"],
+            advertiser_telegram_user_id=10001,
+            light_short_text="新短入口文案",
+        )
+        refreshed = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed["light_short_text"], "新短入口文案")
+
     def test_advertiser_can_stop_running_order_and_get_budget_back(self) -> None:
         _, order = self.create_approved_order(budget="10")
         self.confirm_timezone(10001, display_name="广告主")

@@ -296,6 +296,15 @@ class UpdateHandler:
         if data == "advertiser:library":
             self._send_advertiser_library(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_library"}
+        if data.startswith("advertiser:material:edit:"):
+            material_id = data.removeprefix("advertiser:material:edit:")
+            self._send_material_edit_panel(chat_id, user, material_id, message)
+            return {"handled": True, "type": "callback_material_edit_panel", "material_id": material_id}
+        if data.startswith("advertiser:material:field:"):
+            tail = data.removeprefix("advertiser:material:field:")
+            material_id, _, field = tail.partition(":")
+            self._begin_material_field_edit(chat_id, user, material_id, field, message)
+            return {"handled": True, "type": "callback_material_edit_field", "material_id": material_id, "field": field}
         if data == "advertiser:orders":
             self._send_advertiser_orders(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_orders"}
@@ -1292,11 +1301,14 @@ class UpdateHandler:
         lines = ["🗂 广告库", ""]
         if creatives:
             for index, creative in enumerate(creatives, start=1):
+                number = self.ORDER_LIST_NUMBERS[index - 1] if index <= len(self.ORDER_LIST_NUMBERS) else f"{index}."
                 text = (creative["text"] or "").replace("\n", " ")
                 if len(text) > 28:
                     text = text[:28] + "..."
-                lines.append(f"{index}. {text}")
-                lines.append(f"   {self._creative_status_label(creative['status'])} · {creative['button_text']}")
+                lines.append(f"{number} {text}")
+                lines.append(
+                    f"   {self._creative_status_label(creative['status'])} · {self._slot_name(creative['format_type'])} · {creative['button_text']}"
+                )
         else:
             lines.extend(
                 [
@@ -1304,16 +1316,226 @@ class UpdateHandler:
                     "先从频道里的“频道招商”进入，创建第一条插播。",
                 ]
             )
+        keyboard: list[list[dict[str, str]]] = []
+        if creatives:
+            edit_buttons = [
+                {
+                    "text": f"✏️ {self.ORDER_LIST_NUMBERS[i] if i < len(self.ORDER_LIST_NUMBERS) else str(i + 1)}",
+                    "callback_data": f"advertiser:material:edit:{creative['id']}",
+                }
+                for i, creative in enumerate(creatives)
+            ]
+            keyboard.append(edit_buttons)
+        keyboard.append([{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}])
+        keyboard.append(
+            [
+                {"text": "📋 投放订单", "callback_data": "advertiser:orders"},
+                {"text": "💰 广告钱包", "callback_data": "advertiser:balance"},
+            ]
+        )
+        keyboard.append(
+            [
+                {"text": "💵 定价规则", "callback_data": "publisher:pricing"},
+                {"text": "🏠 主菜单", "callback_data": "menu:home"},
+            ]
+        )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    MATERIAL_EDIT_FIELDS: dict[str, dict[str, str]] = {
+        "text": {"label": "📝 文案", "prompt": "请发送新的广告文案。"},
+        "target_url": {
+            "label": "🔗 目标链接",
+            "prompt": "请发送新的目标链接，必须以 http:// 或 https:// 开头。",
+        },
+        "button_text": {"label": "🔘 按钮文案", "prompt": "请发送新的按钮文案。"},
+        "light_short_text": {
+            "label": "✨ 短入口",
+            "prompt": "请发送新的短入口（2-15 个字，仅文字插播）。",
+        },
+    }
+
+    def _send_material_edit_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        material_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            material = self.materials.get_material(
+                material_id, advertiser_telegram_user_id=user_id
+            )
+        except NotFound:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 素材不存在或不属于你。",
+                inline_keyboard=[
+                    [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+        if material["archived_at"]:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="ℹ️ 已归档的素材无法编辑，请回到广告库新建一条。",
+                inline_keyboard=[
+                    [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+
+        # 清掉残留的 material_edit 对话(用户切到别的素材时不要污染上下文)
+        self._clear_material_edit_state(chat_id)
+
+        text_preview = (material["text"] or "").replace("\n", " ")
+        if len(text_preview) > 60:
+            text_preview = text_preview[:60] + "..."
+        body_lines = [
+            "✏️ 编辑素材",
+            "",
+            f"形态：{self._slot_name(material['format_type'])}",
+            f"文案：{text_preview or '—'}",
+            f"链接：{material['target_url'] or '—'}",
+            f"按钮文案：{material['button_text']}",
+        ]
+        if material["format_type"] == "light_tail":
+            body_lines.append(f"短入口：{material['light_short_text'] or '—'}")
+        body_lines.extend([
+            "",
+            "选一个字段修改。已发布订单的展示快照不变，仅影响后续投放。",
+        ])
+
+        field_keys = ["text", "target_url", "button_text"]
+        if material["format_type"] == "light_tail":
+            field_keys.append("light_short_text")
+        field_buttons = [
+            {
+                "text": self.MATERIAL_EDIT_FIELDS[key]["label"],
+                "callback_data": f"advertiser:material:field:{material_id}:{key}",
+            }
+            for key in field_keys
+        ]
+        keyboard = self._button_grid(field_buttons, 2)
+        keyboard.append([{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(body_lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _begin_material_field_edit(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        material_id: str,
+        field: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        if field not in self.MATERIAL_EDIT_FIELDS:
+            self._send_material_edit_panel(chat_id, user, material_id, source_message)
+            return
+        user_id = user.get("id") or chat_id
+        try:
+            material = self.materials.get_material(
+                material_id, advertiser_telegram_user_id=user_id
+            )
+        except NotFound:
+            self._send_material_edit_panel(chat_id, user, material_id, source_message)
+            return
+        if material["archived_at"]:
+            self._send_material_edit_panel(chat_id, user, material_id, source_message)
+            return
+        if field == "light_short_text" and material["format_type"] != "light_tail":
+            self._send_material_edit_panel(chat_id, user, material_id, source_message)
+            return
+
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", self._display_name(user)
+            )
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                account["id"],
+                "material_edit",
+                field,
+                {"material_id": material_id, "field": field},
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=self.MATERIAL_EDIT_FIELDS[field]["prompt"],
             inline_keyboard=[
-                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
-                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
-                [{"text": "💵 定价规则", "callback_data": "publisher:pricing"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "↩️ 取消", "callback_data": f"advertiser:material:edit:{material_id}"}],
             ],
         )
+
+    def _handle_material_edit_message(
+        self,
+        message: dict[str, Any],
+        state: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        payload = json.loads(state["payload_json"] or "{}")
+        material_id = payload.get("material_id")
+        field = state["step"]
+        if not material_id or field not in self.MATERIAL_EDIT_FIELDS:
+            self._clear_material_edit_state(chat_id)
+            return {"handled": True, "type": "material_edit_invalid_state"}
+        clean_text = (text or "").strip()
+        if not clean_text:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="内容不能为空，请重新发送或点击取消。",
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:material:edit:{material_id}"}]],
+            )
+            return {"handled": True, "type": "material_edit_empty"}
+        user_id = user.get("id") or chat_id
+        kwargs: dict[str, Any] = {field: clean_text}
+        try:
+            self.materials.update_material(
+                material_id,
+                advertiser_telegram_user_id=user_id,
+                **kwargs,
+            )
+        except (InvalidState, NotFound) as exc:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text=f"⚠️ 保存失败：{exc}",
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:material:edit:{material_id}"}]],
+            )
+            return {"handled": True, "type": "material_edit_failed", "error": str(exc)}
+        self._clear_material_edit_state(chat_id)
+        self._send_material_edit_panel(chat_id, user, material_id, None)
+        return {"handled": True, "type": "material_edit_saved", "material_id": material_id, "field": field}
+
+    def _clear_material_edit_state(self, chat_id: str | int) -> None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+            if row and row["flow"] == "material_edit":
+                conn.execute(
+                    "DELETE FROM bot_conversation_states WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
 
     def _send_publisher_menu(
         self,
@@ -1747,6 +1969,8 @@ class UpdateHandler:
             return self._handle_publisher_onboarding_message(message, state)
         if state["flow"] == "placement_config":
             return self._handle_placement_message(message, state, text)
+        if state["flow"] == "material_edit":
+            return self._handle_material_edit_message(message, state, text)
         if state["flow"] != "create_order":
             return {"handled": False, "reason": "unsupported_conversation"}
         if not text:

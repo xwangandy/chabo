@@ -2167,6 +2167,130 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("❌", detail_text)
         self.assertIn("原因", detail_text)
 
+    def test_advertiser_menu_exposes_discover_entry_point(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        discover = [b for b in all_buttons if b["callback_data"] == "advertiser:discover"]
+        self.assertEqual(len(discover), 1)
+        self.assertEqual(discover[0]["text"], "🔍 找频道")
+
+    def test_advertiser_discover_lists_assessed_channels_with_play_buttons(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_discover",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_discover")
+        body = self._last_user_facing_text()
+        self.assertIn("找频道", body)
+        self.assertIn(channel["title"], body)
+        self.assertIn("软件", body)
+        self.assertIn("订阅", body)
+
+        keyboard = self._last_user_facing_keyboard()
+        play_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("channel:order:")
+        ]
+        self.assertEqual(len(play_buttons), 1)
+        self.assertEqual(play_buttons[0]["callback_data"], f"channel:order:{channel['id']}")
+
+    def test_advertiser_discover_empty_state_guides_user(self) -> None:
+        # No channels assessed yet
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_discover_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("暂无", body)
+        self.assertIn("频道招商", body)  # nudge to alternate entry point
+
+    def test_advertiser_discover_play_button_starts_placement_flow(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        # Tap discover → tap ▶
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        play = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_play",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.assertEqual(play["type"], "callback_order_flow_started")
+        # placement_config conversation should be set up for this channel
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        self.assertEqual(state["flow"], "placement_config")
+        payload = json.loads(state["payload_json"])
+        self.assertEqual(payload["channel_id"], channel["id"])
+
     def test_library_create_button_walks_standard_format_end_to_end(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
 

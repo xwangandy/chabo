@@ -296,6 +296,9 @@ class UpdateHandler:
         if data == "advertiser:library":
             self._send_advertiser_library(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_library"}
+        if data == "advertiser:discover":
+            self._send_advertiser_discover(chat_id, user, message)
+            return {"handled": True, "type": "callback_advertiser_discover"}
         if data == "advertiser:material:new":
             self._send_material_format_picker(chat_id, user, message)
             return {"handled": True, "type": "callback_material_new_picker"}
@@ -614,11 +617,91 @@ class UpdateHandler:
                 f"🔒 冻结：USD {reserved:.2f}"
             ),
             inline_keyboard=[
-                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
+                [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}],
                 [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
                 [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
-                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
             ],
+        )
+
+    DISCOVER_LIST_NUMBERS = ("①", "②", "③", "④", "⑤")
+    DISCOVER_PAGE_LIMIT = 5
+    DISCOVER_RISK_EMOJI = {
+        "normal": "🟢",
+        "watch": "🟡",
+        "high": "🟠",
+        "blocked": "🔴",
+    }
+
+    def _send_advertiser_discover(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            channels = self.advertisers.discover_channels(
+                advertiser_telegram_user_id=user_id,
+                slot_type="standard_card",
+                limit=self.DISCOVER_PAGE_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning("discover_channels_failed user=%s error=%s", user_id, exc)
+            channels = []
+
+        lines = ["🔍 找频道", ""]
+        if not channels:
+            lines.extend([
+                "暂无符合条件的频道。",
+                "",
+                "想绕开列表?也可以从频道帖底部的「📣 频道招商」按钮进入。",
+            ])
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="\n".join(lines),
+                inline_keyboard=[
+                    [{"text": "📣 我的广告", "callback_data": "role:advertiser"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+
+        for index, channel in enumerate(channels):
+            number = self.DISCOVER_LIST_NUMBERS[index] if index < len(self.DISCOVER_LIST_NUMBERS) else f"{index + 1}."
+            risk_emoji = self.DISCOVER_RISK_EMOJI.get(channel.get("risk_level"), "⚪️")
+            category_label = self.CATEGORY_VALUE.get(channel.get("category") or "general", ("通用", ""))[0]
+            subscribers = int(channel.get("subscribers") or 0)
+            views = int(channel.get("median_24h_views") or 0)
+            price = cents_to_money(int(channel.get("list_price_cents") or 0))
+            lines.append(f"{number} {channel['title']}")
+            lines.append(
+                f"   🏷 {category_label} · {risk_emoji} 风控 · ⭐ {channel.get('score') or 0}"
+            )
+            lines.append(
+                f"   👥 {subscribers:,} 订阅 · 📈 {views:,} 浏览/24h · 💵 标准插播 USD {price}"
+            )
+        lines.append("")
+        lines.append("点 ▶ 进入投放配置（也可从频道帖按钮进入）。")
+
+        action_buttons = [
+            {
+                "text": f"▶ {self.DISCOVER_LIST_NUMBERS[i] if i < len(self.DISCOVER_LIST_NUMBERS) else str(i + 1)}",
+                "callback_data": f"channel:order:{channel['channel_id']}",
+            }
+            for i, channel in enumerate(channels)
+        ]
+        keyboard = [action_buttons]
+        keyboard.append([
+            {"text": "📣 我的广告", "callback_data": "role:advertiser"},
+            {"text": "🏠 主菜单", "callback_data": "menu:home"},
+        ])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
         )
 
     def _send_channel_sales_landing(

@@ -2377,6 +2377,51 @@ class ChaboMvpTest(unittest.TestCase):
             ).fetchone()
         self.assertTrue(state is None or state["flow"] != "batch_orders")
 
+    def test_batch_flow_acknowledges_stray_text_in_select_channels_step(self) -> None:
+        """bug_004: typed text in select_channels must get a friendly hint, not silence."""
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量素材",
+            target_url="https://example.com",
+        )
+        channel_a, _ = self._seed_two_assessed_channels()
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_hint",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 50,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "怎么全选所有频道?",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "batch_orders_text_hint")
+        self.assertIn("按钮", self.gateway.private_messages[-1]["text"])
+        # Conversation state must remain on select_channels
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT step FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertEqual(state["step"], "select_channels")
+
     def test_batch_flow_blocks_archived_material(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         material = self.app.materials.create_material(

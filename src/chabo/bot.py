@@ -296,6 +296,13 @@ class UpdateHandler:
         if data == "advertiser:library":
             self._send_advertiser_library(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_library"}
+        if data == "advertiser:material:new":
+            self._send_material_format_picker(chat_id, user, message)
+            return {"handled": True, "type": "callback_material_new_picker"}
+        if data.startswith("advertiser:material:new:"):
+            format_type = data.removeprefix("advertiser:material:new:")
+            self._begin_material_create(chat_id, user, format_type, message)
+            return {"handled": True, "type": "callback_material_new_started", "format_type": format_type}
         if data.startswith("advertiser:material:edit:"):
             material_id = data.removeprefix("advertiser:material:edit:")
             self._send_material_edit_panel(chat_id, user, material_id, message)
@@ -1326,7 +1333,10 @@ class UpdateHandler:
                 for i, creative in enumerate(creatives)
             ]
             keyboard.append(edit_buttons)
-        keyboard.append([{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}])
+        keyboard.append([
+            {"text": "➕ 新建素材", "callback_data": "advertiser:material:new"},
+            {"text": "🧾 去频道投放", "callback_data": "advertiser:order_help"},
+        ])
         keyboard.append(
             [
                 {"text": "📋 投放订单", "callback_data": "advertiser:orders"},
@@ -1532,6 +1542,204 @@ class UpdateHandler:
                 (str(chat_id),),
             ).fetchone()
             if row and row["flow"] == "material_edit":
+                conn.execute(
+                    "DELETE FROM bot_conversation_states WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
+
+    def _send_material_format_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        text = (
+            "➕ 新建素材\n\n"
+            "选择形态。素材会保存到你的广告库，下单时可重复挑选。\n"
+            "• 文字插播：频道帖底部短入口，点击进入详情\n"
+            "• 标准插播：图文卡片，平台模板\n"
+            "• 定制插播：广告主自由排版"
+        )
+        keyboard = [
+            [{"text": "✍️ 文字插播", "callback_data": "advertiser:material:new:light_tail"}],
+            [{"text": "🧾 标准插播", "callback_data": "advertiser:material:new:standard_card"}],
+            [{"text": "🎨 定制插播", "callback_data": "advertiser:material:new:strong_post"}],
+            [{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}],
+        ]
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=keyboard,
+        )
+
+    def _begin_material_create(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        format_type: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        if format_type not in MaterialService.SUPPORTED_FORMATS:
+            self._send_material_format_picker(chat_id, user, source_message)
+            return
+        user_id = user.get("id") or chat_id
+        first_step = "light_short_text" if format_type == "light_tail" else "creative_text"
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", self._display_name(user)
+            )
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                account["id"],
+                "material_create",
+                first_step,
+                {"format_type": format_type},
+            )
+        if format_type == "light_tail":
+            prompt = (
+                "✍️ 新建文字插播\n\n"
+                "短入口最多 15 个字，会显示在频道帖底部。\n"
+                "请发送短入口。"
+            )
+        else:
+            label = self._slot_name(format_type)
+            prompt = (
+                f"➕ 新建{label}素材\n\n"
+                "请发送广告文案（4-800 字）。下一步会要链接和按钮文案。"
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=prompt,
+            inline_keyboard=[
+                [{"text": "↩️ 取消", "callback_data": "advertiser:material:new"}],
+                [{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}],
+            ],
+        )
+
+    def _handle_material_create_message(
+        self,
+        message: dict[str, Any],
+        state: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        clean_text = (text or "").strip()
+        payload = json.loads(state["payload_json"] or "{}")
+        format_type = payload.get("format_type")
+        step = state["step"]
+        cancel_keyboard = [[{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}]]
+
+        if not clean_text:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="请发送文字内容，或点击返回广告库。",
+                inline_keyboard=cancel_keyboard,
+            )
+            return {"handled": True, "type": "material_create_text_required"}
+
+        if step == "light_short_text":
+            if len(clean_text) < 2 or len(clean_text) > 15:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text="文字插播短入口需要 2-15 个字。",
+                    inline_keyboard=cancel_keyboard,
+                )
+                return {"handled": True, "type": "material_create_invalid_short"}
+            payload["light_short_text"] = clean_text
+            payload["button_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "material_create", "light_detail_text", payload)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="✅ 短入口已保存\n\n请发送完整广告详情（4-1000 字），用户点击短入口后会看到这段。",
+                inline_keyboard=cancel_keyboard,
+            )
+            return {"handled": True, "type": "material_create_short_saved"}
+
+        if step == "light_detail_text":
+            if len(clean_text) < 4 or len(clean_text) > 1000:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text="广告详情需要 4-1000 个字。",
+                    inline_keyboard=cancel_keyboard,
+                )
+                return {"handled": True, "type": "material_create_invalid_detail"}
+            payload["creative_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "material_create", "target_url", payload)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="请发送广告目标链接，必须以 http:// 或 https:// 开头。",
+                inline_keyboard=cancel_keyboard,
+            )
+            return {"handled": True, "type": "material_create_detail_saved"}
+
+        if step == "creative_text":
+            if len(clean_text) < 4 or len(clean_text) > 800:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text="广告文案需要 4-800 个字。",
+                    inline_keyboard=cancel_keyboard,
+                )
+                return {"handled": True, "type": "material_create_invalid_text"}
+            payload["creative_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "material_create", "target_url", payload)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="请发送广告目标链接，必须以 http:// 或 https:// 开头。",
+                inline_keyboard=cancel_keyboard,
+            )
+            return {"handled": True, "type": "material_create_text_saved"}
+
+        if step == "target_url":
+            if not (clean_text.startswith("https://") or clean_text.startswith("http://")):
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text="链接格式不对。请发送以 http:// 或 https:// 开头的目标链接。",
+                    inline_keyboard=cancel_keyboard,
+                )
+                return {"handled": True, "type": "material_create_invalid_url"}
+            user_id = user.get("id") or chat_id
+            try:
+                material = self.materials.create_material(
+                    advertiser_telegram_user_id=user_id,
+                    format_type=format_type,
+                    text=payload.get("creative_text") or "",
+                    target_url=clean_text,
+                    button_text=payload.get("button_text") or "查看详情",
+                    light_short_text=payload.get("light_short_text"),
+                    display_name=self._display_name(user) or None,
+                )
+            except (InvalidState, NotFound) as exc:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ 素材保存失败：{exc}",
+                    inline_keyboard=cancel_keyboard,
+                )
+                return {"handled": True, "type": "material_create_failed", "error": str(exc)}
+            self._clear_material_create_state(chat_id)
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text=f"✅ 素材已保存（ID {material['id']}）",
+                inline_keyboard=[[{"text": "🗂 广告库", "callback_data": "advertiser:library"}]],
+            )
+            self._send_advertiser_library(chat_id, user, None)
+            return {"handled": True, "type": "material_create_saved", "material_id": material["id"]}
+
+        return {"handled": False, "reason": "unknown_material_create_step"}
+
+    def _clear_material_create_state(self, chat_id: str | int) -> None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+            if row and row["flow"] == "material_create":
                 conn.execute(
                     "DELETE FROM bot_conversation_states WHERE chat_id = ?",
                     (str(chat_id),),
@@ -1971,6 +2179,8 @@ class UpdateHandler:
             return self._handle_placement_message(message, state, text)
         if state["flow"] == "material_edit":
             return self._handle_material_edit_message(message, state, text)
+        if state["flow"] == "material_create":
+            return self._handle_material_create_message(message, state, text)
         if state["flow"] != "create_order":
             return {"handled": False, "reason": "unsupported_conversation"}
         if not text:

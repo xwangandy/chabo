@@ -21,7 +21,7 @@ class FulfillmentService:
         self.db = db
         self.settings = settings
         self.gateway = gateway
-        self.channels = ChannelService(db, settings)
+        self.channels = ChannelService(db, settings, gateway=gateway)
         self.ledger = LedgerService(db, settings)
         self.orders = OrderService(db, settings, gateway=gateway)
 

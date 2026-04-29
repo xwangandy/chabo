@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -10,6 +11,9 @@ from ..config import Settings
 from ..db import Database
 from ..ids import new_id, new_ref_token
 from ..money import bps_amount
+
+
+logger = logging.getLogger(__name__)
 
 from ._common import (
     ChaboError,
@@ -42,9 +46,16 @@ class ChannelService:
         "loop_daily": ("per_day", 800),
     }
 
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(self, db: Database, settings: Settings, gateway: Any | None = None):
+        """Optional gateway is used for advertiser notifications.
+
+        When None, set_format_policy / similar publisher-driven changes do
+        not push notifications to affected advertisers — keeps internal
+        / non-user-facing instances pure.
+        """
         self.db = db
         self.settings = settings
+        self.gateway = gateway
         self.accounts = AccountService(db, settings)
         self.tool_calls = ToolCallLogService(db, settings)
 
@@ -291,13 +302,18 @@ class ChannelService:
         if format_type not in self.DEFAULT_RATES:
             raise NotFound(f"unknown ad format: {format_type}")
         with self.db.transaction() as conn:
-            self.get_channel(conn, channel_id)
+            channel = self.get_channel(conn, channel_id)
             from .billing import SubscriptionService
             has_premium = SubscriptionService.has_active_subscription(conn, channel_id)
             wants_advanced = (not platform_promo_enabled) or owner_price_band == "custom" or custom_multiplier_bps is not None
             if wants_advanced and not has_premium:
                 raise InvalidState("该配置属于频道高级功能，需要先开通频道高级订阅")
             self._ensure_default_format_policies(conn, channel_id)
+            previous = conn.execute(
+                "SELECT enabled, owner_price_band FROM channel_ad_format_policies "
+                "WHERE channel_id = ? AND format_type = ?",
+                (channel_id, format_type),
+            ).fetchone()
             conn.execute(
                 """
                 UPDATE channel_ad_format_policies
@@ -321,7 +337,93 @@ class ChannelService:
                 "SELECT * FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = ?",
                 (channel_id, format_type),
             ).fetchone()
+            self._notify_advertisers_on_policy_change(
+                conn,
+                channel=channel,
+                format_type=format_type,
+                previous=dict(previous) if previous else None,
+                current=dict(row),
+            )
             return dict(row)
+
+    def _notify_advertisers_on_policy_change(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        channel: dict[str, Any],
+        format_type: str,
+        previous: dict[str, Any] | None,
+        current: dict[str, Any],
+    ) -> None:
+        """Notify advertisers with open orders on (channel, format) when the
+        publisher meaningfully changes the policy (enabled flag flipped or
+        price band changed). Silent when gateway absent or no open orders."""
+        if not self.gateway:
+            return
+        if previous is None:
+            return  # first-time default insert; not user-driven change
+        flipped_enabled = bool(previous.get("enabled")) != bool(current.get("enabled"))
+        band_changed = (previous.get("owner_price_band") or "") != (current.get("owner_price_band") or "")
+        if not (flipped_enabled or band_changed):
+            return
+
+        rows = conn.execute(
+            """
+            SELECT DISTINCT a.telegram_user_id, a.id AS account_id
+            FROM ad_orders o
+            JOIN ad_slots s ON s.id = o.slot_id
+            JOIN accounts a ON a.id = o.advertiser_account_id
+            WHERE o.channel_id = ?
+              AND s.slot_type = ?
+              AND o.status IN ('pending_review', 'approved', 'running')
+              AND a.telegram_user_id IS NOT NULL
+            """,
+            (channel["id"], format_type),
+        ).fetchall()
+        if not rows:
+            return
+
+        slot_label = {
+            "light_tail": "文字插播",
+            "standard_card": "标准插播",
+            "strong_post": "定制插播",
+            "pin24h": "置顶 24h",
+            "loop_daily": "循环发布",
+        }.get(format_type, format_type)
+
+        change_lines = []
+        if flipped_enabled:
+            change_lines.append("✅ 已开启" if current.get("enabled") else "❌ 已关闭")
+        if band_changed:
+            band_label = {"low": "低档", "medium": "中档", "high": "高档", "custom": "自定义"}
+            change_lines.append(
+                f"💵 价格档：{band_label.get(previous.get('owner_price_band'), previous.get('owner_price_band'))}"
+                f" → {band_label.get(current.get('owner_price_band'), current.get('owner_price_band'))}"
+            )
+        text = (
+            "🔔 频道主刚刚修改了设置\n\n"
+            f"📺 {channel['title']}\n"
+            f"🧩 {slot_label}\n"
+            + "\n".join(change_lines)
+            + "\n\n你在该频道有未结束的投放，请查看是否需要调整。"
+        )
+        keyboard = [[{"text": "📣 我的广告", "callback_data": "advertiser:orders"}]]
+
+        for row in rows:
+            try:
+                self.gateway.send_private_message(
+                    chat_id=row["telegram_user_id"],
+                    text=text,
+                    inline_keyboard=keyboard,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "notify_advertiser_policy_change_failed channel=%s format=%s recipient=%s error=%s",
+                    channel["id"],
+                    format_type,
+                    row["telegram_user_id"],
+                    exc,
+                )
 
     def _verify_publisher_owns_channel(
         self,

@@ -60,7 +60,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         settings=settings,
         db=db,
         gateway=gateway,
-        channels=ChannelService(db, settings),
+        channels=ChannelService(db, settings, gateway=gateway),
         ledger=LedgerService(db, settings),
         materials=MaterialService(db, settings),
         orders=OrderService(db, settings, gateway=gateway),

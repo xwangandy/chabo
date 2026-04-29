@@ -48,7 +48,7 @@ class UpdateHandler:
         self.settings = settings
         self.gateway = gateway
         self.accounts = AccountService(db, settings)
-        self.channels = ChannelService(db, settings)
+        self.channels = ChannelService(db, settings, gateway=gateway)
         self.ledger = LedgerService(db, settings)
         self.light_probes = LightProbeService(db, settings)
         self.materials = MaterialService(db, settings)

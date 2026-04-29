@@ -365,6 +365,73 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("部分退款", refund_msgs[0]["text"])
         self.assertIn("USD 0.50", refund_msgs[0]["text"])
 
+    def test_advertiser_gets_policy_change_notice_when_band_changes(self) -> None:
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100131,
+            title="调价通知频道",
+            username="policy_channel",
+            owner_telegram_user_id=20006,
+            owner_display_name="频道主",
+        )
+        self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="调价通知测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        # Order is pending_review; advertiser hasn't shipped yet. Now publisher
+        # changes the price band on standard_card.
+        before = len(self.gateway.private_messages)
+        self.app.channels.set_format_policy(
+            channel["id"],
+            "standard_card",
+            enabled=True,
+            owner_price_band="high",
+        )
+        new_messages = self.gateway.private_messages[before:]
+        policy_msgs = [m for m in new_messages if "频道主刚刚修改了设置" in m["text"]]
+        self.assertEqual(len(policy_msgs), 1, f"expected one policy-change notice; got {new_messages}")
+        msg = policy_msgs[0]
+        self.assertEqual(msg["chat_id"], "10001")
+        self.assertIn("标准插播", msg["text"])
+        self.assertIn("中档", msg["text"])
+        self.assertIn("高档", msg["text"])
+
+    def test_no_policy_change_notice_when_only_default_inserted(self) -> None:
+        # Calling set_format_policy on a channel with no prior policy row
+        # creates the default + then writes user's value. The "previous"
+        # snapshot is the default so we should not emit a change notice.
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100132,
+            title="首次设置频道",
+            username="first_policy",
+            owner_telegram_user_id=20007,
+            owner_display_name="频道主",
+        )
+        self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="首次设置测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        before = len(self.gateway.private_messages)
+        # Same band as the default → no actual change → no notification.
+        self.app.channels.set_format_policy(
+            channel["id"],
+            "standard_card",
+            enabled=True,
+            owner_price_band="medium",
+        )
+        new_messages = self.gateway.private_messages[before:]
+        policy_msgs = [m for m in new_messages if "频道主刚刚修改了设置" in m["text"]]
+        self.assertEqual(len(policy_msgs), 0, f"unexpected change notice; got {new_messages}")
+
 
 class MigrationTrackingTest(unittest.TestCase):
     """Verify the numbered-migration registry records each id once."""

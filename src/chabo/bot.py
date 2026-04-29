@@ -691,8 +691,7 @@ class UpdateHandler:
             if slot_type not in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = False
             if slot_type != previous_slot:
-                for key in ("material_id", "creative_text", "target_url", "button_text", "light_short_text"):
-                    payload.pop(key, None)
+                self._swap_placement_creative_draft(payload, previous_slot, slot_type)
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
             return {"handled": True, "type": "callback_placement_slot", "slot_type": slot_type}
 
@@ -1180,6 +1179,39 @@ class UpdateHandler:
             [{"text": "📁 广告素材", "callback_data": "place:creative"}, {"text": "✅ 费用确认", "callback_data": "place:confirm"}],
             [{"text": "🏠 工作台", "callback_data": "menu:home"}],
         ]
+
+    PLACEMENT_CREATIVE_KEYS = (
+        "material_id",
+        "creative_text",
+        "target_url",
+        "button_text",
+        "light_short_text",
+    )
+
+    def _swap_placement_creative_draft(
+        self,
+        payload: dict[str, Any],
+        previous_slot: str,
+        next_slot: str,
+    ) -> None:
+        """Save the outgoing slot's creative draft and restore the incoming one.
+
+        Why: switching display format used to clear all creative inputs, so a
+        user comparing prices between 文字/标准/定制 lost their work. Now each
+        slot keeps its own draft bucket; flipping back restores it.
+        """
+        drafts = payload.setdefault("_slot_drafts", {})
+        if previous_slot:
+            drafts[previous_slot] = {
+                key: payload.get(key) for key in self.PLACEMENT_CREATIVE_KEYS
+            }
+        for key in self.PLACEMENT_CREATIVE_KEYS:
+            payload.pop(key, None)
+        restored = drafts.get(next_slot) or {}
+        for key in self.PLACEMENT_CREATIVE_KEYS:
+            value = restored.get(key)
+            if value:
+                payload[key] = value
 
     def _placement_missing_panel(self, payload: dict[str, Any]) -> str | None:
         if not payload.get("slot_type"):

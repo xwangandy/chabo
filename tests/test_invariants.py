@@ -427,6 +427,37 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("软件 (商业价值 高)", text)
         self.assertIn("风控", text)
 
+    def test_report_publisher_deletion_opens_dispute_refunds_and_notifies(self) -> None:
+        # P2-10: 一个入口同时 open dispute + 全额退款 + 推 advertiser 通知
+        ctx = self._setup_one_running_delivery()
+        before = len(self.gateway.private_messages)
+
+        self.app.orders.report_publisher_deletion(ctx["delivery_id"], note="发现频道里没了")
+
+        # Check dispute row created (and auto-resolved by refund flow)
+        with self.app.db.transaction() as conn:
+            disputes = conn.execute(
+                "SELECT * FROM disputes WHERE delivery_id = ? ORDER BY created_at DESC",
+                (ctx["delivery_id"],),
+            ).fetchall()
+            delivery = conn.execute(
+                "SELECT status, refunded_cents, charge_cents FROM deliveries WHERE id = ?",
+                (ctx["delivery_id"],),
+            ).fetchone()
+        self.assertGreaterEqual(len(disputes), 1)
+        self.assertEqual(disputes[0]["reason"], "频道主提前删除广告")
+        # Auto-resolved by refund_delivery_locked when full refund
+        self.assertEqual(disputes[0]["status"], "resolved")
+        # Delivery fully refunded
+        self.assertEqual(delivery["refunded_cents"], delivery["charge_cents"])
+
+        # Advertiser got the existing P0-2 refund notification with the
+        # publisher-deletion reason in it.
+        new_messages = self.gateway.private_messages[before:]
+        refund_msgs = [m for m in new_messages if "退款已到账" in m["text"]]
+        self.assertEqual(len(refund_msgs), 1)
+        self.assertIn("频道主提前删除广告", refund_msgs[0]["text"])
+
     def test_admin_summary_includes_append_button_failures_count(self) -> None:
         # P2-9: surface 'audit_logs.append_button_failed' counter on /admin
         from chabo.ids import new_id

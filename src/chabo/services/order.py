@@ -930,6 +930,45 @@ class OrderService:
             refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
             return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id, note=note)
 
+    def report_publisher_deletion(
+        self,
+        delivery_id: str,
+        *,
+        actor_account_id: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Operator path for "频道主提前删除已发布广告" cases.
+
+        Opens a dispute row + marks the delivery as disputed + runs a full
+        refund via the standard refund path (which writes audit, snapshots,
+        and pushes the existing P0-2 advertiser refund notification).
+        The dispute row is auto-resolved by refund_delivery_locked when
+        the refund completes.
+        """
+        reason = "频道主提前删除广告"
+        with self.db.transaction() as conn:
+            delivery = self._refundable_delivery(conn, delivery_id)
+            opener_id = actor_account_id or self.accounts.ensure_platform_account(conn)
+            conn.execute(
+                """
+                INSERT INTO disputes (id, order_id, delivery_id, opened_by_account_id, status, reason)
+                VALUES (?, ?, ?, ?, 'open', ?)
+                """,
+                (new_id("dis"), delivery["order_id"], delivery["id"], opener_id, reason),
+            )
+            conn.execute(
+                "UPDATE deliveries SET status = 'disputed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (delivery["id"],),
+            )
+            self._snapshot(
+                conn,
+                delivery["order_id"],
+                delivery["id"],
+                "publisher_deletion_reported",
+                {"reason": reason},
+            )
+        return self.refund_delivery(delivery_id, reason, actor_account_id, note=note)
+
     def refund_delivery_partial(
         self,
         delivery_id: str,

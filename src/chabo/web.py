@@ -285,6 +285,8 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             if amount_cents is None:
                 return self.server.app.orders.refund_delivery(parts[2], _str_value(data, "reason", "运营后台退款"), note=note)
             return self.server.app.orders.refund_delivery_partial(parts[2], amount_cents, _str_value(data, "reason", "运营后台部分退款"), note=note)
+        if len(parts) == 4 and parts[0] == "admin" and parts[1] == "deliveries" and parts[3] == "report-deletion":
+            return self.server.app.orders.report_publisher_deletion(parts[2], note=note)
         if len(parts) == 4 and parts[0] == "admin" and parts[1] == "disputes" and parts[3] == "resolve":
             return self.server.app.disputes.resolve_dispute(
                 dispute_id=parts[2],

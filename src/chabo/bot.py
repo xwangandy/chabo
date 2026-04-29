@@ -359,6 +359,23 @@ class UpdateHandler:
             material_id, _, field = tail.partition(":")
             self._begin_material_field_edit(chat_id, user, material_id, field, message)
             return {"handled": True, "type": "callback_material_edit_field", "material_id": material_id, "field": field}
+        if data.startswith("advertiser:batch:start:"):
+            material_id = data.removeprefix("advertiser:batch:start:")
+            self._begin_batch_orders(chat_id, user, material_id, message)
+            return {"handled": True, "type": "callback_batch_start", "material_id": material_id}
+        if data.startswith("advertiser:batch:toggle:"):
+            channel_id = data.removeprefix("advertiser:batch:toggle:")
+            self._toggle_batch_channel(chat_id, user, channel_id, message)
+            return {"handled": True, "type": "callback_batch_toggle", "channel_id": channel_id}
+        if data == "advertiser:batch:budget":
+            self._begin_batch_budget_input(chat_id, user, message)
+            return {"handled": True, "type": "callback_batch_budget_prompt"}
+        if data == "advertiser:batch:submit":
+            return self._submit_batch_orders(chat_id, user, message)
+        if data == "advertiser:batch:cancel":
+            self._clear_batch_orders_state(chat_id)
+            self._send_advertiser_library(chat_id, user, message)
+            return {"handled": True, "type": "callback_batch_cancelled"}
         if data == "advertiser:orders":
             self._send_advertiser_orders(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_orders"}
@@ -3193,6 +3210,14 @@ class UpdateHandler:
                 for i, creative in enumerate(creatives)
             ]
             keyboard.append(edit_buttons)
+            batch_buttons = [
+                {
+                    "text": f"📡 {self.ORDER_LIST_NUMBERS[i] if i < len(self.ORDER_LIST_NUMBERS) else str(i + 1)}",
+                    "callback_data": f"advertiser:batch:start:{creative['id']}",
+                }
+                for i, creative in enumerate(creatives)
+            ]
+            keyboard.append(batch_buttons)
         keyboard.append([
             {"text": "➕ 新建素材", "callback_data": "advertiser:material:new"},
             {"text": "🧾 去频道投放", "callback_data": "advertiser:order_help"},
@@ -3592,6 +3617,377 @@ class UpdateHandler:
             return {"handled": True, "type": "material_create_saved", "material_id": material["id"]}
 
         return {"handled": False, "reason": "unknown_material_create_step"}
+
+    BATCH_DEFAULT_BUDGET_CENTS = 1000  # USD 10 per channel
+    BATCH_CANDIDATE_LIMIT = 5
+
+    def _begin_batch_orders(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        material_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            material = self.materials.get_material(
+                material_id, advertiser_telegram_user_id=user_id
+            )
+        except NotFound:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 素材不存在或不属于你。",
+                inline_keyboard=[
+                    [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+        if material["archived_at"]:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="ℹ️ 已归档的素材无法批量投放，请回到广告库选择活跃素材。",
+                inline_keyboard=[
+                    [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+        try:
+            candidates = self.advertisers.discover_channels(
+                advertiser_telegram_user_id=user_id,
+                slot_type=material["format_type"],
+                limit=self.BATCH_CANDIDATE_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning("batch_discover_failed user=%s error=%s", user_id, exc)
+            candidates = []
+
+        if not candidates:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=(
+                    "📡 批量投放\n\n"
+                    "暂无符合条件的频道（要求该形态 standard 报价已生效）。\n"
+                    "也可以从频道帖底部的「📣 频道招商」按钮进入单频道投放。"
+                ),
+                inline_keyboard=[
+                    [{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}],
+                ],
+            )
+            return
+
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(
+                conn, user_id, "advertiser", self._display_name(user)
+            )
+            payload = {
+                "material_id": material_id,
+                "slot_type": material["format_type"],
+                "budget_cents": self.BATCH_DEFAULT_BUDGET_CENTS,
+                "selected_channel_ids": [],
+                "candidates": [
+                    {
+                        "channel_id": c["channel_id"],
+                        "title": c["title"],
+                        "category": c.get("category"),
+                        "risk_level": c.get("risk_level"),
+                        "score": c.get("score"),
+                        "subscribers": c.get("subscribers"),
+                        "list_price_cents": c.get("list_price_cents"),
+                    }
+                    for c in candidates
+                ],
+            }
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                account["id"],
+                "batch_orders",
+                "select_channels",
+                payload,
+            )
+        self._send_batch_orders_panel(chat_id, user, source_message)
+
+    def _send_batch_orders_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "batch_orders":
+            self._send_advertiser_library(chat_id, user, source_message)
+            return
+        payload = json.loads(state["payload_json"] or "{}")
+        candidates = payload.get("candidates") or []
+        selected = set(payload.get("selected_channel_ids") or [])
+        slot_type = payload.get("slot_type") or "standard_card"
+        budget_cents = int(payload.get("budget_cents") or self.BATCH_DEFAULT_BUDGET_CENTS)
+        slot_label = self._slot_name(slot_type)
+
+        lines = [
+            "📡 批量投放",
+            "",
+            f"形态：{slot_label}",
+            f"单频道预算：USD {cents_to_money(budget_cents)}",
+            f"已选：{len(selected)} 个频道",
+            "",
+            "勾选要投放的频道：",
+        ]
+        toggle_buttons: list[dict[str, str]] = []
+        for index, channel in enumerate(candidates):
+            number = self.DISCOVER_LIST_NUMBERS[index] if index < len(self.DISCOVER_LIST_NUMBERS) else f"{index + 1}."
+            mark = "✅" if channel["channel_id"] in selected else "☐"
+            risk_emoji = self.DISCOVER_RISK_EMOJI.get(channel.get("risk_level"), "⚪️")
+            category_label = self.CATEGORY_VALUE.get(channel.get("category") or "general", ("通用", ""))[0]
+            price = cents_to_money(int(channel.get("list_price_cents") or 0))
+            lines.append(
+                f"{mark} {number} {channel['title']}｜🏷 {category_label}｜{risk_emoji}"
+                f"｜⭐ {channel.get('score') or 0}｜USD {price}"
+            )
+            toggle_buttons.append({
+                "text": f"{mark} {number}",
+                "callback_data": f"advertiser:batch:toggle:{channel['channel_id']}",
+            })
+
+        keyboard = self._button_grid(toggle_buttons, 5)
+        keyboard.append([{"text": "💵 改单频道预算", "callback_data": "advertiser:batch:budget"}])
+        if selected:
+            estimated = budget_cents * len(selected)
+            lines.extend([
+                "",
+                f"💵 预估总冻结：USD {cents_to_money(estimated)}",
+            ])
+            keyboard.append([
+                {
+                    "text": f"🚀 批量投放 ({len(selected)})",
+                    "callback_data": "advertiser:batch:submit",
+                },
+            ])
+        keyboard.append([{"text": "↩️ 取消", "callback_data": "advertiser:batch:cancel"}])
+
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _toggle_batch_channel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "batch_orders":
+            self._send_advertiser_library(chat_id, user, source_message)
+            return
+        payload = json.loads(state["payload_json"] or "{}")
+        candidate_ids = {c["channel_id"] for c in (payload.get("candidates") or [])}
+        if channel_id not in candidate_ids:
+            self._send_batch_orders_panel(chat_id, user, source_message)
+            return
+        selected = list(payload.get("selected_channel_ids") or [])
+        if channel_id in selected:
+            selected = [c for c in selected if c != channel_id]
+        else:
+            selected.append(channel_id)
+        payload["selected_channel_ids"] = selected
+        with self.db.transaction() as conn:
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                state["account_id"],
+                "batch_orders",
+                state["step"],
+                payload,
+            )
+        self._send_batch_orders_panel(chat_id, user, source_message)
+
+    def _begin_batch_budget_input(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "batch_orders":
+            self._send_advertiser_library(chat_id, user, source_message)
+            return
+        payload = json.loads(state["payload_json"] or "{}")
+        with self.db.transaction() as conn:
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                state["account_id"],
+                "batch_orders",
+                "budget_input",
+                payload,
+            )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                "💵 单频道预算\n\n"
+                "请发送数字（USD），会用于每一个被勾选的频道。\n"
+                "例如：10 → 每个频道冻结 USD 10。"
+            ),
+            inline_keyboard=[
+                [{"text": "↩️ 取消", "callback_data": "advertiser:batch:cancel"}],
+            ],
+        )
+
+    def _handle_batch_orders_message(
+        self,
+        message: dict[str, Any],
+        state: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        if state["step"] != "budget_input":
+            return {"handled": False, "reason": "unsupported_batch_step"}
+        clean_text = (text or "").strip()
+        try:
+            budget_cents = money_to_cents(clean_text)
+        except Exception:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="预算格式不对，请发送正数（最多两位小数）。",
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": "advertiser:batch:cancel"}]],
+            )
+            return {"handled": True, "type": "batch_budget_invalid"}
+        if budget_cents <= 0:
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text="预算需要是大于 0 的金额。",
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": "advertiser:batch:cancel"}]],
+            )
+            return {"handled": True, "type": "batch_budget_invalid"}
+        payload = json.loads(state["payload_json"] or "{}")
+        payload["budget_cents"] = budget_cents
+        with self.db.transaction() as conn:
+            self._set_conversation_conn(
+                conn,
+                chat_id,
+                state["account_id"],
+                "batch_orders",
+                "select_channels",
+                payload,
+            )
+        self._send_batch_orders_panel(chat_id, user, None)
+        return {"handled": True, "type": "batch_budget_saved", "budget_cents": budget_cents}
+
+    def _submit_batch_orders(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "batch_orders":
+            self._send_advertiser_library(chat_id, user, source_message)
+            return {"handled": True, "type": "callback_batch_no_state"}
+        payload = json.loads(state["payload_json"] or "{}")
+        material_id = payload.get("material_id")
+        slot_type = payload.get("slot_type") or "standard_card"
+        budget_cents = int(payload.get("budget_cents") or 0)
+        candidate_lookup = {c["channel_id"]: c for c in (payload.get("candidates") or [])}
+        selected_ids = list(payload.get("selected_channel_ids") or [])
+        if not selected_ids or budget_cents <= 0:
+            self._send_batch_orders_panel(chat_id, user, source_message)
+            return {"handled": True, "type": "callback_batch_incomplete"}
+
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            tokens = []
+            for channel_id in selected_ids:
+                row = conn.execute(
+                    "SELECT ref_token FROM channels WHERE id = ?", (channel_id,)
+                ).fetchone()
+                if row:
+                    tokens.append(row["ref_token"])
+        if not tokens:
+            self._send_batch_orders_panel(chat_id, user, source_message)
+            return {"handled": True, "type": "callback_batch_no_tokens"}
+
+        try:
+            outcome = self.advertisers.create_batch_orders(
+                advertiser_telegram_user_id=user_id,
+                channel_tokens=tokens,
+                slot_type=slot_type,
+                material_id=material_id,
+                budget_cents=budget_cents,
+            )
+        except (InvalidState, NotFound, ChaboError) as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 批量投放失败：{exc}",
+                inline_keyboard=[
+                    [{"text": "📡 返回批量页", "callback_data": f"advertiser:batch:start:{material_id}"}],
+                    [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                ],
+            )
+            return {"handled": True, "type": "callback_batch_failed", "error": str(exc)}
+
+        self._clear_batch_orders_state(chat_id)
+        with self.db.transaction() as conn:
+            placeholders = ",".join(["?"] * len(tokens))
+            title_by_token = {
+                row["ref_token"]: row["title"]
+                for row in conn.execute(
+                    f"SELECT ref_token, title FROM channels WHERE ref_token IN ({placeholders})",
+                    tokens,
+                ).fetchall()
+            }
+        lines = [
+            f"🚀 批量投放完成（{outcome['created_count']} 成功 / {outcome['failed_count']} 失败）",
+            "",
+        ]
+        for item in outcome["results"]:
+            channel_label = title_by_token.get(item["channel_token"], item["channel_token"])
+            if item["ok"]:
+                lines.append(f"✅ {channel_label}｜订单 {item['order_id']}")
+            else:
+                lines.append(f"❌ {channel_label}｜{item['error']}")
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[
+                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                [{"text": "🗂 广告库", "callback_data": "advertiser:library"}],
+                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+        return {
+            "handled": True,
+            "type": "callback_batch_submitted",
+            "created_count": outcome["created_count"],
+            "failed_count": outcome["failed_count"],
+        }
+
+    def _clear_batch_orders_state(self, chat_id: str | int) -> None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+            if row and row["flow"] == "batch_orders":
+                conn.execute(
+                    "DELETE FROM bot_conversation_states WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
 
     def _clear_material_create_state(self, chat_id: str | int) -> None:
         with self.db.transaction() as conn:
@@ -4275,6 +4671,8 @@ class UpdateHandler:
             return self._handle_material_edit_message(message, state, text)
         if state["flow"] == "material_create":
             return self._handle_material_create_message(message, state, text)
+        if state["flow"] == "batch_orders":
+            return self._handle_batch_orders_message(message, state, text)
         if state["flow"] != "create_order":
             return {"handled": False, "reason": "unsupported_conversation"}
         if not text:

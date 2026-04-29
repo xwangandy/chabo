@@ -9,7 +9,7 @@ from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, AdvertiserService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
+from .services import AccountService, AdvertiserService, AdvertiserSubscriptionService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
 
@@ -56,6 +56,7 @@ class UpdateHandler:
         self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
         self.advertisers = AdvertiserService(db, settings)
+        self.advertiser_subscriptions = AdvertiserSubscriptionService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
         if "pre_checkout_query" in update:
@@ -305,6 +306,12 @@ class UpdateHandler:
         if data == "advertiser:alerts":
             self._send_advertiser_alerts(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_alerts"}
+        if data == "advertiser:plan":
+            self._send_advertiser_plan_panel(chat_id, user, message)
+            return {"handled": True, "type": "callback_advertiser_plan"}
+        if data.startswith("advertiser:plan:buy:"):
+            plan = data.removeprefix("advertiser:plan:buy:")
+            return self._trigger_advertiser_plan_purchase(chat_id, user, plan, message)
         if data.startswith("advertiser:save:"):
             tail = data.removeprefix("advertiser:save:")
             origin, _, channel_id = tail.partition(":")
@@ -650,8 +657,9 @@ class UpdateHandler:
             inline_keyboard=[
                 [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}, {"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
                 [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
-                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
-                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "📦 我的套餐", "callback_data": "advertiser:plan"}],
+                [{"text": "💵 定价规则", "callback_data": "publisher:pricing"}, {"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
+                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
             ],
         )
 
@@ -891,6 +899,147 @@ class UpdateHandler:
             text="\n".join(lines),
             inline_keyboard=keyboard,
         )
+
+    PLAN_LABELS = {
+        "free": "Free（免费）",
+        "pro": "Pro（专业）",
+        "enterprise": "Enterprise（企业）",
+    }
+
+    def _send_advertiser_plan_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            status = self.advertiser_subscriptions.status(user_id)
+        except Exception as exc:
+            logger.warning("plan_status_failed user=%s error=%s", user_id, exc)
+            status = {
+                "subscription": None,
+                "entitlements": {"plan": "free", **AdvertiserSubscriptionService.FREE_LIMITS},
+            }
+        entitlements = status.get("entitlements") or {"plan": "free"}
+        current_plan = entitlements.get("plan", "free")
+        active = status.get("subscription")
+
+        lines = ["📦 我的套餐", ""]
+        lines.append(f"当前：{self.PLAN_LABELS.get(current_plan, current_plan)}")
+        if active and active.get("expires_at"):
+            tz_name = self._account_timezone(user_id)
+            lines.append(f"到期：{self._format_local_time(active['expires_at'], tz_name)}")
+        lines.append("")
+        lines.append("权益对比：")
+        for plan_key, plan in (
+            ("free", {"monthly_price_cents": 0, **AdvertiserSubscriptionService.FREE_LIMITS}),
+            ("pro", AdvertiserSubscriptionService.PLANS["pro"]),
+            ("enterprise", AdvertiserSubscriptionService.PLANS["enterprise"]),
+        ):
+            label = self.PLAN_LABELS.get(plan_key, plan_key)
+            price_cents = int(plan.get("monthly_price_cents") or 0)
+            price = "免费" if price_cents == 0 else f"USD {cents_to_money(price_cents)} / 月"
+            badge = "（当前）" if plan_key == current_plan else ""
+            lines.append(f"• {label}{badge}｜{price}")
+            lines.append(
+                f"   频道发现 {plan.get('discover_limit')}｜批量 {'✅' if plan.get('batch_orders') else '❌'}"
+                f"｜提醒 {'✅' if plan.get('alerts') else '❌'}｜完整报表 {'✅' if plan.get('full_report') else '❌'}"
+            )
+
+        keyboard: list[list[dict[str, str]]] = []
+        upgrade_buttons: list[dict[str, str]] = []
+        for plan_key in ("pro", "enterprise"):
+            if plan_key == current_plan:
+                continue
+            label = self.PLAN_LABELS.get(plan_key, plan_key)
+            price_cents = int(AdvertiserSubscriptionService.PLANS[plan_key]["monthly_price_cents"])
+            upgrade_buttons.append({
+                "text": f"🚀 {label} · USD {cents_to_money(price_cents)}",
+                "callback_data": f"advertiser:plan:buy:{plan_key}",
+            })
+        if upgrade_buttons:
+            keyboard.append(upgrade_buttons)
+        keyboard.append([
+            {"text": "💰 广告钱包", "callback_data": "advertiser:balance"},
+            {"text": "🏠 主菜单", "callback_data": "menu:home"},
+        ])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _trigger_advertiser_plan_purchase(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        plan: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = user.get("id") or chat_id
+        try:
+            invoice_response = self.stars_payments.create_advertiser_subscription_invoice(
+                advertiser_telegram_user_id=user_id,
+                plan=plan,
+                months=1,
+            )
+        except (NotFound, InvalidState, ChaboError) as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法发起套餐购买：{exc}",
+                inline_keyboard=[[{"text": "📦 返回套餐", "callback_data": "advertiser:plan"}]],
+            )
+            return {"handled": True, "type": "callback_advertiser_plan_invoice_failed", "error": str(exc)}
+        invoice = invoice_response["invoice"]
+        try:
+            self.gateway.send_invoice(
+                chat_id=user_id,
+                title=invoice["title"],
+                description=invoice["description"],
+                payload=invoice["payload"],
+                currency=invoice["currency"],
+                prices=invoice["prices"],
+            )
+        except TelegramError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 发票发送失败：{exc}",
+                inline_keyboard=[[{"text": "📦 返回套餐", "callback_data": "advertiser:plan"}]],
+            )
+            return {"handled": True, "type": "callback_advertiser_plan_invoice_failed", "error": str(exc)}
+        plan_label = self.PLAN_LABELS.get(plan, plan)
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"💳 已发送 {plan_label} 套餐发票\n\n"
+                "在 Telegram 内打开发票完成 Stars 支付，到账后回到「📦 我的套餐」查看权益。"
+            ),
+            inline_keyboard=[[{"text": "📦 返回套餐", "callback_data": "advertiser:plan"}]],
+        )
+        return {
+            "handled": True,
+            "type": "callback_advertiser_plan_invoice_sent",
+            "plan": plan,
+            "stars_amount": invoice_response["intent"]["stars_amount"],
+        }
+
+    def _account_timezone(self, telegram_user_id: str | int) -> str:
+        try:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT timezone FROM accounts WHERE telegram_user_id = ?",
+                    (str(telegram_user_id),),
+                ).fetchone()
+        except Exception:
+            return DEFAULT_USER_TIMEZONE
+        if row and row["timezone"]:
+            return row["timezone"]
+        return DEFAULT_USER_TIMEZONE
 
     def _toggle_saved_channel(
         self,

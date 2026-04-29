@@ -337,6 +337,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             self._summary_card("Open 争议", summary["open_disputes"], alert=summary["open_disputes"] > 0),
             self._summary_card("近 24h 失败", summary["failed_recent"], alert=summary["failed_recent"] > 0),
             self._summary_card("待审入账", summary["pending_topups"], alert=summary["pending_topups"] > 0),
+            self._summary_card("近 24h 按钮追加失败", summary["append_button_failures_24h"], alert=summary["append_button_failures_24h"] > 0),
             "</div>",
             "<div class='bar'>",
             f"<a href='/admin{token_query}'>全部</a> ",
@@ -638,6 +639,11 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             pending_topups = conn.execute(
                 "SELECT COUNT(*) AS n FROM topup_requests WHERE status = 'pending'"
             ).fetchone()["n"]
+            append_button_failures = conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_logs "
+                "WHERE action = 'append_button_failed' "
+                "AND created_at >= datetime('now', '-1 day')"
+            ).fetchone()["n"]
         return {
             "pending_review_orders": pending_review,
             "running_orders": running_orders,
@@ -646,6 +652,7 @@ class ChaboRequestHandler(BaseHTTPRequestHandler):
             "failed_recent": failed_recent,
             "scheduled_due": scheduled_due,
             "pending_topups": pending_topups,
+            "append_button_failures_24h": append_button_failures,
         }
 
     def _build_health_payload(self) -> dict[str, Any]:

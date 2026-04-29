@@ -427,6 +427,32 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("软件 (商业价值 高)", text)
         self.assertIn("风控", text)
 
+    def test_admin_summary_includes_append_button_failures_count(self) -> None:
+        # P2-9: surface 'audit_logs.append_button_failed' counter on /admin
+        from chabo.ids import new_id
+        # Synthesize an append_button_failed audit row in the last 24h
+        with self.app.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO audit_logs (id, action, entity_type, entity_id, payload_json) "
+                "VALUES (?, 'append_button_failed', 'channel', 'ch_test', '{}')",
+                (new_id("aud"),),
+            )
+        # Reach into the web layer to compute summary
+        from chabo.web import make_server
+        server = make_server(app=self.app, host="127.0.0.1", port=0, admin_token="t" * 24, webhook_secret="s" * 24)
+        try:
+            class _ProbeHandler:
+                def __init__(self, server) -> None:
+                    self.server = server
+            from chabo.web import ChaboRequestHandler
+            probe = ChaboRequestHandler.__new__(ChaboRequestHandler)
+            probe.server = server  # type: ignore[attr-defined]
+            summary = probe._ops_summary()
+        finally:
+            server.server_close()
+        self.assertIn("append_button_failures_24h", summary)
+        self.assertGreaterEqual(summary["append_button_failures_24h"], 1)
+
     def test_advertiser_orders_page_includes_aggregate_report(self) -> None:
         # P1-8: "📣 我的广告" 现在带"投放总览" + "频道分布" + "最近订单"
         ctx = self._setup_one_running_delivery()

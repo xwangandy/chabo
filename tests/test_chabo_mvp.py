@@ -3736,7 +3736,13 @@ class ChaboMvpTest(unittest.TestCase):
         )
         body = self._last_user_facing_text()
         self.assertIn("Pro", body)
-        self.assertIn("create-alert-rule", body)
+        # bug_003: must NOT advertise the CLI fallback, since chabo create-alert-rule
+        # is also Pro-gated and would just throw the same InvalidState back at them.
+        self.assertNotIn("create-alert-rule", body)
+        # Should route to the in-Bot upgrade page instead.
+        keyboard = self._last_user_facing_keyboard()
+        callbacks = [b["callback_data"] for row in keyboard for b in row]
+        self.assertIn("advertiser:plan", callbacks)
 
     def test_advertiser_alerts_empty_for_pro_user_with_no_rules(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")

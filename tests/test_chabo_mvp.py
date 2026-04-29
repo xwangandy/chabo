@@ -3620,6 +3620,158 @@ class ChaboMvpTest(unittest.TestCase):
         )
         self.assertEqual(result["type"], "callback_batch_failed")
 
+    def test_remove_saved_channel_returns_true_only_when_row_existed(self) -> None:
+        channel = self.bind_channel()
+        self.app.advertisers.save_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+            note="先收藏",
+        )
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        first = self.app.advertisers.remove_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        )
+        second = self.app.advertisers.remove_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertFalse(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+
+    def test_advertiser_menu_exposes_saved_entry_point(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu_saved",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        saved = [b for b in all_buttons if b["callback_data"] == "advertiser:saved"]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["text"], "⭐ 我的收藏")
+
+    def test_saved_empty_state_guides_to_discover(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_saved_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:saved",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("还没有收藏", body)
+        keyboard = self._last_user_facing_keyboard()
+        callbacks = [b["callback_data"] for row in keyboard for b in row]
+        self.assertIn("advertiser:discover", callbacks)
+
+    def test_save_then_unsave_cycle_via_discover_and_saved_list(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        # Discover page exposes ⭐ buttons
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_for_save",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        save_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:save:disc:")
+        ]
+        self.assertEqual(len(save_buttons), 1)
+        self.assertTrue(save_buttons[0]["text"].startswith("⭐"))
+
+        # Tap save → channel becomes saved
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_save",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:save:disc:{channel['id']}",
+                }
+            }
+        )
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        # Discover refresh shows the 🌟 marker
+        keyboard_after = self._last_user_facing_keyboard()
+        save_after = [
+            b for row in keyboard_after for b in row
+            if b["callback_data"].startswith("advertiser:save:disc:")
+        ]
+        self.assertTrue(save_after[0]["text"].startswith("🌟"))
+
+        # Saved list page lists the channel
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_saved_list",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:saved",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn(channel["title"], body)
+
+        # Tap ❌ from saved list → unsave
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_unsave",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:save:saved:{channel['id']}",
+                }
+            }
+        )
+        self.assertFalse(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        body_after = self._last_user_facing_text()
+        self.assertIn("还没有收藏", body_after)
+
     def test_advertiser_menu_exposes_discover_entry_point(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         self.app.update_handler.handle(

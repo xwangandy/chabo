@@ -297,10 +297,21 @@ class MaterialService:
                 else:
                     new_button_text = (button_text or "").strip() or "查看详情"
 
+                # Mirror create-time validation so Bot, CLI, and AI tool calls
+                # agree on the rules. light_tail's text is the detail-page body
+                # (longer ceiling), others are the main copy.
                 if not new_text:
                     raise InvalidState("广告素材文案不能为空")
+                text_max = 1000 if row["format_type"] == "light_tail" else 800
+                if text is not None and (len(new_text) < 4 or len(new_text) > text_max):
+                    raise InvalidState(f"广告文案需要 4-{text_max} 个字")
                 if not new_target_url:
                     raise InvalidState("广告素材必须包含目标链接")
+                if target_url is not None and not (
+                    new_target_url.startswith("http://")
+                    or new_target_url.startswith("https://")
+                ):
+                    raise InvalidState("链接必须以 http:// 或 https:// 开头")
 
                 if row["format_type"] == "light_tail":
                     if light_short_text is None:

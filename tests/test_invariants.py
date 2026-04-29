@@ -400,6 +400,36 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("中档", msg["text"])
         self.assertIn("高档", msg["text"])
 
+    def test_placement_display_panel_labels_each_format_with_price(self) -> None:
+        # P1-5: per-format price labels in the placement display panel so
+        # advertisers see costs before committing to a format.
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100133,
+            title="标价测试频道",
+            username="price_label",
+            owner_telegram_user_id=20008,
+            owner_display_name="频道主",
+        )
+        # Need rates to exist for each slot.
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20000,
+            subscribers=50000,
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        keyboard = self.app.update_handler._placement_keyboard(
+            "display",
+            payload={"channel_id": channel["id"], "slot_type": "standard_card"},
+        )
+        all_buttons = [btn for row in keyboard for btn in row]
+        format_buttons = [b for b in all_buttons if b["callback_data"].startswith("place:slot:")]
+        self.assertEqual(len(format_buttons), 3)
+        for btn in format_buttons:
+            self.assertIn(" · USD ", btn["text"], f"missing price label on {btn}")
+
     def test_no_policy_change_notice_when_only_default_inserted(self) -> None:
         # Calling set_format_policy on a channel with no prior policy row
         # creates the default + then writes user's value. The "previous"

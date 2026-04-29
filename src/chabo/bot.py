@@ -998,12 +998,15 @@ class UpdateHandler:
     def _placement_keyboard(self, panel: str, payload: dict[str, Any], creatives: list[Any] | None = None) -> list[list[dict[str, str]]]:
         if panel == "display":
             selected = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            prices = self._placement_slot_prices(payload["channel_id"]) if payload.get("channel_id") else {}
             buttons = []
             for slot_type in PLACEMENT_SLOT_TYPES:
                 prefix = "✅ " if selected == slot_type else ""
-                buttons.append({"text": f"{prefix}{self._slot_label(slot_type)}", "callback_data": f"place:slot:{slot_type}"})
+                price_cents = prices.get(slot_type)
+                price_label = f" · USD {cents_to_money(price_cents)}" if price_cents else ""
+                buttons.append({"text": f"{prefix}{self._slot_label(slot_type)}{price_label}", "callback_data": f"place:slot:{slot_type}"})
             keyboard = self._button_grid(buttons, 2)
-            pin_text = "📌 置顶：开启" if payload.get("pin") else "📌 置顶：关闭"
+            pin_text = "📌 置顶：开启 (×2)" if payload.get("pin") else "📌 置顶：关闭"
             keyboard.append([{"text": pin_text, "callback_data": "place:pin"}])
             keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
             return keyboard
@@ -2877,6 +2880,24 @@ class UpdateHandler:
         with self.db.transaction() as conn:
             rate = self.channels.get_rate(conn, channel_id, slot_type)
             return int(rate["unit_price_cents"])
+
+    def _placement_slot_prices(self, channel_id: str) -> dict[str, int]:
+        """Per-slot unit_price_cents for the placement display panel.
+
+        Single query to label all three format buttons with their per-delivery
+        price; the cost panel still computes the full quote (period × pin × ...).
+        """
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.slot_type, r.unit_price_cents
+                FROM ad_slots s
+                JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+                WHERE s.channel_id = ?
+                """,
+                (channel_id,),
+            ).fetchall()
+        return {row["slot_type"]: int(row["unit_price_cents"]) for row in rows}
 
     def _find_channel(self, conn: Any, identifier: str) -> dict[str, Any]:
         row = conn.execute(

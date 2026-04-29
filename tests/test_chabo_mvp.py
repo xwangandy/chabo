@@ -4406,6 +4406,62 @@ class ChaboMvpTest(unittest.TestCase):
         unchanged = self.app.materials.get_material(material["id"])
         self.assertEqual(unchanged["text"], "A 的素材")
 
+    def test_material_edit_rejects_non_http_url(self) -> None:
+        """merged_bug_001: update_material must enforce the http(s):// scheme like create_material."""
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始文案",
+            target_url="https://example.com",
+        )
+        for bad_url in ("ftp://example.com", "javascript:alert(1)", "example.com"):
+            with self.assertRaises(InvalidState):
+                self.app.materials.update_material(
+                    material["id"],
+                    advertiser_telegram_user_id=10001,
+                    target_url=bad_url,
+                )
+        # The original URL must be intact
+        unchanged = self.app.materials.get_material(material["id"])
+        self.assertEqual(unchanged["target_url"], "https://example.com")
+
+    def test_material_edit_rejects_text_outside_length_bounds(self) -> None:
+        """merged_bug_001: update_material must enforce the 4-800 (light_tail: 4-1000) bounds."""
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始标准插播文案",
+            target_url="https://example.com",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                std["id"], advertiser_telegram_user_id=10001, text="x"
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                std["id"], advertiser_telegram_user_id=10001, text="一" * 801
+            )
+        # within bounds OK
+        self.app.materials.update_material(
+            std["id"], advertiser_telegram_user_id=10001, text="一" * 50
+        )
+
+        light = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="原始文字插播详情",
+            target_url="https://example.com",
+            light_short_text="想看广告？",
+        )
+        # light_tail allows up to 1000
+        self.app.materials.update_material(
+            light["id"], advertiser_telegram_user_id=10001, text="一" * 1000
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                light["id"], advertiser_telegram_user_id=10001, text="一" * 1001
+            )
+
     def test_material_edit_light_short_text_validates_length(self) -> None:
         material = self.app.materials.create_material(
             advertiser_telegram_user_id=10001,

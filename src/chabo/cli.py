@@ -739,31 +739,20 @@ def cmd_advertiser_report(args: argparse.Namespace) -> None:
 def cmd_batch_orders(args: argparse.Namespace) -> None:
     app = create_app()
     tokens = [token.strip() for token in args.channel_tokens.split(",") if token.strip()]
-    text = args.text
-    target_url = args.target_url
-    button_text = args.button_text
-    category = args.category
+    kwargs: dict[str, Any] = {
+        "advertiser_telegram_user_id": args.advertiser_telegram_user_id,
+        "channel_tokens": tokens,
+        "slot_type": args.slot_type,
+        "budget_cents": money_to_cents(args.budget),
+        "button_text": args.button_text,
+        "category": args.category,
+    }
     if args.material_id:
-        material = app.materials.get_material(
-            args.material_id,
-            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
-        )
-        text = material["text"]
-        target_url = material["target_url"]
-        button_text = material["button_text"]
-        category = material["category"]
-    print_json(
-        app.advertisers.create_batch_orders(
-            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
-            channel_tokens=tokens,
-            slot_type=args.slot_type,
-            text=text,
-            target_url=target_url,
-            budget_cents=money_to_cents(args.budget),
-            button_text=button_text,
-            category=category,
-        )
-    )
+        kwargs["material_id"] = args.material_id
+    else:
+        kwargs["text"] = args.text
+        kwargs["target_url"] = args.target_url
+    print_json(app.advertisers.create_batch_orders(**kwargs))
 
 
 def cmd_respond_offer(args: argparse.Namespace) -> None:

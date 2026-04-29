@@ -2880,6 +2880,64 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(len(free_results), 5)
         self.assertEqual(len(paid_results), 7)
 
+    def test_create_batch_orders_with_material_id_reuses_creative(self) -> None:
+        channel_a = self.bind_channel()
+        channel_b = self.app.channels.bind_channel(
+            telegram_chat_id=-100124,
+            title="测试频道B",
+            username="test_channel_b",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主B",
+        )
+        self.topup_advertiser("50")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="共享素材",
+            target_url="https://example.com/share",
+        )
+
+        batch = self.app.advertisers.create_batch_orders(
+            advertiser_telegram_user_id=10001,
+            channel_tokens=[channel_a["ref_token"], channel_b["ref_token"]],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.assertEqual(batch["created_count"], 2)
+        with self.app.db.transaction() as conn:
+            creative_ids = [
+                row["creative_id"]
+                for row in conn.execute(
+                    "SELECT creative_id FROM ad_orders WHERE id IN (?, ?)",
+                    (batch["results"][0]["order_id"], batch["results"][1]["order_id"]),
+                ).fetchall()
+            ]
+        self.assertEqual(set(creative_ids), {material["id"]})
+
+        # Library should still be a single material (no inline duplicates)
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in items], [material["id"]])
+
+    def test_create_batch_orders_requires_material_or_inline(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("50")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.advertisers.create_batch_orders(
+                advertiser_telegram_user_id=10001,
+                channel_tokens=[channel["ref_token"]],
+                slot_type="standard_card",
+                budget_cents=money_to_cents("5"),
+            )
+
     def test_advertiser_report_and_batch_orders(self) -> None:
         channel_a = self.bind_channel()
         channel_b = self.app.channels.bind_channel(

@@ -992,8 +992,54 @@ class UpdateHandler:
         elif panel == "creative":
             lines.extend(["", "📁 广告素材", "选择已有素材，或创建一条新素材。"])
         elif panel == "confirm":
-            lines.extend(["", "✅ 费用确认", "确认后冻结预算，发布成功才扣费。"])
+            lines.extend(["", "✅ 费用确认"])
+            lines.extend(self._placement_cost_breakdown(channel, payload))
+            lines.append("确认后冻结预算，发布成功才扣费。")
         return "\n".join(lines)
+
+    def _placement_cost_breakdown(self, channel: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+        """One-shot cost breakdown for the placement confirm panel.
+
+        Shows: per-delivery base / pin multiplier / period multiplier / total,
+        plus the publisher-net / platform-fee split so advertisers know how
+        the cents are routed.
+        """
+        slot_type = payload.get("slot_type")
+        if not slot_type:
+            return ["报价待计算 — 先选展示形态。"]
+        normalized = self.channels.normalize_slot_type(slot_type)
+        base_unit = self._slot_price_cents(payload["channel_id"], normalized)
+        pin_on = bool(payload.get("pin")) and normalized in PINNABLE_PLACEMENT_SLOTS
+        pin_unit = base_unit * 2 if pin_on else base_unit
+        period_cfg = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
+        deliveries = int(period_cfg["deliveries"])
+        discount_bps = int(period_cfg["discount_bps"])
+        per_delivery = max(1, round(pin_unit * discount_bps / 10000))
+        total = per_delivery * deliveries
+
+        with self.db.transaction() as conn:
+            cfg = conn.execute(
+                "SELECT service_fee_bps FROM channel_configs WHERE channel_id = ?",
+                (payload["channel_id"],),
+            ).fetchone()
+        fee_bps = int(cfg["service_fee_bps"]) if cfg else self.settings.default_service_fee_bps
+        platform_fee = (total * fee_bps) // 10_000
+        publisher_net = total - platform_fee
+
+        lines = ["📊 报价拆解"]
+        lines.append(f"• 基准 USD {cents_to_money(base_unit)} / 次")
+        if pin_on:
+            lines.append(f"• 置顶加价 ×2 → USD {cents_to_money(pin_unit)} / 次")
+        if discount_bps != 10_000:
+            discount_pct = discount_bps / 100  # bps→%
+            lines.append(f"• {period_cfg['label']}: {deliveries} 次 × {discount_pct:.0f}% 折扣")
+        lines.append(f"• 单次结算 USD {cents_to_money(per_delivery)} × {deliveries} 次 = USD {cents_to_money(total)}")
+        if fee_bps > 0:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 USD {cents_to_money(platform_fee)} ({fee_bps/100:.1f}%)")
+        else:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 0% (推广按钮 / 高级订阅)")
+        lines.append("")
+        return lines
 
     def _placement_keyboard(self, panel: str, payload: dict[str, Any], creatives: list[Any] | None = None) -> list[list[dict[str, str]]]:
         if panel == "display":

@@ -400,6 +400,45 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("中档", msg["text"])
         self.assertIn("高档", msg["text"])
 
+    def test_placement_confirm_panel_shows_cost_breakdown(self) -> None:
+        # P1-6: cost confirm panel shows base × pin × period decomposition,
+        # plus publisher-net / platform-fee split so advertiser sees where cents go.
+        self.app.ledger.manual_topup(10001, money_to_cents("100"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100135,
+            title="拆解测试频道",
+            username="breakdown_channel",
+            owner_telegram_user_id=20009,
+            owner_display_name="频道主",
+        )
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20000,
+            subscribers=50000,
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        text = self.app.update_handler._placement_text(
+            channel=channel,
+            payload={
+                "channel_id": channel["id"],
+                "slot_type": "standard_card",
+                "pin": True,
+                "period": "week",
+                "creative_text": "x",
+                "target_url": "https://example.com",
+            },
+            panel="confirm",
+        )
+        # Must show breakdown markers so advertiser sees structure
+        self.assertIn("📊 报价拆解", text)
+        self.assertIn("基准 USD", text)
+        self.assertIn("置顶加价", text)  # pin=True
+        self.assertIn("7 天循环", text)  # period=week
+        self.assertIn("频道主净收", text)
+        self.assertIn("平台服务费", text)
+
     def test_placement_display_panel_labels_each_format_with_price(self) -> None:
         # P1-5: per-format price labels in the placement display panel so
         # advertisers see costs before committing to a format.

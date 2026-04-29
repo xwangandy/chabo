@@ -942,29 +942,39 @@ class AdvertiserService:
         advertiser_telegram_user_id: str | int,
         channel_tokens: list[str],
         slot_type: str,
-        text: str,
-        target_url: str,
         budget_cents: int,
+        text: str | None = None,
+        target_url: str | None = None,
         button_text: str = "查看详情",
         category: str = "general",
+        material_id: str | None = None,
+        light_short_text: str | None = None,
     ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
             self.subscriptions.require_feature(conn, advertiser["id"], "batch_orders")
+        if material_id is None and not (text and target_url):
+            raise InvalidState("批量投放需要 material_id 或同时提供 text + target_url")
         results: list[dict[str, Any]] = []
         for token in channel_tokens:
+            kwargs: dict[str, Any] = {
+                "advertiser_telegram_user_id": advertiser_telegram_user_id,
+                "channel_token": token,
+                "slot_type": slot_type,
+                "budget_cents": budget_cents,
+                "button_text": button_text,
+                "category": category,
+                "campaign_name": "批量插播广告",
+            }
+            if material_id is not None:
+                kwargs["material_id"] = material_id
+            else:
+                kwargs["text"] = text
+                kwargs["target_url"] = target_url
+            if light_short_text is not None:
+                kwargs["light_short_text"] = light_short_text
             try:
-                order = self.orders.create_order(
-                    advertiser_telegram_user_id=advertiser_telegram_user_id,
-                    channel_token=token,
-                    slot_type=slot_type,
-                    text=text,
-                    target_url=target_url,
-                    budget_cents=budget_cents,
-                    button_text=button_text,
-                    category=category,
-                    campaign_name="批量插播广告",
-                )
+                order = self.orders.create_order(**kwargs)
                 results.append({"channel_token": token, "ok": True, "order_id": order["id"]})
             except ChaboError as exc:
                 results.append({"channel_token": token, "ok": False, "error": str(exc)})

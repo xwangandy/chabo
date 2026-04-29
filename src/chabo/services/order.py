@@ -1158,6 +1158,59 @@ class OrderService:
             """,
             (order_id,),
         )
+        self._notify_advertiser_paused(
+            conn,
+            order=order,
+            released_cents=remaining,
+            reason=reason,
+        )
+
+    def _notify_advertiser_paused(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        order: dict[str, Any],
+        released_cents: int,
+        reason: str,
+    ) -> None:
+        """Push '⚠️ 投放已暂停' to the advertiser. Silent when gateway absent."""
+        if not self.gateway:
+            return
+        account = conn.execute(
+            "SELECT telegram_user_id, available_balance_cents FROM accounts WHERE id = ?",
+            (order["advertiser_account_id"],),
+        ).fetchone()
+        if not account or not account["telegram_user_id"]:
+            return
+        channel = conn.execute(
+            "SELECT title FROM channels WHERE id = ?",
+            (order["channel_id"],),
+        ).fetchone()
+        channel_label = channel["title"] if channel else "未知频道"
+        text = (
+            "⚠️ 投放已暂停\n\n"
+            f"📺 {channel_label}\n"
+            f"📝 原因：{reason}\n"
+            f"💵 已退回剩余预算 USD {cents_to_money(released_cents)}\n"
+            f"💰 当前可用余额 USD {cents_to_money(account['available_balance_cents'])}"
+        )
+        keyboard = [
+            [{"text": "📣 我的广告", "callback_data": "advertiser:orders"}],
+            [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
+        ]
+        try:
+            self.gateway.send_private_message(
+                chat_id=account["telegram_user_id"],
+                text=text,
+                inline_keyboard=keyboard,
+            )
+        except Exception as exc:
+            logger.warning(
+                "notify_advertiser_paused_failed order=%s released_cents=%s error=%s",
+                order["id"],
+                released_cents,
+                exc,
+            )
 
     def get_order(self, conn: sqlite3.Connection, order_id: str) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (order_id,)).fetchone()

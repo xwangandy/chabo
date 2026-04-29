@@ -316,6 +316,40 @@ class AdvertiserNotificationTest(unittest.TestCase):
         self.assertIn("全额退款", msg["text"])
         self.assertIn("频道主提前删帖", msg["text"])
 
+    def test_advertiser_gets_pause_notice_when_send_fails(self) -> None:
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100130,
+            title="暂停通知频道",
+            username="pause_channel",
+            owner_telegram_user_id=20005,
+            owner_display_name="频道主",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="暂停通知测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+
+        # Simulate Telegram failing on send_ad → fulfillment marks delivery
+        # failed → calls orders.pause_and_release → should emit pause notice.
+        self.gateway.fail_send = True
+        before = len(self.gateway.private_messages)
+        result = self.app.fulfillment.dispatch_due()
+        self.assertEqual(result[0]["status"], "failed")
+
+        new_messages = self.gateway.private_messages[before:]
+        pause_msgs = [m for m in new_messages if "投放已暂停" in m["text"]]
+        self.assertEqual(len(pause_msgs), 1, f"expected one pause notice; got {new_messages}")
+        msg = pause_msgs[0]
+        self.assertEqual(msg["chat_id"], "10001")
+        self.assertIn("暂停通知频道", msg["text"])
+        self.assertIn("已退回剩余预算", msg["text"])
+
     def test_advertiser_gets_partial_refund_notice(self) -> None:
         ctx = self._setup_one_running_delivery()
         before = len(self.gateway.private_messages)

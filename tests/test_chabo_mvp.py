@@ -3620,6 +3620,108 @@ class ChaboMvpTest(unittest.TestCase):
         )
         self.assertEqual(result["type"], "callback_batch_failed")
 
+    def test_advertiser_menu_exposes_plan_entry(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu_plan",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        plan = [b for b in all_buttons if b["callback_data"] == "advertiser:plan"]
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["text"], "📦 我的套餐")
+
+    def test_advertiser_plan_panel_for_free_user_shows_both_upgrade_paths(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_free",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("Free", body)
+        self.assertIn("Pro", body)
+        self.assertIn("Enterprise", body)
+        self.assertIn("当前", body)
+        keyboard = self._last_user_facing_keyboard()
+        upgrades = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:plan:buy:")
+        ]
+        self.assertEqual(
+            sorted(b["callback_data"].removeprefix("advertiser:plan:buy:") for b in upgrades),
+            ["enterprise", "pro"],
+        )
+
+    def test_advertiser_plan_panel_for_pro_user_hides_pro_upgrade_button(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_pro",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        upgrade_callbacks = [
+            b["callback_data"] for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:plan:buy:")
+        ]
+        self.assertEqual(upgrade_callbacks, ["advertiser:plan:buy:enterprise"])
+
+    def test_advertiser_plan_buy_sends_stars_invoice_and_fulfills_on_payment(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        # Tap buy:pro → invoice sent to gateway
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_buy",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan:buy:pro",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_plan_invoice_sent")
+        self.assertEqual(result["plan"], "pro")
+        self.assertEqual(len(self.gateway.invoices), 1)
+        invoice = self.gateway.invoices[0]
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertEqual(int(result["stars_amount"]), invoice["prices"][0]["amount"])
+
+        # Simulate the user paying — fulfill_successful_payment should activate Pro
+        payment = {
+            "currency": "XTR",
+            "total_amount": result["stars_amount"],
+            "invoice_payload": invoice["payload"],
+            "telegram_payment_charge_id": "charge_pro_test",
+        }
+        self.app.stars_payments.fulfill_successful_payment(
+            payment, telegram_user_id=10001
+        )
+        status = self.app.advertiser_subscriptions.status(10001)
+        self.assertEqual(status["entitlements"]["plan"], "pro")
+
     def test_advertiser_alerts_for_free_user_explains_pro_requirement(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         self.app.update_handler.handle(

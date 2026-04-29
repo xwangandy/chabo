@@ -568,6 +568,89 @@ class DisputeService:
             )
             return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
 
+    def advertiser_open_dispute(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        order_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Advertiser-initiated dispute against the latest sent delivery on an order.
+
+        Ownership-checked: caller must be the order's advertiser. Only orders
+        with at least one delivered (sent / confirmed / refunded / disputed)
+        delivery are disputable — no point opening a case on a never-sent
+        order. The resulting dispute carries delivery_id of the most recent
+        delivery so the operator review queue can locate the evidence.
+        """
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            raise InvalidState("申诉原因不能为空")
+        if len(clean_reason) > 500:
+            raise InvalidState("申诉原因最多 500 个字")
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                raise NotFound(f"order not found: {order_id}")
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ? AND advertiser_account_id = ?",
+                (order_id, advertiser["id"]),
+            ).fetchone()
+            if not order:
+                raise NotFound(f"order not found: {order_id}")
+            delivery = conn.execute(
+                """
+                SELECT * FROM deliveries
+                WHERE order_id = ? AND status IN ('sent', 'confirmed', 'refunded', 'disputed')
+                ORDER BY COALESCE(sent_at, scheduled_at) DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+            if not delivery:
+                raise InvalidState("还没发布成功的投放，无法申诉")
+            existing = conn.execute(
+                """
+                SELECT id FROM disputes
+                WHERE delivery_id = ? AND status = 'open'
+                LIMIT 1
+                """,
+                (delivery["id"],),
+            ).fetchone()
+            if existing:
+                raise InvalidState("该投放已有进行中的申诉")
+            dispute_id = new_id("disp")
+            conn.execute(
+                """
+                INSERT INTO disputes (id, order_id, delivery_id, opened_by_account_id, reason)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (dispute_id, delivery["order_id"], delivery["id"], advertiser["id"], clean_reason),
+            )
+            conn.execute(
+                "UPDATE deliveries SET status = 'disputed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (delivery["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO evidence_snapshots (id, order_id, delivery_id, snapshot_type, payload_json)
+                VALUES (?, ?, ?, 'dispute_opened', ?)
+                """,
+                (
+                    new_id("ev"),
+                    delivery["order_id"],
+                    delivery["id"],
+                    json.dumps(
+                        {"reason": clean_reason, "opened_by": advertiser["id"], "source": "advertiser_self"},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
+
     def list_disputes(self, *, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 100))
         where = ""

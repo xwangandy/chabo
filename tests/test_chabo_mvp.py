@@ -3258,6 +3258,154 @@ class ChaboMvpTest(unittest.TestCase):
         refreshed = self.app.materials.get_material(material["id"])
         self.assertEqual(refreshed["light_short_text"], "新短入口文案")
 
+    def test_advertiser_dispute_button_appears_after_a_delivery_ships(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Before dispatch: no sent delivery → no 🚩 button
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pre",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+        # Dispatch → delivery becomes sent → button appears
+        self.app.fulfillment.dispatch_due()
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard_after = self._last_user_facing_keyboard()
+        dispute_buttons_after = [
+            b for row in keyboard_after for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(len(dispute_buttons_after), 1)
+        self.assertEqual(dispute_buttons_after[0]["callback_data"], f"advertiser:order:{order['id']}:dispute")
+
+    def test_advertiser_dispute_full_flow_marks_delivery_disputed(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+
+        # Tap 🚩 → prompt
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_dispute_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute",
+                }
+            }
+        )
+        self.assertIn("申诉原因", self._last_user_facing_text())
+
+        # Send reason
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "频道主提前删除了广告，没有完成承诺的曝光时长。",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "dispute_opened")
+        self.assertEqual(result["order_id"], order["id"])
+        dispute_id = result["dispute_id"]
+
+        with self.app.db.transaction() as conn:
+            dispute = conn.execute(
+                "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+            ).fetchone()
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ? ORDER BY scheduled_at DESC LIMIT 1",
+                (order["id"],),
+            ).fetchone()
+        self.assertEqual(dispute["status"], "open")
+        self.assertEqual(delivery["status"], "disputed")
+
+        # Conversation cleaned up
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state is None or state["flow"] != "dispute_open")
+
+    def test_advertiser_dispute_blocks_when_already_open(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+        self.app.disputes.advertiser_open_dispute(
+            advertiser_telegram_user_id=10001,
+            order_id=order["id"],
+            reason="第一次申诉",
+        )
+        # Detail page no longer offers the 🚩 button
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post_disp",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+        # Direct service call also rejects
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="想再开一次",
+            )
+
+    def test_advertiser_dispute_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.assertRaises(NotFound):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=99999,
+                order_id=order["id"],
+                reason="他人想偷开案",
+            )
+
+    def test_advertiser_dispute_requires_at_least_one_sent_delivery(self) -> None:
+        _, order = self.create_approved_order()
+        # No dispatch → no sent delivery
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="还没发就想申诉",
+            )
+
     def test_advertiser_can_stop_running_order_and_get_budget_back(self) -> None:
         _, order = self.create_approved_order(budget="10")
         self.confirm_timezone(10001, display_name="广告主")

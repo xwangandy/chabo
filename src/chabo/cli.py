@@ -37,6 +37,122 @@ def cmd_init_db(args: argparse.Namespace) -> None:
     print(f"插播数据库已初始化：{settings.db_path}")
 
 
+def cmd_preflight(args: argparse.Namespace) -> None:
+    """Pre-launch check for production deployments.
+
+    Prints a structured JSON report of: DB ping, schema migration ok,
+    backup-dir writability, token strength, and the same /health-style
+    operational counters. Exits non-zero if any critical check fails so
+    deploy scripts can gate the launch.
+    """
+    from .web import check_token_strength
+
+    settings = Settings.from_env()
+    report: dict[str, Any] = {
+        "ok": True,
+        "issues": [],
+        "warnings": [],
+        "checks": {},
+    }
+
+    # DB connect + migrate
+    try:
+        db = Database(settings.db_path)
+        db.init()
+        with db.connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(creatives)").fetchall()]
+            schema_ok = all(name in cols for name in ("advertiser_account_id", "format_type", "light_short_text", "archived_at"))
+        report["checks"]["db"] = {"ok": True, "schema_up_to_date": schema_ok}
+        if not schema_ok:
+            report["issues"].append("creatives 表缺列；服务可能未初始化最新 schema")
+            report["ok"] = False
+    except Exception as exc:
+        report["checks"]["db"] = {"ok": False, "error": str(exc)[:200]}
+        report["issues"].append(f"DB 连接 / 迁移失败：{str(exc)[:120]}")
+        report["ok"] = False
+
+    # Backup dir writable
+    backups_dir = Path(settings.db_path).parent / "backups"
+    try:
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        probe = backups_dir / ".preflight-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        report["checks"]["backup_dir"] = {"ok": True, "path": str(backups_dir)}
+    except Exception as exc:
+        report["checks"]["backup_dir"] = {"ok": False, "path": str(backups_dir), "error": str(exc)[:200]}
+        report["issues"].append(f"备份目录不可写：{backups_dir}")
+        report["ok"] = False
+
+    # Token strength
+    token_warnings = check_token_strength(
+        admin_token=settings.admin_token,
+        webhook_secret=settings.webhook_secret,
+        host=args.host or settings.web_host,
+    )
+    report["checks"]["tokens"] = {
+        "ok": not token_warnings,
+        "host": args.host or settings.web_host,
+        "warnings": token_warnings,
+    }
+    if token_warnings:
+        report["warnings"].extend(token_warnings)
+        if not args.allow_weak_tokens:
+            report["ok"] = False
+
+    # Bot config sanity
+    bot_token_set = bool(settings.bot_token)
+    bot_username_set = bool(settings.bot_username)
+    bot_ok = (bot_token_set and bot_username_set) or (not bot_token_set and not bot_username_set)
+    report["checks"]["bot"] = {
+        "ok": bot_ok,
+        "bot_token_set": bot_token_set,
+        "bot_username_set": bot_username_set,
+    }
+    if not bot_ok:
+        report["warnings"].append("CHABO_BOT_TOKEN 与 CHABO_BOT_USERNAME 必须同时配置或同时不配置")
+
+    # Operational counters
+    try:
+        app = create_app(settings)
+        with app.db.transaction() as conn:
+            counters = {
+                "pending_review_orders": conn.execute(
+                    "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'pending_review'"
+                ).fetchone()["n"],
+                "running_orders": conn.execute(
+                    "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'running'"
+                ).fetchone()["n"],
+                "scheduled_due": conn.execute(
+                    "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'scheduled' "
+                    "AND scheduled_at <= datetime('now')"
+                ).fetchone()["n"],
+                "open_disputes": conn.execute(
+                    "SELECT COUNT(*) AS n FROM disputes WHERE status = 'open'"
+                ).fetchone()["n"],
+                "failed_recent": conn.execute(
+                    "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' "
+                    "AND updated_at >= datetime('now', '-1 day')"
+                ).fetchone()["n"],
+                "pending_topups": conn.execute(
+                    "SELECT COUNT(*) AS n FROM topup_requests WHERE status = 'pending'"
+                ).fetchone()["n"],
+            }
+        report["checks"]["ops"] = counters
+        if counters["scheduled_due"] > 0:
+            report["warnings"].append(
+                f"{counters['scheduled_due']} 个到期投放未发送，启动后请尽快跑 dispatch-due"
+            )
+    except Exception as exc:
+        report["checks"]["ops"] = {"error": str(exc)[:200]}
+        report["warnings"].append(f"运营计数读取失败：{str(exc)[:120]}")
+
+    print_json(report)
+    if not report["ok"]:
+        sys.exit(2)
+
+
 def cmd_backup_db(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
     target = args.target
@@ -666,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backup-db", help="把 SQLite 数据库备份到文件；不传 --target 时自动写到 <db_dir>/backups/chabo-YYYYMMDD-HHMMSS.sqlite3")
     p.add_argument("--target", help="备份输出路径")
     p.set_defaults(func=cmd_backup_db)
+
+    p = sub.add_parser("preflight", help="生产部署前自检：DB / schema / 备份目录 / token 强度 / Bot 配置 / 运营计数；critical 问题非零退出")
+    p.add_argument("--host", help="覆盖 web_host 用于 token 强度判断（loopback 可放过缺 token）")
+    p.add_argument("--allow-weak-tokens", action="store_true", help="只在告警里报 token 弱，不影响退出码（仅限 staging 调试用）")
+    p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("init-db", help="初始化 SQLite 数据库")
     p.set_defaults(func=cmd_init_db)

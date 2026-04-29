@@ -4224,7 +4224,22 @@ class UpdateHandler:
         if not chat_id:
             return {"handled": False, "reason": "missing_chat"}
         if state["step"] != "budget_input":
-            return {"handled": False, "reason": "unsupported_batch_step"}
+            # User typed text while the panel is in select_channels (or anywhere
+            # else that doesn't take input). Acknowledge so the bot doesn't
+            # appear broken; the panel itself is still in chat with working
+            # buttons.
+            self.gateway.send_private_message(
+                chat_id=chat_id,
+                text=(
+                    "请用上方面板的按钮选择频道，或点 💵 改单频道预算 来调整预算。\n"
+                    "想退出批量投放,点 ↩️ 取消。"
+                ),
+                inline_keyboard=[
+                    [{"text": "💵 改单频道预算", "callback_data": "advertiser:batch:budget"}],
+                    [{"text": "↩️ 取消", "callback_data": "advertiser:batch:cancel"}],
+                ],
+            )
+            return {"handled": True, "type": "batch_orders_text_hint"}
         clean_text = (text or "").strip()
         try:
             budget_cents = money_to_cents(clean_text)

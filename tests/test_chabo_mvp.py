@@ -2443,6 +2443,91 @@ class ChaboMvpTest(unittest.TestCase):
         )
         self.assertEqual(result["type"], "callback_batch_failed")
 
+    def test_advertiser_alerts_for_free_user_explains_pro_requirement(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_free",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("Pro", body)
+        self.assertIn("create-alert-rule", body)
+
+    def test_advertiser_alerts_empty_for_pro_user_with_no_rules(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_pro_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("暂无新提醒", body)
+
+    def test_advertiser_alerts_lists_triggered_events_with_play_buttons(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        channel = self.bind_channel()
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+        self.app.advertisers.create_alert_rule(
+            advertiser_telegram_user_id=10001,
+            category="software",
+            min_score=0,
+            max_risk_level="normal",
+        )
+        self.app.advertisers.scan_alerts(advertiser_telegram_user_id=10001)
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_pro",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn(channel["title"], body)
+        self.assertIn("🆕", body)
+        keyboard = self._last_user_facing_keyboard()
+        play_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("channel:order:")
+        ]
+        self.assertEqual(len(play_buttons), 1)
+        self.assertEqual(play_buttons[0]["callback_data"], f"channel:order:{channel['id']}")
+
     def test_remove_saved_channel_returns_true_only_when_row_existed(self) -> None:
         channel = self.bind_channel()
         self.app.advertisers.save_channel(

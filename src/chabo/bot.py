@@ -302,6 +302,9 @@ class UpdateHandler:
         if data == "advertiser:saved":
             self._send_advertiser_saved(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_saved"}
+        if data == "advertiser:alerts":
+            self._send_advertiser_alerts(chat_id, user, message)
+            return {"handled": True, "type": "callback_advertiser_alerts"}
         if data.startswith("advertiser:save:"):
             tail = data.removeprefix("advertiser:save:")
             origin, _, channel_id = tail.partition(":")
@@ -799,7 +802,87 @@ class UpdateHandler:
 
         keyboard = [play_buttons, unsave_buttons]
         keyboard.append([
+            {"text": "🔔 新频道提醒", "callback_data": "advertiser:alerts"},
+        ])
+        keyboard.append([
             {"text": "🔍 找频道", "callback_data": "advertiser:discover"},
+            {"text": "🏠 主菜单", "callback_data": "menu:home"},
+        ])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _send_advertiser_alerts(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        try:
+            events = self.advertisers.list_alert_events(user_id, status=None)
+        except InvalidState as exc:
+            # Free tier — no alerts feature
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=(
+                    "🔔 新频道提醒\n\n"
+                    f"ℹ️ {exc}\n"
+                    "升级到 Pro 套餐后可设置提醒规则，新评估的频道达标会自动通知。\n"
+                    "目前可在 CLI 使用 `chabo create-alert-rule` 创建规则。"
+                ),
+                inline_keyboard=[
+                    [{"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+        except Exception as exc:
+            logger.warning("list_alert_events_failed user=%s error=%s", user_id, exc)
+            events = []
+
+        lines = ["🔔 新频道提醒", ""]
+        if not events:
+            lines.extend([
+                "暂无新提醒。",
+                "",
+                "提醒规则目前在 CLI 创建：",
+                "`chabo create-alert-rule --advertiser-telegram-user-id <你的 ID> --category <类目> --min-score 70`",
+            ])
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="\n".join(lines),
+                inline_keyboard=[
+                    [{"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
+                    [{"text": "🔍 找频道", "callback_data": "advertiser:discover"}],
+                    [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                ],
+            )
+            return
+
+        play_buttons: list[dict[str, str]] = []
+        for index, event in enumerate(events[: len(self.DISCOVER_LIST_NUMBERS)]):
+            number = self.DISCOVER_LIST_NUMBERS[index]
+            risk_emoji = self.DISCOVER_RISK_EMOJI.get(event.get("risk_level"), "⚪️")
+            category_label = self.CATEGORY_VALUE.get(event.get("category") or "general", ("通用", ""))[0]
+            status_mark = "🆕" if event.get("status") == "new" else "·"
+            lines.append(
+                f"{number} {status_mark} {event['title']}"
+                f"｜🏷 {category_label}｜{risk_emoji}｜⭐ {event.get('score') or 0}"
+            )
+            play_buttons.append({
+                "text": f"▶ {number}",
+                "callback_data": f"channel:order:{event['channel_id']}",
+            })
+
+        keyboard = [play_buttons]
+        keyboard.append([
+            {"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"},
             {"text": "🏠 主菜单", "callback_data": "menu:home"},
         ])
         self._reply_or_edit(

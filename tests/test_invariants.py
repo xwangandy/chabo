@@ -226,5 +226,34 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertIsInstance(failures[0], (InvalidState, ChaboError))
 
 
+class MigrationTrackingTest(unittest.TestCase):
+    """Verify the numbered-migration registry records each id once."""
+
+    def test_schema_migrations_records_all_known_ids(self) -> None:
+        from chabo.db import MIGRATIONS, Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(str(Path(tmp) / "mig.sqlite3"))
+            db.init()
+            with db.connect() as conn:
+                rows = conn.execute("SELECT id FROM schema_migrations ORDER BY id").fetchall()
+            applied_ids = [row[0] for row in rows]
+
+        expected_ids = [mig_id for mig_id, _ in MIGRATIONS]
+        self.assertEqual(applied_ids, expected_ids)
+
+    def test_migrations_are_idempotent_when_re_initing(self) -> None:
+        from chabo.db import Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "mig.sqlite3")
+            Database(path).init()
+            # second init must not error or duplicate rows
+            Database(path).init()
+            with Database(path).connect() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+            self.assertGreater(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

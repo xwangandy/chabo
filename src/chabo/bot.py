@@ -848,10 +848,10 @@ class UpdateHandler:
                 text=(
                     "🔔 新频道提醒\n\n"
                     f"ℹ️ {exc}\n"
-                    "升级到 Pro 套餐后可设置提醒规则，新评估的频道达标会自动通知。\n"
-                    "目前可在 CLI 使用 `chabo create-alert-rule` 创建规则。"
+                    "升级到 Pro 套餐后可设置提醒规则，新评估的频道达标会自动通知。"
                 ),
                 inline_keyboard=[
+                    [{"text": "📦 升级套餐", "callback_data": "advertiser:plan"}],
                     [{"text": "⭐ 我的收藏", "callback_data": "advertiser:saved"}],
                     [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
                 ],
@@ -3314,7 +3314,7 @@ class UpdateHandler:
         lines.append("")
         if deliveries:
             total_clicks = sum(clicks_by_delivery.values())
-            lines.append(f"🚀 发布记录（近 {len(deliveries)} 条，详情页点击合计 {total_clicks}）")
+            lines.append(f"🚀 发布记录（近 {len(deliveries)} 条 · 订单累计点击 {total_clicks}）")
             for delivery in deliveries:
                 status_icon = self._delivery_status_icon(delivery["status"])
                 when_label = self._format_local_time(delivery["sent_at"] or delivery["scheduled_at"], tz_name)

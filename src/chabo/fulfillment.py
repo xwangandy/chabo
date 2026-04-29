@@ -23,7 +23,7 @@ class FulfillmentService:
         self.gateway = gateway
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
-        self.orders = OrderService(db, settings)
+        self.orders = OrderService(db, settings, gateway=gateway)
 
     def dispatch_due(self, limit: int = 20) -> list[dict[str, Any]]:
         sent: list[dict[str, Any]] = []

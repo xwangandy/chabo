@@ -63,7 +63,7 @@ def create_app(settings: Settings | None = None, gateway: MessageGateway | None 
         channels=ChannelService(db, settings),
         ledger=LedgerService(db, settings),
         materials=MaterialService(db, settings),
-        orders=OrderService(db, settings),
+        orders=OrderService(db, settings, gateway=gateway),
         disputes=DisputeService(db, settings),
         pricing=PricingService(db, settings),
         price_offers=PriceOfferService(db, settings),

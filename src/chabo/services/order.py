@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,7 +10,10 @@ from typing import Any
 from ..config import Settings
 from ..db import Database
 from ..ids import new_id, new_ref_token
-from ..money import bps_amount
+from ..money import bps_amount, cents_to_money
+
+
+logger = logging.getLogger(__name__)
 
 from ._common import (
     ChaboError,
@@ -503,9 +507,16 @@ class DisputeService:
 
 
 class OrderService:
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(self, db: Database, settings: Settings, gateway: Any | None = None):
+        """Optional gateway is used for advertiser notifications.
+
+        When None, refund / pause notifications are silently skipped — keeps
+        OrderService pure-DB for unit tests that don't need notifications,
+        while production wires the real Telegram gateway in via app.py.
+        """
         self.db = db
         self.settings = settings
+        self.gateway = gateway
         self.accounts = AccountService(db, settings)
         self.channels = ChannelService(db, settings)
         self.ledger = LedgerService(db, settings)
@@ -1049,10 +1060,63 @@ class OrderService:
                 note,
             ),
         )
+        self._notify_advertiser_refunded(
+            conn,
+            order=order,
+            channel=channel,
+            refund_cents=amount_cents,
+            full_refund=full_refund,
+            reason=reason,
+        )
         return {
             "order": self.get_order(conn, order["id"]),
             "delivery": dict(conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery["id"],)).fetchone()),
         }
+
+    def _notify_advertiser_refunded(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        order: dict[str, Any],
+        channel: sqlite3.Row,
+        refund_cents: int,
+        full_refund: bool,
+        reason: str,
+    ) -> None:
+        """Push '💰 退款已到账' to the advertiser. Silent when gateway absent."""
+        if not self.gateway:
+            return
+        account = conn.execute(
+            "SELECT telegram_user_id, available_balance_cents FROM accounts WHERE id = ?",
+            (order["advertiser_account_id"],),
+        ).fetchone()
+        if not account or not account["telegram_user_id"]:
+            return
+        kind_label = "全额退款" if full_refund else "部分退款"
+        text = (
+            f"💰 {kind_label}已到账\n\n"
+            f"📺 {channel['title']}\n"
+            f"🔁 退款 USD {cents_to_money(refund_cents)}\n"
+            f"💵 当前可用余额 USD {cents_to_money(account['available_balance_cents'])}\n"
+            f"📝 原因：{reason}"
+        )
+        keyboard = [
+            [{"text": "📣 我的广告", "callback_data": "advertiser:orders"}],
+            [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
+        ]
+        try:
+            self.gateway.send_private_message(
+                chat_id=account["telegram_user_id"],
+                text=text,
+                inline_keyboard=keyboard,
+            )
+        except Exception as exc:
+            logger.warning(
+                "notify_advertiser_refunded_failed order=%s delivery_refund_cents=%s error=%s",
+                order["id"],
+                refund_cents,
+                exc,
+            )
 
     def _split_refund_amount(
         self,

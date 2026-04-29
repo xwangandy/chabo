@@ -241,6 +241,27 @@ class AdvertiserNotificationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def _setup_one_running_delivery(self) -> dict:
+        self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
+        channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100129,
+            title="退款通知频道",
+            username="refund_channel",
+            owner_telegram_user_id=20004,
+            owner_display_name="频道主",
+        )
+        order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=channel["ref_token"],
+            slot_type="standard",
+            text="退款通知测试",
+            target_url="https://example.com",
+            budget_cents=money_to_cents("10"),
+        )
+        self.app.orders.approve_order(order["id"])
+        delivered = self.app.fulfillment.dispatch_due()
+        return {"channel": channel, "delivery_id": delivered[0]["delivery_id"]}
+
     def test_advertiser_gets_private_notice_after_delivery(self) -> None:
         self.app.ledger.manual_topup(10001, money_to_cents("20"), display_name="广告主")
         channel = self.app.channels.bind_channel(
@@ -280,6 +301,35 @@ class AdvertiserNotificationTest(unittest.TestCase):
             if "url" in btn
         ]
         self.assertTrue(any(u.startswith("https://t.me/ChaBoTestBot?start=ad_") for u in urls), urls)
+
+    def test_advertiser_gets_full_refund_notice(self) -> None:
+        ctx = self._setup_one_running_delivery()
+        before = len(self.gateway.private_messages)
+        self.app.orders.refund_delivery(ctx["delivery_id"], reason="频道主提前删帖")
+
+        new_messages = self.gateway.private_messages[before:]
+        refund_msgs = [m for m in new_messages if "退款已到账" in m["text"]]
+        self.assertEqual(len(refund_msgs), 1, f"expected one refund notice; got {new_messages}")
+        msg = refund_msgs[0]
+        self.assertEqual(msg["chat_id"], "10001")
+        self.assertIn("退款通知频道", msg["text"])
+        self.assertIn("全额退款", msg["text"])
+        self.assertIn("频道主提前删帖", msg["text"])
+
+    def test_advertiser_gets_partial_refund_notice(self) -> None:
+        ctx = self._setup_one_running_delivery()
+        before = len(self.gateway.private_messages)
+        self.app.orders.refund_delivery_partial(
+            ctx["delivery_id"],
+            money_to_cents("0.50"),
+            reason="部分补偿广告主",
+        )
+
+        new_messages = self.gateway.private_messages[before:]
+        refund_msgs = [m for m in new_messages if "退款已到账" in m["text"]]
+        self.assertEqual(len(refund_msgs), 1)
+        self.assertIn("部分退款", refund_msgs[0]["text"])
+        self.assertIn("USD 0.50", refund_msgs[0]["text"])
 
 
 class MigrationTrackingTest(unittest.TestCase):

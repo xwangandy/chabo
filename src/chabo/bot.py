@@ -52,7 +52,7 @@ class UpdateHandler:
         self.ledger = LedgerService(db, settings)
         self.light_probes = LightProbeService(db, settings)
         self.materials = MaterialService(db, settings)
-        self.orders = OrderService(db, settings)
+        self.orders = OrderService(db, settings, gateway=gateway)
         self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
 

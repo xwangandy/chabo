@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import html
 from typing import Any
 
 from .config import Settings
@@ -79,13 +80,19 @@ class FulfillmentService:
         ad_text = creative["text"]
         button_text = creative["button_text"]
         message_id: str
-        if slot["slot_type"] == "light_tail":
-            short_text = creative["button_text"] or "查看详情"
-            inserted_message_id = self._insert_light_tail_into_latest_post(conn, channel, short_text, track_url)
+        if slot["slot_type"] in {"light_tail", "button_tail"}:
+            short_text = creative["short_text"] or creative["button_text"] or "查看详情"
+            inserted_message_id = self._insert_tail_into_latest_post(
+                conn,
+                channel,
+                short_text if slot["slot_type"] == "light_tail" else None,
+                "查看完整广告" if slot["slot_type"] == "light_tail" else creative["button_text"] or "查看详情",
+                track_url,
+            )
             if inserted_message_id:
                 message_id = inserted_message_id
             else:
-                ad_text = f"🔖 {short_text}"
+                ad_text = f"🔖 {short_text}" if slot["slot_type"] == "light_tail" else f"🔗 {creative['button_text'] or '查看详情'}"
                 button_text = "查看完整广告"
                 try:
                     message_id = self.gateway.send_ad(
@@ -98,13 +105,25 @@ class FulfillmentService:
                     self._mark_delivery_failed(conn, delivery, order, str(exc))
                     return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
         else:
+            if slot["slot_type"] in {"standard_card", "pin24h"} and creative["standard_text"]:
+                ad_text = creative["standard_text"]
             try:
-                message_id = self.gateway.send_ad(
-                    chat_id=channel["telegram_chat_id"],
-                    text=ad_text,
-                    button_text=button_text,
-                    button_url=track_url,
-                )
+                if creative["media_file_id"] and slot["slot_type"] in {"standard_card", "pin24h"}:
+                    message_id = self.gateway.send_media_ad(
+                        chat_id=channel["telegram_chat_id"],
+                        media_file_id=creative["media_file_id"],
+                        media_type=creative["media_type"] or "photo",
+                        caption=ad_text,
+                        button_text=button_text,
+                        button_url=track_url,
+                    )
+                else:
+                    message_id = self.gateway.send_ad(
+                        chat_id=channel["telegram_chat_id"],
+                        text=ad_text,
+                        button_text=button_text,
+                        button_url=track_url,
+                    )
             except TelegramError as exc:
                 self._mark_delivery_failed(conn, delivery, order, str(exc))
                 return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
@@ -155,15 +174,17 @@ class FulfillmentService:
         )
         self._snapshot(conn, order["id"], delivery["id"], "send_log", {"message_id": message_id, "pinned": bool(pinned)})
         self._snapshot(conn, order["id"], delivery["id"], "channel_config", dict(config))
+        self._notify_publisher_income(conn, channel, creative, message_id, publisher_net)
         self._maybe_notify_budget(conn, order["id"])
         self.orders.maybe_schedule_next(conn, order["id"])
         return {"delivery_id": delivery["id"], "status": "sent", "message_id": message_id}
 
-    def _insert_light_tail_into_latest_post(
+    def _insert_tail_into_latest_post(
         self,
         conn: sqlite3.Connection,
         channel: sqlite3.Row,
-        short_text: str,
+        short_text: str | None,
+        button_text: str,
         track_url: str,
     ) -> str | None:
         row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (f"channel_latest_post:{channel['id']}",)).fetchone()
@@ -176,12 +197,12 @@ class FulfillmentService:
         original_text = str(latest.get("text") or "").strip()
         if not original_text:
             return None
-        insertion = f"🔖 {short_text}"
-        updated_text = original_text if insertion in original_text else f"{original_text}\n\n{insertion}"
+        insertion = f"🔖 {short_text}" if short_text else ""
+        updated_text = original_text if not insertion or insertion in original_text else f"{original_text}\n\n{insertion}"
         if len(updated_text) > 3900:
             return None
         keyboard = latest.get("inline_keyboard") or []
-        detail_button = {"text": "查看完整广告", "url": track_url}
+        detail_button = {"text": button_text, "url": track_url}
         if not any(button.get("url") == track_url for row_buttons in keyboard for button in row_buttons):
             keyboard.append([detail_button])
         try:
@@ -247,9 +268,103 @@ class FulfillmentService:
             if account and account["telegram_user_id"]:
                 self.gateway.send_private_message(
                     chat_id=account["telegram_user_id"],
-                    text=f"你的插播预算已低于 20%，订单 {order_id} 剩余预算即将用完。",
-                )
+                text=f"你的插播预算已低于 20%，订单 {order_id} 剩余预算即将用完。",
+            )
             self.orders.mark_low_budget_notified(conn, order_id)
+
+    def _notify_publisher_income(
+        self,
+        conn: sqlite3.Connection,
+        channel: sqlite3.Row,
+        creative: sqlite3.Row,
+        message_id: str,
+        publisher_net_cents: int,
+    ) -> None:
+        if publisher_net_cents <= 0:
+            return
+        recipients = self._publisher_income_notification_recipients(conn, channel)
+        if not recipients:
+            return
+        post_url = self._channel_post_url(channel, message_id)
+        channel_name = html.escape(str(channel["title"]))
+        channel_label = f'<a href="{html.escape(post_url)}">{channel_name}</a>' if post_url else f"<b>{channel_name}</b>"
+        campaign = conn.execute("SELECT * FROM campaigns WHERE id = ?", (creative["campaign_id"],)).fetchone()
+        ad_label = self._short_text(str((campaign["name"] if campaign else None) or creative["text"] or "广告"), 22)
+        keyboard = [
+            [
+                {"text": "🔕 关闭通知", "callback_data": "publisher:disable_income_notifications"},
+                {"text": "💰 我的钱包", "callback_data": "publisher:earnings"},
+            ]
+        ]
+        for account in recipients:
+            total_cents = (
+                int(account["pending_earnings_cents"] or 0)
+                + int(account["confirmed_earnings_cents"] or 0)
+            )
+            text = (
+                f"<b>💸 收入到账 +USD {self._money(publisher_net_cents)}</b>\n\n"
+                f"频道：{channel_label}\n"
+                f"广告：{html.escape(ad_label)}\n"
+                f"当前收益：USD {self._money(total_cents)}"
+            )
+            try:
+                self.gateway.send_private_message(
+                    chat_id=account["telegram_user_id"],
+                    text=text,
+                    inline_keyboard=keyboard,
+                    parse_mode="HTML",
+                )
+            except TelegramError as exc:
+                self._snapshot(
+                    conn,
+                    None,
+                    None,
+                    "publisher_income_notification_failed",
+                    {"channel_id": channel["id"], "account_id": account["id"], "error": str(exc)},
+                )
+
+    def _publisher_income_notification_recipients(self, conn: sqlite3.Connection, channel: sqlite3.Row) -> list[sqlite3.Row]:
+        rows = conn.execute(
+            """
+            SELECT a.*
+            FROM accounts a
+            WHERE a.id = ?
+              AND a.telegram_user_id IS NOT NULL
+              AND a.publisher_income_notifications_enabled = 1
+            UNION
+            SELECT a.*
+            FROM channel_admins ca
+            JOIN accounts a ON a.telegram_user_id = ca.telegram_user_id
+            WHERE ca.channel_id = ?
+              AND ca.status IN ('creator', 'administrator')
+              AND ca.is_bot = 0
+              AND a.telegram_user_id IS NOT NULL
+              AND a.publisher_income_notifications_enabled = 1
+            """,
+            (channel["owner_account_id"], channel["id"]),
+        ).fetchall()
+        unique: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            unique[str(row["telegram_user_id"])] = row
+        return list(unique.values())
+
+    def _channel_post_url(self, channel: sqlite3.Row, message_id: str) -> str | None:
+        username = str(channel["username"] or "").strip().lstrip("@")
+        if username:
+            return f"https://t.me/{username}/{message_id}"
+        chat_id = str(channel["telegram_chat_id"] or "")
+        if chat_id.startswith("-100"):
+            return f"https://t.me/c/{chat_id[4:]}/{message_id}"
+        return None
+
+    def _short_text(self, text: str, limit: int) -> str:
+        text = " ".join((text or "").strip().split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."
+
+    def _money(self, amount_cents: int) -> str:
+        return f"{amount_cents / 100:.2f}"
 
     def _snapshot(
         self,

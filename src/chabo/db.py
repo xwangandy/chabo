@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     pending_earnings_cents INTEGER NOT NULL DEFAULT 0,
     confirmed_earnings_cents INTEGER NOT NULL DEFAULT 0,
     releasable_earnings_cents INTEGER NOT NULL DEFAULT 0,
+    publisher_income_notifications_enabled INTEGER NOT NULL DEFAULT 1,
     timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
     timezone_confirmed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -191,6 +192,23 @@ CREATE TABLE IF NOT EXISTS advertiser_saved_channels (
     UNIQUE(advertiser_account_id, channel_id)
 );
 
+CREATE TABLE IF NOT EXISTS advertiser_channel_collections (
+    id TEXT PRIMARY KEY,
+    advertiser_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(advertiser_account_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS advertiser_channel_collection_items (
+    id TEXT PRIMARY KEY,
+    collection_id TEXT NOT NULL REFERENCES advertiser_channel_collections(id) ON DELETE CASCADE,
+    channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(collection_id, channel_id)
+);
+
 CREATE TABLE IF NOT EXISTS advertiser_alert_rules (
     id TEXT PRIMARY KEY,
     advertiser_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -276,6 +294,10 @@ CREATE TABLE IF NOT EXISTS creatives (
     text TEXT NOT NULL,
     target_url TEXT NOT NULL,
     button_text TEXT NOT NULL DEFAULT '查看详情',
+    short_text TEXT,
+    standard_text TEXT,
+    media_file_id TEXT,
+    media_type TEXT,
     category TEXT NOT NULL DEFAULT 'general',
     status TEXT NOT NULL DEFAULT 'pending_review',
     content_hash TEXT NOT NULL,
@@ -438,6 +460,8 @@ CREATE INDEX IF NOT EXISTS idx_channel_subscriptions_channel ON channel_subscrip
 CREATE INDEX IF NOT EXISTS idx_light_probes_channel ON light_probes(channel_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_light_probe_events_probe ON light_probe_events(probe_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_saved_channels_advertiser ON advertiser_saved_channels(advertiser_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_collections_account ON advertiser_channel_collections(advertiser_account_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_channel_collection_items_collection ON advertiser_channel_collection_items(collection_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_alert_rules_advertiser ON advertiser_alert_rules(advertiser_account_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_alert_events_advertiser ON advertiser_alert_events(advertiser_account_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_advertiser_subscriptions_account ON advertiser_subscriptions(advertiser_account_id, status, expires_at);
@@ -480,6 +504,11 @@ class Database:
             "ALTER TABLE deliveries ADD COLUMN platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE accounts ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai'",
             "ALTER TABLE accounts ADD COLUMN timezone_confirmed_at TEXT",
+            "ALTER TABLE accounts ADD COLUMN publisher_income_notifications_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE creatives ADD COLUMN short_text TEXT",
+            "ALTER TABLE creatives ADD COLUMN standard_text TEXT",
+            "ALTER TABLE creatives ADD COLUMN media_file_id TEXT",
+            "ALTER TABLE creatives ADD COLUMN media_type TEXT",
         ]
         for statement in statements:
             try:

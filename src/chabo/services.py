@@ -599,6 +599,7 @@ class ChannelService:
     }
     DEFAULT_RATES = {
         "light_tail": ("per_tail", 300),
+        "button_tail": ("per_button", 500),
         "standard_card": ("per_post", 1_000),
         "strong_post": ("per_post", 1_800),
         "pin24h": ("per_24h_pin", 2_500),
@@ -983,6 +984,7 @@ class OrderService:
         campaign_name: str = "插播广告",
         unit_price_override_cents: int | None = None,
         price_offer_id: str | None = None,
+        existing_creative_id: str | None = None,
     ) -> dict[str, Any]:
         scheduled_at = scheduled_at or utcnow()
         slot_type = self.channels.normalize_slot_type(slot_type)
@@ -1015,26 +1017,44 @@ class OrderService:
             unit_price_cents = unit_price_override_cents or rate["unit_price_cents"]
             if budget_cents < unit_price_cents:
                 raise InvalidState("插播预算低于该广告位单次刊例价")
-            campaign_id = new_id("camp")
-            creative_id = new_id("cre")
-            order_id = new_id("ord")
-            content_hash = hashlib.sha256(f"{text}|{target_url}|{button_text}".encode("utf-8")).hexdigest()
-            conn.execute(
-                """
-                INSERT INTO campaigns (id, advertiser_account_id, name)
-                VALUES (?, ?, ?)
-                """,
-                (campaign_id, advertiser["id"], campaign_name),
-            )
-            conn.execute(
-                """
-                INSERT INTO creatives (
-                    id, campaign_id, text, target_url, button_text, category, content_hash
+            if existing_creative_id:
+                creative = conn.execute(
+                    """
+                    SELECT cr.*, ca.advertiser_account_id
+                    FROM creatives cr
+                    JOIN campaigns ca ON ca.id = cr.campaign_id
+                    WHERE cr.id = ?
+                    """,
+                    (existing_creative_id,),
+                ).fetchone()
+                if not creative or creative["advertiser_account_id"] != advertiser["id"] or creative["status"] == "rejected":
+                    raise InvalidState("广告素材不存在或不可用于当前账户")
+                campaign_id = creative["campaign_id"]
+                creative_id = creative["id"]
+                text = creative["text"]
+                target_url = creative["target_url"]
+                button_text = creative["button_text"]
+            else:
+                campaign_id = new_id("camp")
+                creative_id = new_id("cre")
+                content_hash = hashlib.sha256(f"{text}|{target_url}|{button_text}".encode("utf-8")).hexdigest()
+                conn.execute(
+                    """
+                    INSERT INTO campaigns (id, advertiser_account_id, name)
+                    VALUES (?, ?, ?)
+                    """,
+                    (campaign_id, advertiser["id"], campaign_name),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (creative_id, campaign_id, text, target_url, button_text, category, content_hash),
-            )
+                conn.execute(
+                    """
+                    INSERT INTO creatives (
+                        id, campaign_id, text, target_url, button_text, category, content_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (creative_id, campaign_id, text, target_url, button_text, category, content_hash),
+                )
+            order_id = new_id("ord")
             conn.execute(
                 """
                 INSERT INTO ad_orders (
@@ -2683,6 +2703,7 @@ class PricingService:
     }
     FORMAT_FACTORS_BPS = {
         "light_tail": 3000,
+        "button_tail": 5000,
         "standard_card": 10000,
         "strong_post": 18000,
         "pin24h": 25000,

@@ -12,7 +12,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from chabo.app import create_app
+from chabo.bot import UpdateHandler
 from chabo.config import Settings
+from chabo.fulfillment import FulfillmentService
 from chabo.money import money_to_cents
 from chabo.polling import PollingRunner
 from chabo.telegram import TelegramError
@@ -23,6 +25,7 @@ class FakeGateway:
     def __init__(self) -> None:
         self.next_message_id = 100
         self.sent_ads = []
+        self.sent_media_ads = []
         self.private_messages = []
         self.invoices = []
         self.pre_checkout_answers = []
@@ -54,14 +57,42 @@ class FakeGateway:
         )
         return message_id
 
+    def send_media_ad(
+        self,
+        *,
+        chat_id: str,
+        media_file_id: str,
+        media_type: str,
+        caption: str,
+        button_text: str,
+        button_url: str,
+    ) -> str:
+        if self.fail_send:
+            raise TelegramError("send failed")
+        self.next_message_id += 1
+        message_id = str(self.next_message_id)
+        self.sent_media_ads.append(
+            {
+                "chat_id": chat_id,
+                "media_file_id": media_file_id,
+                "media_type": media_type,
+                "caption": caption,
+                "button_text": button_text,
+                "button_url": button_url,
+                "message_id": message_id,
+            }
+        )
+        return message_id
+
     def send_private_message(
         self,
         *,
         chat_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> str | None:
-        self.private_messages.append({"chat_id": str(chat_id), "text": text, "inline_keyboard": inline_keyboard})
+        self.private_messages.append({"chat_id": str(chat_id), "text": text, "inline_keyboard": inline_keyboard, "parse_mode": parse_mode})
         return "pm_1"
 
     def send_invoice(
@@ -147,8 +178,9 @@ class FakeGateway:
         message_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> None:
-        self.text_edits.append({"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "inline_keyboard": inline_keyboard})
+        self.text_edits.append({"chat_id": str(chat_id), "message_id": str(message_id), "text": text, "inline_keyboard": inline_keyboard, "parse_mode": parse_mode})
 
     def edit_channel_message_text(
         self,
@@ -202,6 +234,26 @@ class ChaboMvpTest(unittest.TestCase):
                 """,
                 (account["id"],),
             )
+
+    def complete_placement_ad_asset(self, *, name: str = "测试广告资产", target_url: str = "https://asset.example") -> dict:
+        user = {"id": 10001, "first_name": "广告主"}
+        messages = [
+            {"message_id": 8101, "text": name},
+            {"message_id": 8102, "photo": [{"file_id": "photo_small"}, {"file_id": "photo_large"}]},
+            {"message_id": 8103, "text": "这是通过引导流程创建的完整广告详情，适合定制插播和详情页展示。"},
+            {"message_id": 8104, "text": target_url},
+            {"message_id": 8105, "text": "立即了解"},
+            {"message_id": 8106, "text": "限时福利"},
+            {
+                "message_id": 8107,
+                "text": "这是标准插播文案\\n最多五行\\n用于频道里克制展示",
+            },
+        ]
+        result = {"handled": False}
+        for item in messages:
+            message = {"from": user, "chat": {"id": 10001}, **item}
+            result = self.app.update_handler.handle({"message": message})
+        return result
 
     def create_approved_order(self, *, slot_type: str = "standard", budget: str = "10"):
         channel = self.bind_channel()
@@ -287,13 +339,11 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(start["channel_id"], channel["id"])
         landing = self.gateway.private_messages[-1]
         self.assertIn("给「测试频道」投放广告", landing["text"])
-        self.assertIn("展示：未选择", landing["text"])
-        self.assertIn("下一步：选择展示设置", landing["text"])
+        self.assertIn("位置：未选择", landing["text"])
+        self.assertIn("下一步：选择或添加广告", landing["text"])
+        self.assertIn("第 1/4 步：选择广告", landing["text"])
         button_texts = [button["text"] for row in landing["inline_keyboard"] for button in row]
-        self.assertIn("🧩 展示设置", button_texts)
-        self.assertIn("⏱ 发布设置", button_texts)
-        self.assertIn("📁 广告素材", button_texts)
-        self.assertIn("✅ 费用确认", button_texts)
+        self.assertIn("➕ 添加广告", button_texts)
         self.assertNotIn("🗂 广告库", button_texts)
         self.assertNotIn("💰 广告钱包", button_texts)
 
@@ -305,6 +355,21 @@ class ChaboMvpTest(unittest.TestCase):
         channel = self.bind_channel()
         self.confirm_timezone(10001, display_name="广告主")
         self.topup_advertiser("30")
+        with self.app.db.transaction() as conn:
+            account = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+            conn.execute(
+                """
+                INSERT INTO campaigns (id, advertiser_account_id, name, status)
+                VALUES ('camp_existing', ?, '已有广告', 'active')
+                """,
+                (account["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO creatives (id, campaign_id, text, target_url, button_text, status, content_hash)
+                VALUES ('cre_existing', 'camp_existing', '已有广告素材', 'https://existing.example', '查看详情', 'approved', 'hash_existing')
+                """
+            )
 
         self.app.update_handler.handle(
             {
@@ -319,13 +384,15 @@ class ChaboMvpTest(unittest.TestCase):
         display = self.app.update_handler.handle(
             {
                 "callback_query": {
-                    "id": "cb_place_display",
+                    "id": "cb_place_pick",
                     "from": {"id": 10001, "first_name": "广告主"},
                     "message": {"chat": {"id": 10001}},
-                    "data": "place:display",
+                    "data": "place:pick:0",
                 }
             }
         )
+        display_message = self.gateway.private_messages[-1]
+        display_buttons = [button["text"] for row in display_message["inline_keyboard"] for button in row]
         slot = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -336,6 +403,17 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
+        schedule = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_schedule",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:next",
+                }
+            }
+        )
+        schedule_message = self.gateway.private_messages[-1]
         pinned = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -357,13 +435,186 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(display["type"], "callback_placement_display")
+        self.assertEqual(display["type"], "callback_placement_creative_selected")
         self.assertEqual(slot["type"], "callback_placement_slot")
+        self.assertEqual(schedule["panel"], "schedule")
         self.assertEqual(pinned["type"], "callback_placement_pin")
         self.assertEqual(weekly["type"], "callback_placement_period")
-        self.assertIn("展示：标准插播 + 置顶", self.gateway.private_messages[-1]["text"])
-        self.assertIn("发布：7 天循环", self.gateway.private_messages[-1]["text"])
-        self.assertIn("费用：预计 USD 126.00", self.gateway.private_messages[-1]["text"])
+        self.assertIn("第 2/4 步：选择插播位置", display_message["text"])
+        self.assertEqual(display_buttons[:4], ["🔘 按钮插播", "✍️ 文字插播", "🧾 标准插播", "🎨 定制插播"])
+        self.assertFalse(any("置顶" in button for button in display_buttons))
+        self.assertIn("第 3/4 步：配置发布节奏", schedule_message["text"])
+        self.assertIn("📌 是否置顶：否", [button["text"] for row in schedule_message["inline_keyboard"] for button in row])
+        self.assertIn("位置：标准插播 + 置顶", self.gateway.private_messages[-1]["text"])
+        self.assertIn("节奏：连续 1 周", self.gateway.private_messages[-1]["text"])
+        self.assertIn("预算：预计 USD 126.00", self.gateway.private_messages[-1]["text"])
+
+    def test_guided_placement_flow_selects_ad_then_position_and_skips_rhythm_for_button_tail(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("20")
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_guided_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        first_page = self.gateway.private_messages[-1]
+        first_buttons = [button["text"] for row in first_page["inline_keyboard"] for button in row]
+
+        self.assertIn("第 1/4 步：选择广告", first_page["text"])
+        self.assertIn("➕ 添加广告", first_buttons)
+        self.assertNotIn("下一步 ➡️", first_buttons)
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_guided_new",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:new:auto",
+                }
+            }
+        )
+        asset_prompt = self.gateway.private_messages[-1]
+        self.assertIn("创建广告资产", asset_prompt["text"])
+        self.assertIn("👉 当前填写：广告名称", asset_prompt["text"])
+        self.assertIn("完成度：0/7", asset_prompt["text"])
+        self.assertIn("广告名称", asset_prompt["text"])
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 61,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "引导式广告资产",
+                }
+            }
+        )
+        media_prompt = self.gateway.private_messages[-1]
+        self.assertIn("第 2/7 步", media_prompt["text"])
+        self.assertIn("👉 当前填写：媒体文件", media_prompt["text"])
+        self.assertIn("✅ 广告名称：引导式广告资产", media_prompt["text"])
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 62,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "photo": [{"file_id": "photo_small"}, {"file_id": "photo_large"}],
+                }
+            }
+        )
+        detail_prompt = self.gateway.private_messages[-1]
+        self.assertIn("第 3/7 步", detail_prompt["text"])
+        self.assertIn("👉 当前填写：详细介绍", detail_prompt["text"])
+        self.assertIn("✅ 媒体文件：图片已收到", detail_prompt["text"])
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 63,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "这是通过引导流程创建的完整广告详情，适合定制插播和详情页展示。",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 64,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://guided.example",
+                }
+            }
+        )
+        button_prompt = self.gateway.private_messages[-1]
+        self.assertIn("第 5/7 步", button_prompt["text"])
+        self.assertIn("👉 当前填写：按钮名称", button_prompt["text"])
+        self.assertIn("按钮上显示的文字", button_prompt["text"])
+        self.assertIn("✅ 跳转链接：https://guid...", button_prompt["text"])
+        self.assertNotIn("立即了解", button_prompt["text"])
+        self.assertIn("⬅️ 返回上一步", [button["text"] for row in button_prompt["inline_keyboard"] for button in row])
+        back_to_link = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_guided_asset_back",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:asset_back",
+                }
+            }
+        )
+        link_prompt = self.gateway.private_messages[-1]
+        self.assertEqual(back_to_link["type"], "callback_placement_asset_back")
+        self.assertEqual(back_to_link["step"], "target_url")
+        self.assertIn("👉 当前填写：跳转链接", link_prompt["text"])
+        self.assertNotIn("✅ 跳转链接", link_prompt["text"])
+        self.assertIn("✅ 详细介绍：", link_prompt["text"])
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 6401,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://guided.example/fixed",
+                }
+            }
+        )
+        for message in [
+            {"message_id": 65, "text": "查看"},
+            {"message_id": 66, "text": "限时福利"},
+            {"message_id": 67, "text": "这是标准插播文案\\n最多五行\\n用于频道里克制展示"},
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "message": {
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        **message,
+                    }
+                }
+            )
+        position_page = self.gateway.private_messages[-1]
+        position_buttons = [button["text"] for row in position_page["inline_keyboard"] for button in row]
+
+        self.assertIn("第 2/4 步：选择插播位置", position_page["text"])
+        self.assertEqual(position_buttons[:4], ["🔘 按钮插播", "✍️ 文字插播", "🧾 标准插播", "🎨 定制插播"])
+        self.assertFalse(any("置顶" in button for button in position_buttons))
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_guided_button_slot",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:button_tail",
+                }
+            }
+        )
+        selected_position = self.gateway.private_messages[-1]
+        self.assertIn("位置：按钮插播", selected_position["text"])
+        self.assertIn("节奏：随频道节奏", selected_position["text"])
+
+        next_page = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_guided_next",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:next",
+                }
+            }
+        )
+
+        self.assertEqual(next_page["panel"], "confirm")
+        self.assertIn("第 4/4 步：确认预算", self.gateway.private_messages[-1]["text"])
 
     def test_placement_configurator_creates_order_without_manual_budget_step(self) -> None:
         channel = self.bind_channel()
@@ -400,26 +651,7 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
-        creative = self.app.update_handler.handle(
-            {
-                "message": {
-                    "message_id": 51,
-                    "from": {"id": 10001, "first_name": "广告主"},
-                    "chat": {"id": 10001},
-                    "text": "这是通过投放配置器创建的标准插播广告",
-                }
-            }
-        )
-        url = self.app.update_handler.handle(
-            {
-                "message": {
-                    "message_id": 52,
-                    "from": {"id": 10001, "first_name": "广告主"},
-                    "chat": {"id": 10001},
-                    "text": "https://placement.example",
-                }
-            }
-        )
+        url = self.complete_placement_ad_asset(name="标准插播测试资产", target_url="https://placement.example")
         submit = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -437,14 +669,80 @@ class ChaboMvpTest(unittest.TestCase):
             state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = '10001'").fetchone()
 
         self.assertEqual(new_creative["type"], "callback_placement_new_creative")
-        self.assertEqual(creative["type"], "placement_creative_saved")
-        self.assertEqual(url["type"], "placement_url_saved")
+        self.assertEqual(url["type"], "placement_standard_text_saved")
         self.assertEqual(submit["type"], "callback_placement_order_created")
         self.assertEqual(order["status"], "approved")
         self.assertEqual(order["budget_cents"], 1000)
         self.assertEqual(order["unit_price_cents"], 1000)
         self.assertEqual(creative_row["target_url"], "https://placement.example")
+        self.assertEqual(creative_row["short_text"], "限时福利")
+        self.assertEqual(creative_row["button_text"], "立即了解")
+        self.assertEqual(creative_row["media_file_id"], "photo_large")
         self.assertIsNone(state)
+        self.app.fulfillment.dispatch_due()
+        self.assertEqual(len(self.gateway.sent_media_ads), 1)
+        media_ad = self.gateway.sent_media_ads[-1]
+        self.assertEqual(media_ad["media_file_id"], "photo_large")
+        self.assertEqual(media_ad["media_type"], "photo")
+        self.assertIn("这是标准插播文案", media_ad["caption"])
+        self.assertEqual(media_ad["button_text"], "立即了解")
+
+    def test_placement_confirmation_blocks_when_balance_is_short(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_short_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_short_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_short_3",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:new:auto",
+                }
+            }
+        )
+        self.complete_placement_ad_asset(name="余额不足测试资产", target_url="https://short-balance.example")
+        confirm = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_place_short_confirm",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:confirm",
+                }
+            }
+        )
+
+        message = self.gateway.private_messages[-1]
+        button_texts = [button["text"] for row in message["inline_keyboard"] for button in row]
+
+        self.assertEqual(confirm["type"], "callback_placement_confirm")
+        self.assertIn("下一步：充值或降低配置", message["text"])
+        self.assertIn("广告钱包可用：USD 0.00", message["text"])
+        self.assertIn("余额不足", message["text"])
+        self.assertIn("💰 充值", button_texts)
+        self.assertIn("📍 降低配置", button_texts)
+        self.assertNotIn("✅ 保存并生效", button_texts)
 
     def test_channel_management_syncs_latest_title_from_telegram(self) -> None:
         channel = self.bind_channel()
@@ -536,21 +834,54 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
+        self.assertIn("广告库", self.gateway.private_messages[-1]["text"])
+        settings = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_4",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "settings:home",
+                }
+            }
+        )
 
         self.assertEqual(first_start["type"], "timezone_prompt")
         self.assertIn("时区确认", self.gateway.private_messages[0]["text"])
         self.assertEqual(timezone_ok["type"], "callback_timezone_confirmed")
         self.assertEqual(start["type"], "main_menu")
-        self.assertEqual(self.gateway.text_edits[-1]["inline_keyboard"][0][0]["text"], "➕ 添加频道")
+        main_keyboard = self.gateway.text_edits[-1]["inline_keyboard"]
+        main_buttons = [button["text"] for row in main_keyboard for button in row]
+        self.assertEqual(
+            main_buttons,
+            [
+                "➕ 添加频道",
+                "➕ 广告投放",
+                "📺 频道管理",
+                "🔎 频道广场",
+                "📋 我的广告",
+                "🗂 广告素材",
+                "💸 我的收益",
+                "⭐ 频道收藏夹",
+                "💰 我的钱包",
+                "⚙️ 设置",
+            ],
+        )
+        self.assertIn("Telegram 频道广告协作工具", self.gateway.text_edits[-1]["text"])
+        self.assertIn("让好频道获得透明收益", self.gateway.text_edits[-1]["text"])
+        self.assertIn("频道主：添加频道", self.gateway.text_edits[-1]["text"])
+        self.assertIn("广告主：创建素材", self.gateway.text_edits[-1]["text"])
+        self.assertIn("发布成功才扣费", self.gateway.text_edits[-1]["text"])
         self.assertNotIn("我是广告主", self.gateway.text_edits[-1]["text"])
         self.assertNotIn("我是频道主", self.gateway.text_edits[-1]["text"])
-        self.assertEqual(len(self.gateway.text_edits[-1]["inline_keyboard"][1]), 2)
+        self.assertTrue(all(len(row) == 2 for row in main_keyboard))
         self.assertTrue(any(message["inline_keyboard"] and message["inline_keyboard"][0][0]["text"] == "➕ 添加频道" for message in self.gateway.private_messages))
         self.assertEqual(advertiser_menu["type"], "callback_advertiser_menu")
         self.assertEqual(balance["type"], "callback_advertiser_balance")
         self.assertEqual(library["type"], "callback_advertiser_library")
-        self.assertEqual(len(self.gateway.callback_answers), 4)
-        self.assertIn("广告库", self.gateway.private_messages[-1]["text"])
+        self.assertEqual(settings["type"], "callback_settings_menu")
+        self.assertEqual(len(self.gateway.callback_answers), 5)
+        self.assertIn("设置", self.gateway.private_messages[-1]["text"])
 
     def test_timezone_setup_accepts_city_input(self) -> None:
         self.app.update_handler.handle(
@@ -593,8 +924,528 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(account["timezone"], "Asia/Manila")
         self.assertIsNotNone(account["timezone_confirmed_at"])
 
-    def test_start_recognizes_publisher_owned_channels(self) -> None:
-        channel = self.bind_channel()
+    def test_home_ad_launch_selects_creative_slot_then_channel(self) -> None:
+        low_channel = self.bind_channel()
+        high_channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100456,
+            title="高订阅频道",
+            username="high_channel",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主2",
+        )
+        self.app.pricing.assess_channel(
+            channel_id=low_channel["id"],
+            category="general",
+            median_24h_views=200,
+            subscribers=1_000,
+            light_clicks_30d=5,
+            light_unique_clickers_30d=3,
+            repeat_purchase_count=0,
+            dispute_count=0,
+        )
+        self.app.pricing.assess_channel(
+            channel_id=high_channel["id"],
+            category="general",
+            median_24h_views=10_000,
+            subscribers=50_000,
+            light_clicks_30d=80,
+            light_unique_clickers_30d=40,
+            repeat_purchase_count=1,
+            dispute_count=0,
+        )
+        self.confirm_timezone(10001, display_name="广告主")
+        with self.app.db.transaction() as conn:
+            account = self.app.update_handler.accounts.get_or_create_by_telegram(conn, 10001, "mixed", "广告主")
+            conn.execute(
+                "INSERT INTO campaigns (id, advertiser_account_id, name, status) VALUES ('camp_launch', ?, '记账工具B版', 'active')",
+                (account["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO creatives (
+                    id, campaign_id, text, target_url, button_text, short_text, standard_text,
+                    media_file_id, media_type, status, content_hash
+                )
+                VALUES (
+                    'cre_launch', 'camp_launch', '记账工具完整介绍', 'https://launch.example',
+                    '查看', '记账工具', '记账工具标准文案', 'photo_large', 'photo',
+                    'approved', 'hash_launch'
+                )
+                """
+            )
+            collection = self.app.update_handler._ensure_channel_collection_conn(conn, account["id"], "高订阅组合")
+            self.app.update_handler._save_channel_to_collection_conn(conn, account["id"], collection["id"], high_channel["id"])
+
+        start = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "advertiser:order_help",
+                }
+            }
+        )
+        creative_page = self.gateway.private_messages[-1]
+        pick = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_pick",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:pick:0",
+                }
+            }
+        )
+        display_page = self.gateway.private_messages[-1]
+        slot = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_slot",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:slot:standard_card",
+                }
+            }
+        )
+        folder_page = self.gateway.private_messages[-1]
+        folder_buttons = [button["text"] for row in folder_page["inline_keyboard"] for button in row]
+        manual = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_manual_channels",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:channel_mode:channels",
+                }
+            }
+        )
+        channel_page = self.gateway.private_messages[-1]
+        channel_buttons = [button["text"] for row in channel_page["inline_keyboard"] for button in row]
+        toggled = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_toggle",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:toggle:0",
+                }
+            }
+        )
+        toggled_page = self.gateway.private_messages[-1]
+        toggled_buttons = [button["text"] for row in toggled_page["inline_keyboard"] for button in row]
+        selected = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:start",
+                }
+            }
+        )
+        schedule_page = self.gateway.private_messages[-1]
+        back = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_launch_back",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:back",
+                }
+            }
+        )
+
+        self.assertEqual(start["type"], "callback_global_placement_started")
+        self.assertIn("第 1/5 步：选择广告素材", creative_page["text"])
+        self.assertIn("➕ 添加广告素材", [button["text"] for row in creative_page["inline_keyboard"] for button in row])
+        self.assertEqual(pick["type"], "callback_global_placement_creative_selected")
+        self.assertIn("第 2/5 步：选择插播位置", display_page["text"])
+        self.assertIn("广告素材：记账工具B版", display_page["text"])
+        self.assertEqual(slot["type"], "callback_global_placement_slot")
+        self.assertIn("第 3/5 步：选择频道文件夹", folder_page["text"])
+        self.assertIn("默认按频道文件夹投放", folder_page["text"])
+        self.assertIn("高订阅组合", folder_page["text"])
+        self.assertIn("可投 1", folder_page["text"])
+        self.assertIn("📺 按频道选择", folder_buttons)
+        self.assertIn("➕ 新建文件夹", folder_buttons)
+        self.assertIn("下一步 ➡️（1 个频道）", folder_buttons)
+        self.assertEqual(manual["type"], "callback_global_placement_channel_mode")
+        self.assertEqual(manual["mode"], "channels")
+        self.assertIn("第 3/5 步：选择投放频道", channel_page["text"])
+        self.assertIn("当前显示 1-2 / 2", channel_page["text"])
+        self.assertIn("频道清单", channel_page["text"])
+        self.assertIn("1. 👥 5.0万｜高订阅频道｜USD 10.00", channel_page["text"])
+        self.assertIn("https://t.me/high_channel", channel_page["text"])
+        self.assertTrue(any("1 高订阅频道" in button for button in channel_buttons))
+        self.assertEqual(toggled["type"], "callback_global_placement_channel_toggled")
+        self.assertEqual(toggled["selected_count"], 1)
+        self.assertIn("频道：高订阅频道", toggled_page["text"])
+        self.assertIn("✅ 1 高订阅频道", toggled_buttons)
+        self.assertIn("✅ 开始投放（已选 1 个）", toggled_buttons)
+        self.assertEqual(selected["type"], "callback_global_placement_channel_selected")
+        self.assertEqual(selected["channel_ids"], [high_channel["id"]])
+        self.assertEqual(selected["panel"], "schedule")
+        self.assertIn("🎯 给「高订阅频道」投放广告", schedule_page["text"])
+        self.assertIn("频道：高订阅频道", schedule_page["text"])
+        self.assertIn("第 4/5 步：配置发布节奏", schedule_page["text"])
+        self.assertEqual(back["panel"], "channel")
+        self.assertIn("第 3/5 步：选择投放频道", self.gateway.private_messages[-1]["text"])
+
+    def test_home_ad_launch_can_submit_multiple_channels(self) -> None:
+        first_channel = self.bind_channel()
+        second_channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100789,
+            title="第二投放频道",
+            username="second_launch_channel",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主2",
+        )
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("30")
+        with self.app.db.transaction() as conn:
+            account = self.app.update_handler.accounts.get_or_create_by_telegram(conn, 10001, "mixed", "广告主")
+            conn.execute(
+                "INSERT INTO campaigns (id, advertiser_account_id, name, status) VALUES ('camp_multi_launch', ?, '批量素材', 'active')",
+                (account["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO creatives (
+                    id, campaign_id, text, target_url, button_text, short_text, standard_text,
+                    media_file_id, media_type, status, content_hash
+                )
+                VALUES (
+                    'cre_multi_launch', 'camp_multi_launch', '批量投放详情', 'https://multi.example',
+                    '查看', '批量广告', '批量标准文案', 'photo_large', 'photo',
+                    'approved', 'hash_multi_launch'
+                )
+                """
+            )
+            collection = self.app.update_handler._ensure_channel_collection_conn(conn, account["id"], "批量频道组")
+            self.app.update_handler._save_channel_to_collection_conn(conn, account["id"], collection["id"], first_channel["id"])
+            self.app.update_handler._save_channel_to_collection_conn(conn, account["id"], collection["id"], second_channel["id"])
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "advertiser:order_help",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_pick",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:pick:0",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_slot",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:slot:standard_card",
+                }
+            }
+        )
+        selected_page = self.gateway.private_messages[-1]
+        selected = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_begin",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:start",
+                }
+            }
+        )
+        schedule_page = self.gateway.private_messages[-1]
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_next",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:next",
+                }
+            }
+        )
+        confirm_page = self.gateway.private_messages[-1]
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_multi_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:submit",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            orders = conn.execute("SELECT * FROM ad_orders ORDER BY created_at, id").fetchall()
+            reserved = conn.execute("SELECT reserved_balance_cents FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+
+        self.assertIn("第 3/5 步：选择频道文件夹", selected_page["text"])
+        self.assertIn("频道：批量频道组（2 个频道）", selected_page["text"])
+        self.assertIn("下一步 ➡️（2 个频道）", [button["text"] for row in selected_page["inline_keyboard"] for button in row])
+        self.assertEqual(selected["type"], "callback_global_placement_channel_selected")
+        self.assertEqual(set(selected["channel_ids"]), {first_channel["id"], second_channel["id"]})
+        self.assertIn("🎯 给「批量频道组（2 个频道）」投放广告", schedule_page["text"])
+        self.assertIn("预算：预计 USD 20.00", schedule_page["text"])
+        self.assertIn("需要冻结：USD 20.00", confirm_page["text"])
+        self.assertEqual(submit["type"], "callback_placement_batch_created")
+        self.assertEqual(len(orders), 2)
+        self.assertEqual({orders[0]["channel_id"], orders[1]["channel_id"]}, {first_channel["id"], second_channel["id"]})
+        self.assertEqual(sum(order["budget_cents"] for order in orders), 2000)
+        self.assertEqual(reserved["reserved_balance_cents"], 2000)
+
+    def test_channel_market_saves_folder_and_launches_from_collection(self) -> None:
+        low_channel = self.bind_channel()
+        high_channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100987,
+            title="优质动漫频道",
+            username="anime_channel",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主2",
+        )
+        self.app.pricing.assess_channel(
+            channel_id=low_channel["id"],
+            category="general",
+            median_24h_views=200,
+            subscribers=1_000,
+            light_clicks_30d=5,
+            light_unique_clickers_30d=3,
+            repeat_purchase_count=0,
+            dispute_count=0,
+        )
+        self.app.pricing.assess_channel(
+            channel_id=high_channel["id"],
+            category="anime",
+            median_24h_views=8_000,
+            subscribers=80_000,
+            light_clicks_30d=80,
+            light_unique_clickers_30d=40,
+            repeat_purchase_count=1,
+            dispute_count=0,
+        )
+        self.confirm_timezone(10001, display_name="广告主")
+        with self.app.db.transaction() as conn:
+            account = self.app.update_handler.accounts.get_or_create_by_telegram(conn, 10001, "mixed", "广告主")
+            conn.execute(
+                "INSERT INTO campaigns (id, advertiser_account_id, name, status) VALUES ('camp_market', ?, '频道广场素材', 'active')",
+                (account["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO creatives (
+                    id, campaign_id, text, target_url, button_text, short_text, standard_text,
+                    media_file_id, media_type, status, content_hash
+                )
+                VALUES (
+                    'cre_market', 'camp_market', '频道广场投放详情', 'https://market.example',
+                    '查看', '广场广告', '频道广场标准文案', 'photo_large', 'photo',
+                    'approved', 'hash_market'
+                )
+                """
+            )
+
+        home = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_home",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:home",
+                }
+            }
+        )
+        home_page = self.gateway.private_messages[-1]
+        browse = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_browse",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:browse",
+                }
+            }
+        )
+        browse_page = self.gateway.private_messages[-1]
+        browse_buttons = [button["text"] for row in browse_page["inline_keyboard"] for button in row]
+        new_folder = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_new",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:new_folder",
+                }
+            }
+        )
+        created = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 9001,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "动漫频道",
+                }
+            }
+        )
+        saved = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_save",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:save",
+                }
+            }
+        )
+        saved_page = self.gateway.private_messages[-1]
+        saved_buttons = [button["text"] for row in saved_page["inline_keyboard"] for button in row]
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_next_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:next",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_next_2",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:next",
+                }
+            }
+        )
+        end_page = self.gateway.private_messages[-1]
+        end_buttons = [button["text"] for row in end_page["inline_keyboard"] for button in row]
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_folders",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:folders",
+                }
+            }
+        )
+        folders_page = self.gateway.private_messages[-1]
+        folder_buttons = [button["text"] for row in folders_page["inline_keyboard"] for button in row]
+        folder_callback = next(
+            button["callback_data"]
+            for row in folders_page["inline_keyboard"]
+            for button in row
+            if "动漫频道" in button["text"]
+        )
+        selected_folder = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_folder",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": folder_callback,
+                }
+            }
+        )
+        selected_folder_page = self.gateway.private_messages[-1]
+        launch = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_launch",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "market:launch_folder:0",
+                }
+            }
+        )
+        creative_page = self.gateway.private_messages[-1]
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_pick",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:pick:0",
+                }
+            }
+        )
+        slot = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_market_slot",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "launch:slot:standard_card",
+                }
+            }
+        )
+        schedule_page = self.gateway.private_messages[-1]
+
+        self.assertEqual(home["type"], "callback_channel_market_browse")
+        self.assertIn("第 1/2 个频道", home_page["text"])
+        self.assertIn("优质动漫频道", home_page["text"])
+        self.assertNotIn("像刷频道卡片一样挑选投放目标", home_page["text"])
+        self.assertNotIn("🔎 开始刷频道", [button["text"] for row in home_page["inline_keyboard"] for button in row])
+        self.assertEqual(browse["type"], "callback_channel_market_browse")
+        self.assertIn("第 1/2 个频道", browse_page["text"])
+        self.assertIn("优质动漫频道", browse_page["text"])
+        self.assertIn("https://t.me/anime_channel", browse_page["text"])
+        self.assertIn("标准插播", browse_page["text"])
+        self.assertEqual(browse_page["parse_mode"], "HTML")
+        self.assertIn("<pre>", browse_page["text"])
+        self.assertIn("<blockquote>", browse_page["text"])
+        self.assertIn("📁 默认收藏夹", browse_buttons)
+        self.assertIn("⭐ 收藏", browse_buttons)
+        self.assertNotIn("➕ 广告投放", browse_buttons)
+        self.assertNotIn("🏠 主菜单", browse_buttons)
+        self.assertNotIn("➕ 新建收藏夹", browse_buttons)
+        self.assertEqual(new_folder["type"], "callback_channel_market_new_folder")
+        self.assertEqual(created["type"], "channel_market_folder_created")
+        self.assertEqual(saved["type"], "callback_channel_market_saved")
+        self.assertIn("当前收藏夹：动漫频道（1 个）", saved_page["text"])
+        self.assertIn("状态：已在当前收藏夹", saved_page["text"])
+        self.assertIn("📁 动漫频道", saved_buttons)
+        self.assertIn("✅ 已收藏", saved_buttons)
+        self.assertIn("已经看到最后一个频道", end_page["text"])
+        self.assertIn("📣 推荐给频道主", end_buttons)
+        self.assertIn("🏠 返回主页", end_buttons)
+        self.assertIn("动漫频道｜1 个频道", folders_page["text"])
+        self.assertIn("选择一个收藏夹后，会直接回到频道广场继续刷。", folders_page["text"])
+        self.assertNotIn("🏠 主菜单", folder_buttons)
+        self.assertEqual(selected_folder["type"], "callback_channel_market_folder_selected")
+        self.assertIn("🔎 频道广场", selected_folder_page["text"])
+        self.assertIn("当前收藏夹：动漫频道（1 个）", selected_folder_page["text"])
+        self.assertNotIn("这个收藏夹还是空的", selected_folder_page["text"])
+        self.assertEqual(launch["type"], "callback_channel_market_launch_collection")
+        self.assertIn("频道：动漫频道（1 个）", creative_page["text"])
+        self.assertEqual(slot["type"], "callback_global_placement_collection_slot")
+        self.assertIn("第 4/5 步：配置发布节奏", schedule_page["text"])
+
+    def test_start_opens_main_menu_and_channel_management_lists_assets(self) -> None:
+        for index in range(12):
+            self.app.channels.bind_channel(
+                telegram_chat_id=-100900 - index,
+                title=f"频道{index + 1}",
+                username=f"channel_{index + 1}",
+                owner_telegram_user_id=20001,
+                owner_display_name="频道主",
+            )
         self.confirm_timezone(20001, role="publisher", display_name="频道主")
 
         start = self.app.update_handler.handle(
@@ -609,8 +1460,28 @@ class ChaboMvpTest(unittest.TestCase):
         )
 
         self.assertEqual(start["type"], "organic_start")
-        self.assertIn("1 个频道资产", self.gateway.private_messages[-1]["text"])
-        self.assertEqual(self.gateway.private_messages[-1]["inline_keyboard"][0][0]["text"], f"📺 {channel['title']}")
+        self.assertIn("插播广告工作台", self.gateway.private_messages[-1]["text"])
+        self.assertNotIn("频道资产", self.gateway.private_messages[-1]["text"])
+        channels = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_start_channels",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}},
+                    "data": "publisher:channels",
+                }
+            }
+        )
+        message = self.gateway.private_messages[-1]
+        keyboard = message["inline_keyboard"]
+        channel_buttons = [button for row in keyboard for button in row if button.get("callback_data", "").startswith("pub:channel:")]
+
+        self.assertEqual(channels["type"], "callback_publisher_channels")
+        self.assertIn("12 个频道资产", message["text"])
+        self.assertIn("先显示前 10 个", message["text"])
+        self.assertEqual(len(channel_buttons), 10)
+        self.assertTrue(all(len(row) == 2 for row in keyboard[:5]))
+        self.assertEqual(keyboard[-1], [{"text": "🏠 返回主菜单", "callback_data": "menu:home"}])
 
     def test_my_chat_member_binds_channel_syncs_admins_and_notifies(self) -> None:
         channel_chat_id = -100888
@@ -660,7 +1531,115 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(channel["title"], "资产频道")
         self.assertEqual(len(admins), 3)
         self.assertGreaterEqual(result["notified"], 2)
-        self.assertTrue(any(message["chat_id"] == "20002" and "频道已加入插播" in message["text"] for message in self.gateway.private_messages))
+        notification = next(
+            message
+            for message in self.gateway.private_messages
+            if message["chat_id"] == "20002" and "频道已加入插播" in message["text"]
+        )
+        keyboard = notification["inline_keyboard"]
+        self.assertEqual(keyboard[0][0]["text"], "⚙️ 频道设置")
+        self.assertEqual(keyboard[0][1]["text"], "📋 使用模版")
+        self.assertTrue(keyboard[0][0]["callback_data"].startswith("pub:channel:"))
+        self.assertTrue(keyboard[0][1]["callback_data"].startswith("pub:template:"))
+        self.assertNotIn("📺 频道管理", [button["text"] for row in keyboard for button in row])
+
+    def test_publisher_can_apply_channel_template_to_new_channel(self) -> None:
+        source = self.app.channels.bind_channel(
+            telegram_chat_id=-100901,
+            title="模板频道",
+            username="template_channel",
+            owner_telegram_user_id=20001,
+            owner_display_name="频道主",
+        )
+        target = self.app.channels.bind_channel(
+            telegram_chat_id=-100902,
+            title="710",
+            username="target_channel",
+            owner_telegram_user_id=20001,
+            owner_display_name="频道主",
+        )
+        self.app.channels.update_rate(source["id"], "standard_card", 4200)
+        self.app.channels.set_format_policy(source["id"], "strong_post", enabled=False)
+        with self.app.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE channel_configs
+                SET daily_ad_limit = 8,
+                    allowed_start_hour = 10,
+                    allowed_end_hour = 22,
+                    allow_pin = 0,
+                    service_fee_bps = 700,
+                    holdback_bps = 1200,
+                    holdback_days = 5
+                WHERE channel_id = ?
+                """,
+                (source["id"],),
+            )
+            conn.execute(
+                "UPDATE ad_slots SET enabled = 0, min_days = 3 WHERE channel_id = ? AND slot_type = 'light_tail'",
+                (source["id"],),
+            )
+
+        picker = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_tpl_pick",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}},
+                    "data": f"pub:template:{target['ref_token']}",
+                }
+            }
+        )
+        picker_message = self.gateway.private_messages[-1]
+        picker_buttons = [button for row in picker_message["inline_keyboard"] for button in row]
+
+        applied = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_tpl_apply",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}},
+                    "data": f"pub:tplapply:{target['ref_token']}:{source['ref_token']}",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            target_config = conn.execute("SELECT * FROM channel_configs WHERE channel_id = ?", (target["id"],)).fetchone()
+            strong_policy = conn.execute(
+                "SELECT * FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = 'strong_post'",
+                (target["id"],),
+            ).fetchone()
+            standard_rate = conn.execute(
+                """
+                SELECT r.*
+                FROM rate_cards r
+                JOIN ad_slots s ON s.id = r.slot_id
+                WHERE s.channel_id = ? AND s.slot_type = 'standard_card' AND r.active = 1
+                """,
+                (target["id"],),
+            ).fetchone()
+            light_slot = conn.execute(
+                "SELECT * FROM ad_slots WHERE channel_id = ? AND slot_type = 'light_tail'",
+                (target["id"],),
+            ).fetchone()
+
+        self.assertEqual(picker["type"], "callback_publisher_template_picker")
+        self.assertIn("目标频道：710", picker_message["text"])
+        self.assertTrue(any(button["text"] == "📋 模板频道" for button in picker_buttons))
+        self.assertEqual(applied["type"], "callback_publisher_template_applied")
+        self.assertIn("模版已应用", self.gateway.private_messages[-1]["text"])
+        self.assertEqual(target_config["daily_ad_limit"], 8)
+        self.assertEqual(target_config["allowed_start_hour"], 10)
+        self.assertEqual(target_config["allowed_end_hour"], 22)
+        self.assertEqual(target_config["allow_pin"], 0)
+        self.assertEqual(target_config["service_fee_bps"], 700)
+        self.assertEqual(target_config["holdback_bps"], 1200)
+        self.assertEqual(target_config["holdback_days"], 5)
+        self.assertEqual(strong_policy["enabled"], 0)
+        self.assertEqual(standard_rate["unit_price_cents"], 4200)
+        self.assertEqual(light_slot["enabled"], 0)
+        self.assertEqual(light_slot["min_days"], 3)
 
     def test_bot_self_serve_order_form_creates_pending_order(self) -> None:
         channel = self.bind_channel()
@@ -877,7 +1856,6 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(self.gateway.channel_text_edits[-1]["inline_keyboard"][-1][0]["text"], "查看完整广告")
         self.assertEqual(self.gateway.sent_ads, [])
 
-        self.confirm_timezone(333, display_name="点击用户")
         with self.app.db.transaction() as conn:
             delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
         result = self.app.update_handler.handle(
@@ -923,6 +1901,54 @@ class ChaboMvpTest(unittest.TestCase):
         runner.run(once=True, idle_sleep_seconds=0, log=logs.append)
 
         self.assertTrue(any('"event": "polling_error"' in item for item in logs))
+
+    def test_polling_runner_dispatches_due_orders_after_update(self) -> None:
+        self.create_approved_order(budget="10")
+
+        class PollingGateway(FakeGateway):
+            def __init__(self) -> None:
+                super().__init__()
+                self.deleted_webhook = False
+
+            def delete_webhook(self, *, drop_pending_updates: bool = False) -> bool:
+                self.deleted_webhook = True
+                return True
+
+            def get_updates(self, *, offset=None, timeout=30, limit=100):
+                return [
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 1,
+                            "from": {"id": 10001, "first_name": "广告主"},
+                            "chat": {"id": 10001},
+                            "text": "/start",
+                        },
+                    }
+                ]
+
+        runner_settings = Settings(
+            db_path=self.settings.db_path,
+            bot_token="dummy",
+            bot_username="ChaBoTestBot",
+        )
+        runner = PollingRunner(runner_settings)
+        polling_gateway = PollingGateway()
+        runner.gateway = polling_gateway
+        runner.handler = UpdateHandler(runner.db, runner.settings, polling_gateway)
+        runner.fulfillment = FulfillmentService(runner.db, runner.settings, polling_gateway)
+        logs = []
+
+        runner.run(once=True, idle_sleep_seconds=0, log=logs.append)
+
+        self.assertTrue(polling_gateway.deleted_webhook)
+        self.assertEqual(len(polling_gateway.sent_ads), 1)
+        self.assertTrue(any('"event": "dispatch_due"' in item for item in logs))
+        with runner.db.transaction() as conn:
+            delivery = conn.execute("SELECT * FROM deliveries").fetchone()
+            order = conn.execute("SELECT * FROM ad_orders").fetchone()
+        self.assertEqual(delivery["status"], "sent")
+        self.assertEqual(order["spent_cents"], 1000)
 
     def test_http_webhook_and_admin_actions_are_runnable(self) -> None:
         base_url = self.start_http_server()
@@ -1045,6 +2071,17 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
+        quote = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pub_quote",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}},
+                    "data": f"channel:quote:{channel['id']}",
+                }
+            }
+        )
+        quote_buttons = [button["text"] for row in self.gateway.private_messages[-1]["inline_keyboard"] for button in row]
         toggled = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -1067,11 +2104,16 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(channel["title"], "新接入频道")
         self.assertEqual(channel["username"], "new_channel")
         self.assertIsNone(state)
-        self.assertIn("频道已接入", self.gateway.private_messages[-3]["text"])
+        self.assertTrue(any("频道已接入" in message["text"] for message in self.gateway.private_messages))
         self.assertEqual(formats["type"], "callback_publisher_formats")
+        self.assertEqual(quote["type"], "callback_channel_quote")
+        self.assertIn("⬅️ 频道详情", quote_buttons)
+        self.assertNotIn("📣 投放这个频道", quote_buttons)
         self.assertEqual(toggled["type"], "callback_publisher_format_toggled")
         self.assertEqual(strong_policy["enabled"], 0)
         self.assertIn("定制插播", self.gateway.private_messages[-1]["text"])
+        self.assertNotIn("🔁 循环发布｜", self.gateway.private_messages[-1]["text"])
+        self.assertNotIn("📌 置顶 24h｜", self.gateway.private_messages[-1]["text"])
         self.assertNotIn("strong_post", self.gateway.private_messages[-1]["text"])
 
     def test_admin_reject_order_releases_reserved_budget(self) -> None:
@@ -1184,8 +2226,6 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn(f"probe_{probe['id']}", keyboard[-2][0]["url"])
         self.assertEqual(keyboard[-1][0]["text"], "📣 频道招商")
 
-        for user_id in [333, 444]:
-            self.confirm_timezone(user_id, display_name="点击用户")
         for user_id in [333, 333, 444]:
             start = self.app.update_handler.handle(
                 {
@@ -1220,6 +2260,8 @@ class ChaboMvpTest(unittest.TestCase):
             saved_order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (order["id"],)).fetchone()
             delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
             ledger_count = conn.execute("SELECT COUNT(*) AS n FROM ledger_transactions").fetchone()["n"]
+        notifications = [message for message in self.gateway.private_messages if message["chat_id"] == "20001" and "收入到账" in message["text"]]
+        notification_buttons = [button["text"] for row in notifications[0]["inline_keyboard"] for button in row]
 
         self.assertEqual(advertiser["available_balance_cents"], 0)
         self.assertEqual(advertiser["reserved_balance_cents"], 0)
@@ -1229,11 +2271,86 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(saved_order["status"], "budget_exhausted")
         self.assertEqual(delivery["status"], "sent")
         self.assertGreaterEqual(ledger_count, 4)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0]["parse_mode"], "HTML")
+        self.assertIn("+USD 10.00", notifications[0]["text"])
+        self.assertIn('频道：<a href="https://t.me/test_channel/', notifications[0]["text"])
+        self.assertIn("广告：", notifications[0]["text"])
+        self.assertIn("当前收益：USD 10.00", notifications[0]["text"])
+        self.assertEqual(notification_buttons, ["🔕 关闭通知", "💰 我的钱包"])
+
+    def test_publisher_can_disable_and_reenable_income_notifications(self) -> None:
+        self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+
+        disabled = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disable_income_notice",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}, "message_id": 7001},
+                    "data": "publisher:disable_income_notifications",
+                }
+            }
+        )
+        settings = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_income_settings",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}, "message_id": 7002},
+                    "data": "settings:home",
+                }
+            }
+        )
+        settings_page = self.gateway.text_edits[-1]
+        wallet = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_publisher_wallet",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}, "message_id": 7004},
+                    "data": "publisher:earnings",
+                }
+            }
+        )
+        wallet_page = self.gateway.text_edits[-1]
+        wallet_buttons = [button["text"] for row in wallet_page["inline_keyboard"] for button in row]
+
+        self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        notifications = [message for message in self.gateway.private_messages if message["chat_id"] == "20001" and "收入到账" in message["text"]]
+
+        enabled = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_enable_income_notice",
+                    "from": {"id": 20001, "first_name": "频道主"},
+                    "message": {"chat": {"id": 20001}, "message_id": 7003},
+                    "data": "publisher:enable_income_notifications",
+                }
+            }
+        )
+
+        with self.app.db.transaction() as conn:
+            account = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '20001'").fetchone()
+
+        self.assertEqual(disabled["type"], "callback_publisher_income_notifications_disabled")
+        self.assertEqual(settings["type"], "callback_settings_menu")
+        self.assertIn("收入通知：已关闭", settings_page["text"])
+        self.assertIn("🔔 开启收入通知", [button["text"] for row in settings_page["inline_keyboard"] for button in row])
+        self.assertEqual(wallet["type"], "callback_publisher_earnings")
+        self.assertIn("💰 我的钱包", wallet_page["text"])
+        self.assertEqual(wallet_buttons, ["🔔 开启通知", "💰 我的钱包"])
+        self.assertNotIn("📺 频道管理", wallet_buttons)
+        self.assertNotIn("🏠 主菜单", wallet_buttons)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(enabled["type"], "callback_publisher_income_notifications_enabled")
+        self.assertEqual(account["publisher_income_notifications_enabled"], 1)
 
     def test_ad_deep_link_records_bot_start_metric(self) -> None:
         _, order = self.create_approved_order()
         self.app.fulfillment.dispatch_due()
-        self.confirm_timezone(333, display_name="点击用户")
         with self.app.db.transaction() as conn:
             delivery = conn.execute("SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)).fetchone()
 

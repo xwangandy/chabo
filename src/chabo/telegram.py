@@ -23,12 +23,25 @@ class MessageGateway(Protocol):
     ) -> str:
         ...
 
+    def send_media_ad(
+        self,
+        *,
+        chat_id: str,
+        media_file_id: str,
+        media_type: str,
+        caption: str,
+        button_text: str,
+        button_url: str,
+    ) -> str:
+        ...
+
     def send_private_message(
         self,
         *,
         chat_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> str | None:
         ...
 
@@ -39,6 +52,7 @@ class MessageGateway(Protocol):
         message_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         ...
 
@@ -224,14 +238,45 @@ class BotApiClient:
         )
         return str(result["message_id"])
 
+    def send_media_ad(
+        self,
+        *,
+        chat_id: str,
+        media_file_id: str,
+        media_type: str,
+        caption: str,
+        button_text: str,
+        button_url: str,
+    ) -> str:
+        method_by_type = {
+            "photo": ("sendPhoto", "photo"),
+            "video": ("sendVideo", "video"),
+            "animation": ("sendAnimation", "animation"),
+        }
+        method, media_key = method_by_type.get(media_type, method_by_type["photo"])
+        safe_caption = caption if len(caption) <= 1024 else caption[:1021] + "..."
+        result = self._post(
+            method,
+            {
+                "chat_id": chat_id,
+                media_key: media_file_id,
+                "caption": safe_caption,
+                "reply_markup": {"inline_keyboard": [[{"text": button_text, "url": button_url}]]},
+            },
+        )
+        return str(result["message_id"])
+
     def send_private_message(
         self,
         *,
         chat_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> str | None:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if inline_keyboard:
             payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
         result = self._post("sendMessage", payload)
@@ -244,8 +289,11 @@ class BotApiClient:
         message_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if inline_keyboard:
             payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
         self._post("editMessageText", payload)
@@ -346,12 +394,25 @@ class NullGateway:
     def send_ad(self, *, chat_id: str, text: str, button_text: str, button_url: str) -> str:
         raise TelegramError("CHABO_BOT_TOKEN is not configured")
 
+    def send_media_ad(
+        self,
+        *,
+        chat_id: str,
+        media_file_id: str,
+        media_type: str,
+        caption: str,
+        button_text: str,
+        button_url: str,
+    ) -> str:
+        raise TelegramError("CHABO_BOT_TOKEN is not configured")
+
     def send_private_message(
         self,
         *,
         chat_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> str | None:
         return None
 
@@ -362,6 +423,7 @@ class NullGateway:
         message_id: str | int,
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         return None
 

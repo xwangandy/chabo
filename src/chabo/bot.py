@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,6 +16,7 @@ from .telegram import MessageGateway, TelegramError
 
 
 DEFAULT_USER_TIMEZONE = "Asia/Shanghai"
+STALE_CHANNEL_POST_SECONDS = 10 * 60
 
 
 TIMEZONE_ALIASES = {
@@ -60,6 +63,7 @@ TIMEZONE_ALIASES = {
 
 SLOT_DISPLAY_NAMES = {
     "light_tail": "文字插播",
+    "button_tail": "按钮插播",
     "standard": "标准插播",
     "standard_card": "标准插播",
     "strong_post": "定制插播",
@@ -69,6 +73,7 @@ SLOT_DISPLAY_NAMES = {
 
 SLOT_EMOJIS = {
     "light_tail": "✍️",
+    "button_tail": "🔘",
     "standard": "🧾",
     "standard_card": "🧾",
     "strong_post": "🎨",
@@ -76,12 +81,24 @@ SLOT_EMOJIS = {
     "loop_daily": "🔁",
 }
 
-PLACEMENT_SLOT_TYPES = ("light_tail", "standard_card", "strong_post")
+PLACEMENT_SLOT_TYPES = ("strong_post", "standard_card", "button_tail", "light_tail")
 PINNABLE_PLACEMENT_SLOTS = {"standard_card", "strong_post"}
+SCHEDULED_PLACEMENT_SLOTS = {"standard_card", "strong_post"}
+CHANNEL_PACED_PLACEMENT_SLOTS = {"button_tail", "light_tail"}
+PLACEMENT_ASSET_STEPS = ("ad_name", "media_detail", "detail_text", "target_url", "button_text", "short_text", "standard_text")
+PLACEMENT_ASSET_STEP_FIELDS = {
+    "ad_name": ("creative_name",),
+    "media_detail": ("media_file_id", "media_type"),
+    "detail_text": ("creative_text",),
+    "target_url": ("target_url",),
+    "button_text": ("button_text",),
+    "short_text": ("light_short_text",),
+    "standard_text": ("standard_text",),
+}
 PLACEMENT_PERIODS = {
-    "once": {"label": "发布一次", "deliveries": 1, "discount_bps": 10000},
-    "week": {"label": "7 天循环", "deliveries": 7, "discount_bps": 9000},
-    "month": {"label": "30 天循环", "deliveries": 30, "discount_bps": 8000},
+    "once": {"label": "仅发布一次", "deliveries": 1, "discount_bps": 10000},
+    "week": {"label": "连续 1 周", "deliveries": 7, "discount_bps": 9000},
+    "month": {"label": "连续 1 个月", "deliveries": 30, "discount_bps": 8000},
     "monthly": {"label": "连续包月", "deliveries": 30, "discount_bps": 7000},
 }
 
@@ -116,7 +133,7 @@ class UpdateHandler:
     def _handle_message(self, message: dict[str, Any]) -> dict[str, Any]:
         if "successful_payment" in message:
             return self._handle_successful_payment(message)
-        text = message.get("text") or ""
+        text = message.get("text") or message.get("caption") or ""
         if text.startswith("/cancel"):
             return self._handle_cancel(message)
         if text.startswith("/menu"):
@@ -167,9 +184,6 @@ class UpdateHandler:
         channel_start_result: dict[str, Any] | None = None
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", display_name)
-            if not account["timezone_confirmed_at"]:
-                self._prompt_timezone(chat.get("id", user_id), account["id"], payload, None, conn=conn)
-                return {"handled": True, "type": "timezone_prompt", "pending_start_payload": payload}
             if payload.startswith("ad_"):
                 delivery_id = payload.removeprefix("ad_")
                 delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
@@ -206,6 +220,9 @@ class UpdateHandler:
                         text=f"{probe['detail_text']}\n\n{probe['target_url']}",
                     )
                     return {"handled": True, "type": "light_probe_start", "probe_id": probe_id, "channel_id": probe["channel_id"]}
+            if not account["timezone_confirmed_at"]:
+                self._prompt_timezone(chat.get("id", user_id), account["id"], payload, None, conn=conn)
+                return {"handled": True, "type": "timezone_prompt", "pending_start_payload": payload}
             channel = None
             for channel_token in self._channel_tokens_from_start_payload(payload):
                 channel = self.channels.get_by_token(conn, channel_token)
@@ -229,11 +246,7 @@ class UpdateHandler:
         if channel_for_landing and channel_start_result:
             self._send_channel_sales_landing(chat.get("id", user_id), channel_for_landing, [])
             return channel_start_result
-        publisher_channels = self._publisher_channels_for_user(user_id, display_name)
-        if publisher_channels:
-            self._send_publisher_menu(chat.get("id", user_id), user, channels=publisher_channels)
-        else:
-            self._send_main_menu(chat.get("id", user_id), user=user)
+        self._send_main_menu(chat.get("id", user_id), user=user)
         return {"handled": True, "type": "organic_start", "session_id": organic_session_id}
 
     def _handle_callback_query(self, query: dict[str, Any]) -> dict[str, Any]:
@@ -245,7 +258,7 @@ class UpdateHandler:
         if not chat_id:
             return {"handled": False, "reason": "missing_callback_chat"}
         try:
-            self.gateway.answer_callback_query(callback_query_id=query["id"], text="处理中...")
+            self.gateway.answer_callback_query(callback_query_id=query["id"])
         except TelegramError:
             pass
 
@@ -282,6 +295,12 @@ class UpdateHandler:
         if data == "publisher:earnings":
             self._send_publisher_earnings(chat_id, user, message)
             return {"handled": True, "type": "callback_publisher_earnings"}
+        if data == "publisher:disable_income_notifications":
+            self._set_publisher_income_notifications(chat_id, user, message, enabled=False)
+            return {"handled": True, "type": "callback_publisher_income_notifications_disabled"}
+        if data == "publisher:enable_income_notifications":
+            self._set_publisher_income_notifications(chat_id, user, message, enabled=True)
+            return {"handled": True, "type": "callback_publisher_income_notifications_enabled"}
         if data == "advertiser:balance":
             self._send_advertiser_balance(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_balance"}
@@ -291,21 +310,14 @@ class UpdateHandler:
         if data == "advertiser:orders":
             self._send_advertiser_orders(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_orders"}
+        if data == "settings:home":
+            self._send_settings_menu(chat_id, user, message)
+            return {"handled": True, "type": "callback_settings_menu"}
         if data == "advertiser:order_help":
-            self._reply_or_edit(
-                chat_id=chat_id,
-                source_message=message,
-                text=(
-                    "🧾 创建订单\n\n"
-                    "从频道里的「频道招商」进入。\n\n"
-                    "1 选广告位\n"
-                    "2 发文案和链接\n"
-                    "3 设置预算\n\n"
-                    "✅ 发布成功才扣费"
-                ),
-                inline_keyboard=[[{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
-            )
-            return {"handled": True, "type": "callback_advertiser_order_help"}
+            self._send_global_placement(chat_id, user, message, payload=self._default_global_placement_payload(), panel="creative")
+            return {"handled": True, "type": "callback_global_placement_started"}
+        if data.startswith("market:"):
+            return self._handle_channel_market_callback(data, chat_id, user, message)
         if data == "publisher:onboard":
             self._start_publisher_onboarding(chat_id, user, message)
             return {"handled": True, "type": "callback_publisher_onboard_started"}
@@ -327,6 +339,20 @@ class UpdateHandler:
             channel_identifier = data.removeprefix("pub:formats:")
             self._send_publisher_formats(chat_id, user, channel_identifier, message)
             return {"handled": True, "type": "callback_publisher_formats", "channel": channel_identifier}
+        if data.startswith("pub:template:"):
+            channel_identifier = data.removeprefix("pub:template:")
+            self._send_channel_template_picker(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_template_picker", "channel": channel_identifier}
+        if data.startswith("pub:tplapply:"):
+            rest = data.removeprefix("pub:tplapply:")
+            target_identifier, source_identifier = rest.split(":", 1)
+            self._apply_channel_template(chat_id, user, target_identifier, source_identifier, message)
+            return {
+                "handled": True,
+                "type": "callback_publisher_template_applied",
+                "target": target_identifier,
+                "source": source_identifier,
+            }
         if data.startswith("pub:channel:"):
             channel_identifier = data.removeprefix("pub:channel:")
             self._send_publisher_channel_dashboard(chat_id, user, channel_identifier, message)
@@ -342,12 +368,14 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_publisher_format_toggled", "channel": channel_identifier, "slot_type": slot_type}
         if data.startswith("channel:quote:"):
             channel_id = data.removeprefix("channel:quote:")
-            self._send_channel_quote(chat_id, channel_id, message)
+            self._send_channel_quote(chat_id, channel_id, user, message)
             return {"handled": True, "type": "callback_channel_quote", "channel_id": channel_id}
         if data.startswith("channel:order:"):
             channel_id = data.removeprefix("channel:order:")
             self._start_order_flow(chat_id, user, channel_id, message)
             return {"handled": True, "type": "callback_order_flow_started", "channel_id": channel_id}
+        if data.startswith("launch:"):
+            return self._handle_global_placement_callback(data, chat_id, user, message)
         if data.startswith("place:"):
             return self._handle_placement_callback(data, chat_id, user, message)
         if data.startswith("order:slot:"):
@@ -451,6 +479,11 @@ class UpdateHandler:
         message_id = post.get("message_id")
         if not chat_id or not message_id:
             return {"handled": False, "reason": "missing_channel_post_ids"}
+        post_date = int(post.get("date") or 0)
+        if post_date:
+            age_seconds = datetime.now(timezone.utc).timestamp() - post_date
+            if age_seconds > STALE_CHANNEL_POST_SECONDS:
+                return {"handled": True, "type": "stale_channel_post_skipped", "message_id": message_id}
         with self.db.transaction() as conn:
             channel = self.channels.get_by_chat_id(conn, chat_id)
             if not channel:
@@ -516,16 +549,484 @@ class UpdateHandler:
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "📌 插播工作台\n\n"
-                "接广告，投频道。"
+                "<b>📌 插播广告工作台</b>\n\n"
+                "<blockquote>插播是一套 Telegram 频道广告协作工具。\n"
+                "我们的理念：让好频道获得透明收益，让广告主用清楚的价格买到真实发布。</blockquote>\n\n"
+                "频道主：添加频道、<b>设置价格、查看收益</b>。\n"
+                "广告主：创建素材、<b>选择频道、确认预算后投放</b>。\n"
+                "<code>发布成功才扣费</code>"
             ),
             inline_keyboard=[
-                [{"text": "➕ 添加频道", "url": self._add_channel_url()}],
-                [{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "📣 我的广告", "callback_data": "role:advertiser"}],
-                [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
-                [{"text": "💵 定价规则", "callback_data": "publisher:pricing"}, {"text": "🌐 时区", "callback_data": "timezone:change"}],
+                [{"text": "➕ 添加频道", "url": self._add_channel_url()}, {"text": "➕ 广告投放", "callback_data": "advertiser:order_help"}],
+                [{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "🔎 频道广场", "callback_data": "market:home"}],
+                [{"text": "📋 我的广告", "callback_data": "advertiser:orders"}, {"text": "🗂 广告素材", "callback_data": "advertiser:library"}],
+                [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "⭐ 频道收藏夹", "callback_data": "market:folders"}],
+                [{"text": "💰 我的钱包", "callback_data": "advertiser:balance"}, {"text": "⚙️ 设置", "callback_data": "settings:home"}],
+            ],
+            parse_mode="HTML",
+        )
+
+    def _send_settings_menu(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+        timezone_name = account["timezone"] or DEFAULT_USER_TIMEZONE
+        income_notifications_enabled = bool(account["publisher_income_notifications_enabled"])
+        notification_label = "已开启" if income_notifications_enabled else "已关闭"
+        notification_button = (
+            {"text": "🔕 关闭收入通知", "callback_data": "publisher:disable_income_notifications"}
+            if income_notifications_enabled
+            else {"text": "🔔 开启收入通知", "callback_data": "publisher:enable_income_notifications"}
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                "⚙️ 设置\n\n"
+                f"当前时区：{timezone_name}\n"
+                f"收入通知：{notification_label}\n"
+                "语言等设置后续放在这里。"
+            ),
+            inline_keyboard=[
+                [{"text": "🌐 修改时区", "callback_data": "timezone:change"}],
+                [notification_button],
+                [{"text": "🏠 返回主菜单", "callback_data": "menu:home"}],
             ],
         )
+
+    def _set_publisher_income_notifications(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None,
+        *,
+        enabled: bool,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            conn.execute(
+                """
+                UPDATE accounts
+                SET publisher_income_notifications_enabled = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, account["id"]),
+            )
+        if enabled:
+            text = "🔔 收入通知已开启\n\n以后频道广告成功发布时，会继续提醒你收益到账。"
+            button = {"text": "🔕 关闭通知", "callback_data": "publisher:disable_income_notifications"}
+        else:
+            text = "🔕 收入通知已关闭\n\n以后广告成功发布时，不再推送这类到账提醒。可以在设置里重新开启。"
+            button = {"text": "🔔 重新开启", "callback_data": "publisher:enable_income_notifications"}
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[
+                [button, {"text": "💰 我的钱包", "callback_data": "publisher:earnings"}],
+            ],
+        )
+
+    def _send_channel_market_home(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
+        state = self._get_conversation(chat_id)
+        payload = json.loads(state["payload_json"] or "{}") if state and state["flow"] == "channel_market" else {}
+        payload["offset"] = 0
+        self._send_channel_market_browse(chat_id, user, source_message, payload=payload, offset=0)
+
+    def _send_channel_market_browse(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        payload: dict[str, Any] | None = None,
+        offset: int | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            if payload is None:
+                state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = ?", (str(chat_id),)).fetchone()
+                payload = json.loads(state["payload_json"] or "{}") if state and state["flow"] == "channel_market" else {}
+            collection = self._channel_collection_by_id_conn(conn, payload.get("collection_id") or "")
+            if not collection or collection["advertiser_account_id"] != account["id"]:
+                collection = self._ensure_channel_collection_conn(conn, account["id"], "默认收藏夹")
+            total = self._market_channel_count_conn(conn)
+            current_offset = max(0, int(payload.get("offset") or 0) if offset is None else offset)
+            if total and current_offset > total:
+                current_offset = total
+            channel = None if total and current_offset >= total else self._market_channel_at_conn(conn, current_offset)
+            payload = {"offset": current_offset, "collection_id": collection["id"], "collection_name": collection["name"]}
+            if channel:
+                payload["channel_id"] = channel["id"]
+            saved_count = self._channel_collection_count_conn(conn, collection["id"])
+            is_saved = bool(channel and self._channel_in_collection_conn(conn, collection["id"], channel["id"]))
+            prices = self._market_channel_prices_conn(conn, channel["id"]) if channel else []
+            self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "browse", payload)
+        if total and current_offset >= total:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=(
+                    "<b>🔎 频道广场</b>\n\n"
+                    + self._html_quote("已经看到最后一个频道了。\n如果你想投放的频道还没接入，可以把机器人推荐给频道主，让对方先把频道接进来。")
+                ),
+                inline_keyboard=self._market_end_keyboard(total),
+                parse_mode="HTML",
+            )
+            return
+        if not channel:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="<b>🔎 频道广场</b>\n\n" + self._html_quote("当前还没有可浏览的频道。"),
+                inline_keyboard=[[{"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+                parse_mode="HTML",
+            )
+            return
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=self._market_channel_text(channel, prices, current_offset + 1, total, collection["name"], saved_count, is_saved),
+            inline_keyboard=self._market_browse_keyboard(current_offset, total, collection["name"], is_saved),
+            parse_mode="HTML",
+        )
+
+    def _send_channel_collections(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = ?", (str(chat_id),)).fetchone()
+            previous_payload = json.loads(state["payload_json"] or "{}") if state and state["flow"] == "channel_market" else {}
+            self._ensure_channel_collection_conn(conn, account["id"], "默认收藏夹")
+            collections = self._channel_collections_conn(conn, account["id"])
+            payload = {
+                "collection_ids": [row["id"] for row in collections],
+                "offset": int(previous_payload.get("offset") or 0),
+            }
+            if previous_payload.get("channel_id"):
+                payload["channel_id"] = previous_payload["channel_id"]
+            if previous_payload.get("collection_id"):
+                payload["collection_id"] = previous_payload["collection_id"]
+                payload["collection_name"] = previous_payload.get("collection_name")
+            self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "folders", payload)
+        lines = [
+            "<b>⭐ 频道收藏夹</b>",
+            "",
+            self._html_quote("选择一个收藏夹后，会直接回到频道广场继续刷。\n之后点击收藏，都会保存到当前收藏夹。"),
+            "",
+        ]
+        if collections:
+            for index, collection in enumerate(collections, start=1):
+                lines.append(f"{index}. <b>{self._h(collection['name'])}｜{collection['channel_count']} 个频道</b>")
+        else:
+            lines.append("还没有收藏夹。")
+        buttons = [
+            {"text": f"{index + 1} {self._short_title(collection['name'], 12)}", "callback_data": f"market:folder:{index}"}
+            for index, collection in enumerate(collections)
+        ]
+        keyboard = self._button_grid(buttons, 2)
+        keyboard.append([{"text": "➕ 新建收藏夹", "callback_data": "market:new_folder"}])
+        keyboard.append([{"text": "↩️ 返回广场", "callback_data": "market:browse"}])
+        self._reply_or_edit(chat_id=chat_id, source_message=source_message, text="\n".join(lines), inline_keyboard=keyboard, parse_mode="HTML")
+
+    def _send_channel_collection_detail(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None,
+        *,
+        collection_id: str,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            collection = self._channel_collection_by_id_conn(conn, collection_id)
+            if not collection or collection["advertiser_account_id"] != account["id"]:
+                self._send_channel_collections(chat_id, user, source_message)
+                return
+            channels = self._channel_collection_channels_conn(conn, collection_id, limit=10)
+            payload = {"collection_ids": [collection_id], "collection_id": collection_id, "collection_name": collection["name"]}
+            self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "folder_detail", payload)
+        lines = [f"<b>⭐ {self._h(collection['name'])}</b>", "", f"已收藏 <code>{len(channels)} 个频道</code>。", ""]
+        if channels:
+            for index, channel in enumerate(channels, start=1):
+                subscribers = self._compact_count(int(channel["subscribers"] or 0))
+                link = self._channel_public_url(channel) or "暂无公开链接"
+                lines.append(f"{index}. 👥 {self._h(subscribers)}｜<b>{self._h(self._short_title(channel['title'], 16))}</b>")
+                lines.append(f"   {self._h(link)}")
+        else:
+            lines.append(self._html_quote("这个收藏夹还是空的。先去频道广场收藏频道。"))
+        keyboard = []
+        if channels:
+            keyboard.append([{"text": "➕ 用这个收藏夹投放", "callback_data": "market:launch_folder:0"}])
+        keyboard.append([{"text": "🔎 继续刷频道", "callback_data": "market:browse"}, {"text": "⭐ 收藏夹列表", "callback_data": "market:folders"}])
+        keyboard.append([{"text": "🏠 主菜单", "callback_data": "menu:home"}])
+        self._reply_or_edit(chat_id=chat_id, source_message=source_message, text="\n".join(lines), inline_keyboard=keyboard, parse_mode="HTML")
+
+    def _market_channel_text(
+        self,
+        channel: Any,
+        prices: list[Any],
+        index: int,
+        total: int,
+        collection_name: str,
+        saved_count: int,
+        is_saved: bool,
+    ) -> str:
+        subscribers = self._compact_count(int(channel["subscribers"] or 0))
+        views = self._compact_count(int(channel["median_24h_views"] or 0))
+        score = channel["score"] if channel["score"] is not None else "待评估"
+        risk = channel["risk_level"] or "待评估"
+        category = channel["category"] or "未分类"
+        link = self._channel_public_url(channel) or "暂无公开链接"
+        price_lines = [f"{self._slot_label(row['format_type'])}  USD {cents_to_money(int(row['unit_price_cents'] or 0))}" for row in prices]
+        if not price_lines:
+            price_lines = ["暂无可投广告位"]
+        link_line = f'链接：<a href="{self._h(link)}">{self._h(link)}</a>' if link.startswith("http") else f"链接：{self._h(link)}"
+        saved_line = "已在当前收藏夹 ✅" if is_saved else "未收藏"
+        metric_block = self._html_pre(
+            [
+                f"订阅量   {subscribers}",
+                f"24h浏览  {views}",
+                f"类目     {category}",
+                f"评分     {score}",
+                f"风险     {risk}",
+            ]
+        )
+        return "\n".join(
+            [
+                f"<b>🔎 频道广场</b>\n<code>第 {index}/{total} 个频道</code>",
+                "",
+                f"<b>📺 {self._h(channel['title'])}</b>",
+                metric_block,
+                link_line,
+                "",
+                "<b>可投广告位</b>",
+                self._html_quote("\n".join(price_lines)),
+                "",
+                f"<b>当前收藏夹：{self._h(collection_name)}（{saved_count} 个）</b>",
+                f"状态：{self._h(saved_line)}",
+                "",
+                self._html_quote("喜欢就收藏；不合适就点下一个继续看。"),
+            ]
+        )
+
+    def _market_browse_keyboard(self, offset: int, total: int, collection_name: str, is_saved: bool) -> list[list[dict[str, str]]]:
+        keyboard = [
+            [
+                {"text": f"📁 {self._short_title(collection_name, 12)}", "callback_data": "market:folders"},
+                {"text": "✅ 已收藏" if is_saved else "⭐ 收藏", "callback_data": "market:save"},
+            ]
+        ]
+        nav_row: list[dict[str, str]] = []
+        if offset > 0:
+            nav_row.append({"text": "⬅️ 上一个", "callback_data": "market:prev"})
+        if offset + 1 < total:
+            nav_row.append({"text": "下一个 ➡️", "callback_data": "market:next"})
+        elif total:
+            nav_row.append({"text": "下一个 ➡️", "callback_data": "market:next"})
+        if nav_row:
+            keyboard.append(nav_row)
+        return keyboard
+
+    def _market_end_keyboard(self, total: int) -> list[list[dict[str, str]]]:
+        keyboard: list[list[dict[str, str]]] = []
+        if total:
+            keyboard.append([{"text": "⬅️ 上一个", "callback_data": "market:prev"}])
+        keyboard.append([{"text": "📣 推荐给频道主", "url": self._add_channel_url()}])
+        keyboard.append([{"text": "🏠 返回主页", "callback_data": "menu:home"}])
+        return keyboard
+
+    def _ensure_channel_collection_conn(self, conn: Any, account_id: str, name: str) -> Any:
+        clean_name = self._clean_collection_name(name)
+        row = conn.execute(
+            "SELECT * FROM advertiser_channel_collections WHERE advertiser_account_id = ? AND name = ?",
+            (account_id, clean_name),
+        ).fetchone()
+        if row:
+            return row
+        collection_id = new_id("col")
+        conn.execute(
+            """
+            INSERT INTO advertiser_channel_collections (id, advertiser_account_id, name)
+            VALUES (?, ?, ?)
+            """,
+            (collection_id, account_id, clean_name),
+        )
+        return conn.execute("SELECT * FROM advertiser_channel_collections WHERE id = ?", (collection_id,)).fetchone()
+
+    def _clean_collection_name(self, name: str) -> str:
+        clean_name = " ".join((name or "").strip().split())
+        if not clean_name:
+            clean_name = "默认收藏夹"
+        return clean_name[:24]
+
+    def _channel_collection_by_id_conn(self, conn: Any, collection_id: str) -> Any | None:
+        if not collection_id:
+            return None
+        return conn.execute("SELECT * FROM advertiser_channel_collections WHERE id = ?", (collection_id,)).fetchone()
+
+    def _channel_collections_conn(self, conn: Any, account_id: str) -> list[Any]:
+        return conn.execute(
+            """
+            SELECT c.*, COUNT(i.channel_id) AS channel_count
+            FROM advertiser_channel_collections c
+            LEFT JOIN advertiser_channel_collection_items i ON i.collection_id = c.id
+            WHERE c.advertiser_account_id = ?
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC, c.created_at DESC
+            """,
+            (account_id,),
+        ).fetchall()
+
+    def _channel_collection_count_conn(self, conn: Any, collection_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM advertiser_channel_collection_items WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def _channel_in_collection_conn(self, conn: Any, collection_id: str, channel_id: str) -> bool:
+        return bool(
+            conn.execute(
+                "SELECT 1 FROM advertiser_channel_collection_items WHERE collection_id = ? AND channel_id = ?",
+                (collection_id, channel_id),
+            ).fetchone()
+        )
+
+    def _save_channel_to_collection_conn(self, conn: Any, account_id: str, collection_id: str, channel_id: str) -> None:
+        item_id = new_id("coli")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO advertiser_channel_collection_items (id, collection_id, channel_id)
+            VALUES (?, ?, ?)
+            """,
+            (item_id, collection_id, channel_id),
+        )
+        conn.execute(
+            "UPDATE advertiser_channel_collections SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (collection_id,),
+        )
+        saved_id = new_id("save")
+        conn.execute(
+            """
+            INSERT INTO advertiser_saved_channels (id, advertiser_account_id, channel_id, note)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(advertiser_account_id, channel_id)
+            DO UPDATE SET note = excluded.note
+            """,
+            (saved_id, account_id, channel_id, collection_id),
+        )
+
+    def _channel_collection_channels_conn(self, conn: Any, collection_id: str, *, limit: int = 50) -> list[Any]:
+        return conn.execute(
+            """
+            SELECT c.*,
+                   COALESCE(stats.subscribers, 0) AS subscribers,
+                   COALESCE(stats.median_24h_views, 0) AS median_24h_views
+            FROM advertiser_channel_collection_items i
+            JOIN channels c ON c.id = i.channel_id
+            LEFT JOIN (
+                SELECT a.*
+                FROM channel_pricing_assessments a
+                JOIN (
+                    SELECT channel_id, MAX(created_at) AS created_at
+                    FROM channel_pricing_assessments
+                    GROUP BY channel_id
+                ) latest ON latest.channel_id = a.channel_id AND latest.created_at = a.created_at
+            ) stats ON stats.channel_id = c.id
+            WHERE i.collection_id = ? AND c.status = 'active'
+            ORDER BY i.created_at DESC
+            LIMIT ?
+            """,
+            (collection_id, limit),
+        ).fetchall()
+
+    def _market_channel_count_conn(self, conn: Any) -> int:
+        row = conn.execute("SELECT COUNT(*) AS count FROM channels WHERE status = 'active'").fetchone()
+        return int(row["count"] if row else 0)
+
+    def _market_channel_at_conn(self, conn: Any, offset: int) -> Any | None:
+        return conn.execute(
+            """
+            SELECT c.*,
+                   stats.category,
+                   stats.score,
+                   stats.risk_level,
+                   COALESCE(stats.subscribers, 0) AS subscribers,
+                   COALESCE(stats.median_24h_views, 0) AS median_24h_views
+            FROM channels c
+            LEFT JOIN (
+                SELECT a.*
+                FROM channel_pricing_assessments a
+                JOIN (
+                    SELECT channel_id, MAX(created_at) AS created_at
+                    FROM channel_pricing_assessments
+                    GROUP BY channel_id
+                ) latest ON latest.channel_id = a.channel_id AND latest.created_at = a.created_at
+            ) stats ON stats.channel_id = c.id
+            WHERE c.status = 'active'
+            ORDER BY COALESCE(stats.subscribers, 0) DESC, c.updated_at DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (offset,),
+        ).fetchone()
+
+    def _market_channel_prices_conn(self, conn: Any, channel_id: str) -> list[Any]:
+        return conn.execute(
+            """
+            SELECT p.format_type, r.unit_price_cents
+            FROM channel_ad_format_policies p
+            JOIN ad_slots s
+              ON s.channel_id = p.channel_id
+             AND s.slot_type = p.format_type
+             AND s.enabled = 1
+            JOIN rate_cards r
+              ON r.slot_id = s.id
+             AND r.active = 1
+            WHERE p.channel_id = ? AND p.enabled = 1
+            ORDER BY CASE p.format_type
+                WHEN 'button_tail' THEN 1
+                WHEN 'light_tail' THEN 2
+                WHEN 'standard_card' THEN 3
+                WHEN 'strong_post' THEN 4
+                ELSE 9
+            END
+            """,
+            (channel_id,),
+        ).fetchall()
+
+    def _collection_supported_channel_ids_conn(self, conn: Any, collection_id: str, slot_type: str) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT c.id
+            FROM advertiser_channel_collection_items i
+            JOIN channels c ON c.id = i.channel_id
+            JOIN channel_ad_format_policies p
+              ON p.channel_id = c.id
+             AND p.format_type = ?
+             AND p.enabled = 1
+            JOIN ad_slots s
+              ON s.channel_id = c.id
+             AND s.slot_type = p.format_type
+             AND s.enabled = 1
+            JOIN rate_cards r
+              ON r.slot_id = s.id
+             AND r.active = 1
+            WHERE i.collection_id = ? AND c.status = 'active'
+            ORDER BY i.created_at DESC
+            """,
+            (slot_type, collection_id),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
 
     def _send_advertiser_menu(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
@@ -558,11 +1059,12 @@ class UpdateHandler:
     ) -> None:
         del rates
         payload = self._default_placement_payload(channel["id"])
-        self._send_placement_configurator(chat_id, {}, source_message, payload=payload)
+        self._send_placement_configurator(chat_id, {}, source_message, payload=payload, panel="creative")
 
     def _default_placement_payload(self, channel_id: str) -> dict[str, Any]:
         return {
             "channel_id": channel_id,
+            "flow_version": "guided_v2",
             "slot_type": "",
             "pin": False,
             "period": "once",
@@ -573,6 +1075,377 @@ class UpdateHandler:
             "creative_ids": [],
         }
 
+    def _default_global_placement_payload(self) -> dict[str, Any]:
+        payload = self._default_placement_payload("")
+        payload["flow_version"] = "global_v1"
+        payload["launch_mode"] = "global"
+        payload["channel_ids"] = []
+        return payload
+
+    def _send_global_placement(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        payload: dict[str, Any] | None = None,
+        panel: str = "creative",
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        display_name = self._display_name(user) or None
+        if panel not in {"creative", "display", "channel"}:
+            panel = "creative"
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", display_name)
+            if payload is None:
+                state = conn.execute("SELECT * FROM bot_conversation_states WHERE chat_id = ?", (str(chat_id),)).fetchone()
+                if state and state["flow"] in {"global_placement", "placement_config"}:
+                    payload = json.loads(state["payload_json"] or "{}")
+                else:
+                    payload = self._default_global_placement_payload()
+            payload["launch_mode"] = "global"
+            creatives: list[Any] = []
+            channels: list[Any] = []
+            collections: list[dict[str, Any]] = []
+            if panel == "creative":
+                payload["channel_offset"] = 0
+                creatives = conn.execute(
+                    """
+                    SELECT cr.*, ca.name AS campaign_name
+                    FROM creatives cr
+                    JOIN campaigns ca ON ca.id = cr.campaign_id
+                    WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
+                    ORDER BY cr.updated_at DESC, cr.created_at DESC
+                    LIMIT 8
+                    """,
+                    (account["id"],),
+                ).fetchall()
+                payload["creative_ids"] = [row["id"] for row in creatives]
+            elif panel == "channel":
+                mode = payload.get("channel_pick_mode") or "folders"
+                if mode == "channels":
+                    slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+                    total = self._global_placement_channel_count(conn, slot_type)
+                    offset = max(0, int(payload.get("channel_offset") or 0))
+                    if total and offset >= total:
+                        offset = max(0, ((total - 1) // 10) * 10)
+                    payload["channel_offset"] = offset
+                    payload["channel_total"] = total
+                    channels = self._global_placement_channels(conn, slot_type, offset=offset)
+                    payload["channel_ids"] = [row["id"] for row in channels]
+                else:
+                    payload["channel_pick_mode"] = "folders"
+                    collections = self._global_collection_options_conn(conn, account["id"], self.channels.normalize_slot_type(payload.get("slot_type") or ""))
+                    payload["collection_ids"] = [row["id"] for row in collections]
+                    if not payload.get("selected_collection_ids"):
+                        first_ready = next((row for row in collections if int(row["supported_count"]) > 0), None)
+                        if first_ready:
+                            self._apply_global_collection_selection_conn(conn, payload, [str(first_ready["id"])])
+                    elif payload.get("selected_collection_ids"):
+                        self._apply_global_collection_selection_conn(conn, payload, [str(item) for item in payload.get("selected_collection_ids") or []])
+            self._set_conversation_conn(conn, chat_id, account["id"], "global_placement", panel, payload)
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=self._global_placement_text(payload, panel, channels, collections),
+            inline_keyboard=self._global_placement_keyboard(payload, panel, creatives, channels, collections),
+            parse_mode="HTML",
+        )
+
+    def _global_placement_channel_count(self, conn: Any, slot_type: str) -> int:
+        if not slot_type:
+            return 0
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM channels c
+            JOIN channel_ad_format_policies p
+              ON p.channel_id = c.id
+             AND p.format_type = ?
+             AND p.enabled = 1
+            JOIN ad_slots s
+              ON s.channel_id = c.id
+             AND s.slot_type = p.format_type
+             AND s.enabled = 1
+            WHERE c.status = 'active'
+            """,
+            (slot_type,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def _global_placement_channels(self, conn: Any, slot_type: str, *, offset: int = 0, limit: int = 10) -> list[Any]:
+        if not slot_type:
+            return []
+        return conn.execute(
+            """
+            SELECT c.*,
+                   COALESCE(stats.subscribers, 0) AS subscribers,
+                   r.unit_price_cents,
+                   r.currency
+            FROM channels c
+            JOIN channel_ad_format_policies p
+              ON p.channel_id = c.id
+             AND p.format_type = ?
+             AND p.enabled = 1
+            JOIN ad_slots s
+              ON s.channel_id = c.id
+             AND s.slot_type = p.format_type
+             AND s.enabled = 1
+            JOIN rate_cards r
+              ON r.slot_id = s.id
+             AND r.active = 1
+            LEFT JOIN (
+                SELECT channel_id, MAX(subscribers) AS subscribers
+                FROM channel_pricing_assessments
+                GROUP BY channel_id
+            ) stats ON stats.channel_id = c.id
+            WHERE c.status = 'active'
+            ORDER BY COALESCE(stats.subscribers, 0) DESC, c.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (slot_type, limit, offset),
+        ).fetchall()
+
+    def _global_collection_options_conn(self, conn: Any, account_id: str, slot_type: str) -> list[dict[str, Any]]:
+        self._ensure_channel_collection_conn(conn, account_id, "默认收藏夹")
+        collections = self._channel_collections_conn(conn, account_id)
+        options: list[dict[str, Any]] = []
+        for collection in collections:
+            supported_ids = self._collection_supported_channel_ids_conn(conn, collection["id"], slot_type) if slot_type else []
+            options.append(
+                {
+                    "id": str(collection["id"]),
+                    "name": str(collection["name"]),
+                    "channel_count": int(collection["channel_count"] or 0),
+                    "supported_count": len(supported_ids),
+                }
+            )
+        return options
+
+    def _apply_global_collection_selection_conn(self, conn: Any, payload: dict[str, Any], collection_ids: list[str]) -> None:
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        selected_ids = list(dict.fromkeys(str(collection_id) for collection_id in collection_ids if collection_id))
+        selected_channel_ids: list[str] = []
+        selected_names: list[str] = []
+        for collection_id in selected_ids:
+            collection = self._channel_collection_by_id_conn(conn, collection_id)
+            if not collection:
+                continue
+            supported_ids = self._collection_supported_channel_ids_conn(conn, collection_id, slot_type)
+            selected_channel_ids.extend(supported_ids)
+            selected_names.append(str(collection["name"]))
+        selected_channel_ids = list(dict.fromkeys(selected_channel_ids))
+        payload["selected_collection_ids"] = selected_ids
+        payload["selected_collection_names"] = selected_names
+        payload["selected_channel_ids"] = selected_channel_ids
+        if selected_channel_ids:
+            first_channel = self.channels.get_channel(conn, selected_channel_ids[0])
+            payload["channel_id"] = first_channel["id"]
+            payload["channel_title"] = self._global_channel_label(payload)
+        else:
+            payload.pop("channel_id", None)
+            payload["channel_title"] = "待选择"
+
+    def _global_placement_text(
+        self,
+        payload: dict[str, Any],
+        panel: str,
+        channels: list[Any] | None = None,
+        collections: list[dict[str, Any]] | None = None,
+    ) -> str:
+        status_block = self._html_pre(
+            [
+                f"广告素材：{self._placement_creative_label(payload)}",
+                f"插播位置：{self._placement_display_label(payload)}",
+                f"频道：{self._global_channel_label(payload)}",
+            ]
+        )
+        lines = [
+            "<b>➕ 广告投放</b>",
+            "",
+            status_block,
+            "",
+            f"<b>{self._h(self._global_placement_step_title(panel, payload))}</b>",
+        ]
+        if panel == "creative":
+            lines.append(self._html_quote("先选择要投放的广告素材；没有素材就先创建一套。"))
+        elif panel == "display":
+            lines.append(self._html_quote("选择广告在频道里的呈现方式。这里只能选一种。"))
+        elif panel == "channel":
+            if (payload.get("channel_pick_mode") or "folders") == "folders":
+                selected_count = len(payload.get("selected_collection_ids") or [])
+                selected_channels = len(payload.get("selected_channel_ids") or [])
+                lines.extend(
+                    [
+                        self._html_quote(
+                            "默认按频道文件夹投放。可以同时选择多个文件夹。\n"
+                            "没有合适文件夹时，先去频道广场收藏频道；也可以临时按单个频道选择。"
+                        ),
+                        "",
+                        f"<b>频道文件夹</b>  <code>已选 {selected_count} 个｜可投 {selected_channels} 个频道</code>",
+                    ]
+                )
+                if collections:
+                    for index, collection in enumerate(collections, start=1):
+                        lines.append(
+                            f"{index}. <b>{self._h(collection['name'])}</b>｜"
+                            f"收藏 {collection['channel_count']}｜可投 {collection['supported_count']}"
+                        )
+                else:
+                    lines.append(self._html_quote("还没有频道文件夹。可以新建文件夹，然后去频道广场收藏频道。"))
+            elif channels:
+                offset = int(payload.get("channel_offset") or 0)
+                total = int(payload.get("channel_total") or len(channels))
+                lines.extend(
+                    [
+                        self._html_quote(
+                            f"选择要投放的频道。当前显示 {offset + 1}-{offset + len(channels)} / {total}。\n"
+                            "清单里的链接用于预览频道；下方编号按钮用于勾选。"
+                        ),
+                        "",
+                        "<b>频道清单</b>",
+                    ]
+                )
+                for index, channel in enumerate(channels, start=1):
+                    lines.extend(self._global_channel_summary_lines(index, channel))
+            else:
+                lines.append(self._html_quote("当前没有找到支持这个插播位置的频道，可以换一种插播位置。"))
+        return "\n".join(lines)
+
+    def _global_placement_keyboard(
+        self,
+        payload: dict[str, Any],
+        panel: str,
+        creatives: list[Any] | None = None,
+        channels: list[Any] | None = None,
+        collections: list[dict[str, Any]] | None = None,
+    ) -> list[list[dict[str, str]]]:
+        if panel == "creative":
+            keyboard: list[list[dict[str, str]]] = []
+            for index, creative in enumerate(creatives or []):
+                label = self._short_title((creative["campaign_name"] or creative["text"] or "").replace("\n", " "), 18)
+                keyboard.append([{"text": f"📄 {label}", "callback_data": f"launch:pick:{index}"}])
+            keyboard.append([{"text": "➕ 添加广告素材", "callback_data": "launch:new"}])
+            keyboard.append([{"text": "🔎 先挑频道", "callback_data": "market:home"}, {"text": "⭐ 频道收藏夹", "callback_data": "market:folders"}])
+            keyboard.append([{"text": "🏠 返回主菜单", "callback_data": "menu:home"}])
+            return keyboard
+        if panel == "display":
+            selected = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            keyboard = [
+                [
+                    {"text": self._placement_slot_button_text("button_tail", selected), "callback_data": "launch:slot:button_tail"},
+                    {"text": self._placement_slot_button_text("light_tail", selected), "callback_data": "launch:slot:light_tail"},
+                ],
+                [
+                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "launch:slot:standard_card"},
+                    {"text": self._placement_slot_button_text("strong_post", selected), "callback_data": "launch:slot:strong_post"},
+                ],
+            ]
+            keyboard.append([{"text": "⬅️ 上一步", "callback_data": "launch:back"}, {"text": "下一步 ➡️", "callback_data": "launch:next"}])
+            return keyboard
+        if panel == "channel":
+            if (payload.get("channel_pick_mode") or "folders") == "folders":
+                selected_collection_ids = set(str(collection_id) for collection_id in payload.get("selected_collection_ids") or [])
+                keyboard = [
+                    [
+                        {"text": "📺 按频道选择", "callback_data": "launch:channel_mode:channels"},
+                        {"text": "➕ 新建文件夹", "callback_data": "launch:new_folder"},
+                    ]
+                ]
+                folder_buttons = [
+                    {
+                        "text": self._global_collection_button_text(index + 1, collection, selected=str(collection["id"]) in selected_collection_ids),
+                        "callback_data": f"launch:folder:{index}",
+                    }
+                    for index, collection in enumerate(collections or [])
+                ]
+                keyboard.extend(self._button_grid(folder_buttons, 2))
+                selected_channel_count = len(payload.get("selected_channel_ids") or [])
+                if selected_channel_count:
+                    keyboard.append([{"text": f"下一步 ➡️（{selected_channel_count} 个频道）", "callback_data": "launch:start"}])
+                keyboard.append([{"text": "⬅️ 上一步", "callback_data": "launch:back"}, {"text": "🔎 频道广场", "callback_data": "market:home"}])
+                return keyboard
+            selected_ids = set(str(channel_id) for channel_id in payload.get("selected_channel_ids") or [])
+            select_buttons = [
+                {
+                    "text": self._global_channel_select_button_text(index + 1, channel, selected=str(channel["id"]) in selected_ids),
+                    "callback_data": f"launch:toggle:{index}",
+                }
+                for index, channel in enumerate(channels or [])
+            ]
+            keyboard = [[{"text": "📁 按文件夹选择", "callback_data": "launch:channel_mode:folders"}]]
+            keyboard.extend(self._button_grid(select_buttons, 2))
+            offset = int(payload.get("channel_offset") or 0)
+            total = int(payload.get("channel_total") or len(channels or []))
+            page_buttons: list[dict[str, str]] = []
+            if offset > 0:
+                page_buttons.append({"text": "⬅️ 上一批", "callback_data": "launch:page:prev"})
+            if offset + len(channels or []) < total:
+                page_buttons.append({"text": "下一批 ➡️", "callback_data": "launch:page:next"})
+            if page_buttons:
+                keyboard.append(page_buttons)
+            selected_count = len(selected_ids)
+            if selected_count:
+                keyboard.append([{"text": f"✅ 开始投放（已选 {selected_count} 个）", "callback_data": "launch:start"}])
+            keyboard.append([{"text": "⬅️ 上一步", "callback_data": "launch:back"}])
+            return keyboard
+        return [[{"text": "🏠 返回主菜单", "callback_data": "menu:home"}]]
+
+    def _global_placement_step_title(self, panel: str, payload: dict[str, Any] | None = None) -> str:
+        titles = {
+            "creative": "第 1/5 步：选择广告素材",
+            "display": "第 2/5 步：选择插播位置",
+            "channel": "第 3/5 步：选择投放频道",
+        }
+        if panel == "channel" and payload and (payload.get("channel_pick_mode") or "folders") == "folders":
+            return "第 3/5 步：选择频道文件夹"
+        return titles.get(panel, titles["creative"])
+
+    def _global_channel_label(self, payload: dict[str, Any]) -> str:
+        selected = payload.get("selected_channel_ids") or []
+        selected_collections = payload.get("selected_collection_names") or []
+        if selected_collections:
+            if len(selected_collections) == 1:
+                return f"{selected_collections[0]}（{len(selected)} 个频道）"
+            return f"已选 {len(selected_collections)} 个文件夹 / {len(selected)} 个频道"
+        if selected and payload.get("selected_collection_name"):
+            return f"{payload['selected_collection_name']}（{len(selected)} 个）"
+        if len(selected) > 1:
+            return f"已选 {len(selected)} 个"
+        return payload.get("channel_title") or ("已选 1 个" if selected else "待选择")
+
+    def _global_channel_summary_lines(self, index: int, channel: Any) -> list[str]:
+        subscribers = self._compact_count(int(channel["subscribers"] or 0))
+        title = self._short_title(str(channel["title"] or "未命名频道"), 16)
+        price = cents_to_money(int(channel["unit_price_cents"] or 0))
+        link = self._channel_public_url(channel)
+        if link:
+            return [f"<b>{index}. 👥 {self._h(subscribers)}｜{self._h(title)}｜USD {price}</b>", f'   <a href="{self._h(link)}">{self._h(link)}</a>']
+        return [f"<b>{index}. 👥 {self._h(subscribers)}｜{self._h(title)}｜USD {price}</b>", "   暂无公开链接"]
+
+    def _global_channel_select_button_text(self, index: int, channel: Any, *, selected: bool) -> str:
+        title = self._short_title(str(channel["title"] or "未命名频道"), 9)
+        return f"{'✅ ' if selected else ''}{index} {title}"
+
+    def _global_collection_button_text(self, index: int, collection: dict[str, Any], *, selected: bool) -> str:
+        title = self._short_title(str(collection["name"] or "未命名文件夹"), 8)
+        supported = int(collection.get("supported_count") or 0)
+        return f"{'✅ ' if selected else ''}{index} {title}（{supported}）"
+
+    def _channel_public_url(self, channel: Any) -> str | None:
+        username = str(channel["username"] or "").strip().lstrip("@")
+        if username:
+            return f"https://t.me/{username}"
+        return None
+
+    def _compact_count(self, value: int) -> str:
+        value = max(0, value)
+        if value >= 10000:
+            return f"{value / 10000:.1f}万"
+        if value:
+            return str(value)
+        return "未知"
+
     def _send_placement_configurator(
         self,
         chat_id: str | int,
@@ -580,8 +1453,10 @@ class UpdateHandler:
         source_message: dict[str, Any] | None = None,
         *,
         payload: dict[str, Any] | None = None,
-        panel: str = "home",
+        panel: str = "creative",
     ) -> None:
+        if panel == "home":
+            panel = "creative"
         user_id = user.get("id") or chat_id
         display_name = self._display_name(user) or None
         with self.db.transaction() as conn:
@@ -597,12 +1472,14 @@ class UpdateHandler:
                     )
                     return
                 payload = json.loads(state["payload_json"] or "{}")
+        panel = self._placement_effective_panel(panel, payload)
+        with self.db.transaction() as conn:
             channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, payload["channel_id"]))
             creatives = []
             if panel == "creative":
                 creatives = conn.execute(
                     """
-                    SELECT cr.*
+                    SELECT cr.*, ca.name AS campaign_name
                     FROM creatives cr
                     JOIN campaigns ca ON ca.id = cr.campaign_id
                     WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
@@ -617,13 +1494,20 @@ class UpdateHandler:
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
-            text=self._placement_text(channel, payload, panel),
-            inline_keyboard=self._placement_keyboard(panel, payload, creatives),
+            text=self._placement_text(channel, payload, panel, account),
+            inline_keyboard=self._placement_keyboard(panel, payload, creatives, account),
+            parse_mode="HTML",
         )
 
     def _handle_placement_callback(self, data: str, chat_id: str | int, user: dict[str, Any], message: dict[str, Any] | None = None) -> dict[str, Any]:
         if data == "place:home":
-            self._send_placement_configurator(chat_id, user, message, panel="home")
+            state = self._get_conversation(chat_id)
+            if state and state["flow"] == "placement_config":
+                payload = json.loads(state["payload_json"] or "{}")
+                if payload.get("launch_mode") == "global":
+                    self._send_global_placement(chat_id, user, message, payload=payload, panel="creative")
+                    return {"handled": True, "type": "callback_global_placement_home"}
+            self._send_placement_configurator(chat_id, user, message, panel="creative")
             return {"handled": True, "type": "callback_placement_home"}
         if data in {"place:display", "place:schedule", "place:creative", "place:confirm"}:
             panel = data.removeprefix("place:")
@@ -641,6 +1525,42 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_placement_expired"}
         payload = json.loads(state["payload_json"] or "{}")
 
+        if data == "place:next":
+            current_panel = state.get("step") or "creative"
+            next_panel = self._placement_next_panel(payload, current_panel)
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=next_panel)
+            return {"handled": True, "type": "callback_placement_next", "panel": next_panel}
+
+        if data == "place:back":
+            current_panel = state.get("step") or "creative"
+            previous_panel = self._placement_previous_panel(payload, current_panel)
+            if previous_panel == "channel":
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_placement_back", "panel": previous_panel}
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=previous_panel)
+            return {"handled": True, "type": "callback_placement_back", "panel": previous_panel}
+
+        if data == "place:asset_back":
+            current_step = state.get("step") or "ad_name"
+            previous_step = self._placement_asset_previous_step(current_step)
+            if not previous_step:
+                self._reply_or_edit(
+                    chat_id=chat_id,
+                    source_message=message,
+                    text=self._placement_creative_prompt(payload, current_step),
+                    inline_keyboard=self._placement_asset_keyboard(current_step),
+                )
+                return {"handled": True, "type": "callback_placement_asset_back", "step": current_step}
+            self._clear_placement_asset_from_step(payload, previous_step)
+            self._set_conversation(chat_id, state["account_id"], "placement_config", previous_step, payload)
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=message,
+                text=self._placement_creative_prompt(payload, previous_step),
+                inline_keyboard=self._placement_asset_keyboard(previous_step),
+            )
+            return {"handled": True, "type": "callback_placement_asset_back", "step": previous_step}
+
         if data.startswith("place:slot:"):
             slot_type = self.channels.normalize_slot_type(data.removeprefix("place:slot:"))
             payload["slot_type"] = slot_type
@@ -653,7 +1573,24 @@ class UpdateHandler:
             slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
             if slot_type in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = not bool(payload.get("pin"))
-            self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
+            target_panel = state.get("step") or "display"
+            if target_panel not in {"schedule", "confirm"}:
+                target_panel = "display"
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=target_panel)
+            return {"handled": True, "type": "callback_placement_pin", "pin": bool(payload.get("pin"))}
+
+        if data.startswith("place:pin:"):
+            slot_type = self.channels.normalize_slot_type(data.removeprefix("place:pin:"))
+            if slot_type in PINNABLE_PLACEMENT_SLOTS:
+                if payload.get("slot_type") != slot_type:
+                    payload["slot_type"] = slot_type
+                    payload["pin"] = True
+                else:
+                    payload["pin"] = not bool(payload.get("pin"))
+            target_panel = state.get("step") or "display"
+            if target_panel not in {"schedule", "confirm"}:
+                target_panel = "display"
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=target_panel)
             return {"handled": True, "type": "callback_placement_pin", "pin": bool(payload.get("pin"))}
 
         if data.startswith("place:period:"):
@@ -685,19 +1622,32 @@ class UpdateHandler:
                 self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 没有这个广告素材。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
                 return {"handled": True, "type": "callback_placement_creative_missing"}
             with self.db.transaction() as conn:
-                creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (creative_ids[index],)).fetchone()
+                creative = conn.execute(
+                    """
+                    SELECT cr.*, ca.name AS campaign_name
+                    FROM creatives cr
+                    JOIN campaigns ca ON ca.id = cr.campaign_id
+                    WHERE cr.id = ?
+                    """,
+                    (creative_ids[index],),
+                ).fetchone()
             if not creative:
                 self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 广告素材不存在。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
                 return {"handled": True, "type": "callback_placement_creative_missing"}
             payload.update(
                 {
                     "creative_text": creative["text"],
+                    "creative_name": creative["campaign_name"],
                     "target_url": creative["target_url"],
                     "button_text": creative["button_text"],
+                    "light_short_text": creative["short_text"] or creative["button_text"],
+                    "standard_text": creative["standard_text"] or creative["text"],
+                    "media_file_id": creative["media_file_id"],
+                    "media_type": creative["media_type"],
                     "selected_creative_id": creative["id"],
                 }
             )
-            self._send_placement_configurator(chat_id, user, message, payload=payload, panel="home")
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
             return {"handled": True, "type": "callback_placement_creative_selected"}
 
         if data.startswith("place:new:"):
@@ -719,64 +1669,437 @@ class UpdateHandler:
         self._send_placement_configurator(chat_id, user, message, payload=payload, panel="home")
         return {"handled": True, "type": "callback_placement_unknown"}
 
+    def _handle_channel_market_callback(self, data: str, chat_id: str | int, user: dict[str, Any], message: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = self._get_conversation(chat_id)
+        payload = json.loads(state["payload_json"] or "{}") if state and state["flow"] == "channel_market" else {}
+
+        if data == "market:home":
+            self._send_channel_market_home(chat_id, user, message)
+            return {"handled": True, "type": "callback_channel_market_browse"}
+
+        if data == "market:browse":
+            self._send_channel_market_browse(chat_id, user, message, payload=payload)
+            return {"handled": True, "type": "callback_channel_market_browse"}
+
+        if data in {"market:next", "market:prev"}:
+            offset = int(payload.get("offset") or 0)
+            offset = offset + 1 if data == "market:next" else offset - 1
+            self._send_channel_market_browse(chat_id, user, message, payload=payload, offset=max(0, offset))
+            return {"handled": True, "type": "callback_channel_market_page", "offset": max(0, offset)}
+
+        if data == "market:save":
+            channel_id = payload.get("channel_id")
+            user_id = user.get("id") or chat_id
+            with self.db.transaction() as conn:
+                account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+                collection = self._channel_collection_by_id_conn(conn, payload.get("collection_id") or "")
+                if not collection or collection["advertiser_account_id"] != account["id"]:
+                    collection = self._ensure_channel_collection_conn(conn, account["id"], "默认收藏夹")
+                if channel_id:
+                    self._save_channel_to_collection_conn(conn, account["id"], collection["id"], str(channel_id))
+                    payload["collection_id"] = collection["id"]
+                    payload["collection_name"] = collection["name"]
+                    self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "browse", payload)
+            self._send_channel_market_browse(chat_id, user, message, payload=payload)
+            return {"handled": True, "type": "callback_channel_market_saved", "channel_id": channel_id}
+
+        if data == "market:folders":
+            self._send_channel_collections(chat_id, user, message)
+            return {"handled": True, "type": "callback_channel_market_folders"}
+
+        if data == "market:new_folder":
+            user_id = user.get("id") or chat_id
+            with self.db.transaction() as conn:
+                account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+                self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "folder_name", payload)
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=message,
+                text="➕ 新建频道收藏夹\n\n发送收藏夹名称，例如：动漫频道、工具号、成人用品。",
+                inline_keyboard=[[{"text": "⭐ 收藏夹列表", "callback_data": "market:folders"}, {"text": "↩️ 返回广场", "callback_data": "market:browse"}]],
+            )
+            return {"handled": True, "type": "callback_channel_market_new_folder"}
+
+        if data.startswith("market:folder:"):
+            index = int(data.removeprefix("market:folder:"))
+            collection_ids = payload.get("collection_ids") or []
+            if index < 0 or index >= len(collection_ids):
+                self._send_channel_collections(chat_id, user, message)
+                return {"handled": True, "type": "callback_channel_market_folder_missing"}
+            user_id = user.get("id") or chat_id
+            with self.db.transaction() as conn:
+                account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+                collection = self._channel_collection_by_id_conn(conn, str(collection_ids[index]))
+                if not collection or collection["advertiser_account_id"] != account["id"]:
+                    self._send_channel_collections(chat_id, user, message)
+                    return {"handled": True, "type": "callback_channel_market_folder_missing"}
+                total = self._market_channel_count_conn(conn)
+                offset = int(payload.get("offset") or 0)
+                if total and offset >= total:
+                    offset = max(0, total - 1)
+                payload["collection_id"] = collection["id"]
+                payload["collection_name"] = collection["name"]
+                payload["offset"] = offset
+                self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "browse", payload)
+            self._send_channel_market_browse(chat_id, user, message, payload=payload)
+            return {"handled": True, "type": "callback_channel_market_folder_selected", "collection_id": collection_ids[index]}
+
+        if data.startswith("market:launch_folder:"):
+            index = int(data.removeprefix("market:launch_folder:"))
+            collection_ids = payload.get("collection_ids") or []
+            collection_id = payload.get("collection_id")
+            if collection_ids and 0 <= index < len(collection_ids):
+                collection_id = collection_ids[index]
+            if not collection_id:
+                self._send_channel_collections(chat_id, user, message)
+                return {"handled": True, "type": "callback_channel_market_folder_missing"}
+            return self._start_global_placement_from_collection(chat_id, user, message, str(collection_id))
+
+        self._send_channel_market_home(chat_id, user, message)
+        return {"handled": True, "type": "callback_channel_market_unknown"}
+
+    def _start_global_placement_from_collection(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None,
+        collection_id: str,
+    ) -> dict[str, Any]:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            collection = self._channel_collection_by_id_conn(conn, collection_id)
+            if not collection or collection["advertiser_account_id"] != account["id"]:
+                self._send_channel_collections(chat_id, user, source_message)
+                return {"handled": True, "type": "callback_channel_market_folder_missing"}
+            channels = self._channel_collection_channels_conn(conn, collection_id, limit=200)
+        if not channels:
+            self._send_channel_collection_detail(chat_id, user, source_message, collection_id=collection_id)
+            return {"handled": True, "type": "callback_channel_market_folder_empty"}
+        payload = self._default_global_placement_payload()
+        payload["selected_collection_id"] = collection_id
+        payload["selected_collection_name"] = collection["name"]
+        payload["selected_channel_ids"] = [str(channel["id"]) for channel in channels]
+        payload["channel_id"] = str(channels[0]["id"])
+        payload["channel_title"] = f"{collection['name']}（{len(channels)} 个）"
+        self._send_global_placement(chat_id, user, source_message, payload=payload, panel="creative")
+        return {"handled": True, "type": "callback_channel_market_launch_collection", "collection_id": collection_id, "channel_count": len(channels)}
+
+    def _handle_global_placement_callback(self, data: str, chat_id: str | int, user: dict[str, Any], message: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = self._get_conversation(chat_id)
+        if not state or state["flow"] != "global_placement":
+            self._send_global_placement(chat_id, user, message, panel="creative")
+            return {"handled": True, "type": "callback_global_placement_started"}
+        payload = json.loads(state["payload_json"] or "{}")
+        current_panel = state.get("step") or "creative"
+
+        if data == "launch:new":
+            self._begin_placement_creative(chat_id, user, message, payload, state["account_id"])
+            return {"handled": True, "type": "callback_global_placement_new_creative"}
+
+        if data.startswith("launch:pick:"):
+            index = int(data.removeprefix("launch:pick:"))
+            creative_ids = payload.get("creative_ids") or []
+            if index < 0 or index >= len(creative_ids):
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_global_placement_creative_missing"}
+            with self.db.transaction() as conn:
+                creative = conn.execute(
+                    """
+                    SELECT cr.*, ca.name AS campaign_name
+                    FROM creatives cr
+                    JOIN campaigns ca ON ca.id = cr.campaign_id
+                    WHERE cr.id = ?
+                    """,
+                    (creative_ids[index],),
+                ).fetchone()
+            if not creative:
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_global_placement_creative_missing"}
+            payload.update(
+                {
+                    "creative_text": creative["text"],
+                    "creative_name": creative["campaign_name"],
+                    "target_url": creative["target_url"],
+                    "button_text": creative["button_text"],
+                    "light_short_text": creative["short_text"] or creative["button_text"],
+                    "standard_text": creative["standard_text"] or creative["text"],
+                    "media_file_id": creative["media_file_id"],
+                    "media_type": creative["media_type"],
+                    "selected_creative_id": creative["id"],
+                }
+            )
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="display")
+            return {"handled": True, "type": "callback_global_placement_creative_selected"}
+
+        if data.startswith("launch:slot:"):
+            slot_type = self.channels.normalize_slot_type(data.removeprefix("launch:slot:"))
+            payload["slot_type"] = slot_type
+            payload["pin"] = False
+            if payload.get("selected_collection_id"):
+                with self.db.transaction() as conn:
+                    selected_ids = self._collection_supported_channel_ids_conn(conn, str(payload["selected_collection_id"]), slot_type)
+                    first_channel = self.channels.get_channel(conn, selected_ids[0]) if selected_ids else None
+                if selected_ids and first_channel:
+                    payload["selected_channel_ids"] = selected_ids
+                    payload["channel_id"] = first_channel["id"]
+                    collection_name = payload.get("selected_collection_name") or "频道收藏夹"
+                    payload["channel_title"] = f"{collection_name}（{len(selected_ids)} 个）"
+                    next_panel = "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "confirm"
+                    self._send_placement_configurator(chat_id, user, message, payload=payload, panel=next_panel)
+                    return {"handled": True, "type": "callback_global_placement_collection_slot", "slot_type": slot_type, "channel_count": len(selected_ids), "panel": next_panel}
+                payload.pop("channel_id", None)
+                payload.pop("channel_title", None)
+                payload["selected_channel_ids"] = []
+            else:
+                payload.pop("channel_id", None)
+                payload.pop("channel_title", None)
+                payload["selected_channel_ids"] = []
+                payload["selected_collection_ids"] = []
+                payload["selected_collection_names"] = []
+                payload["channel_pick_mode"] = "folders"
+            payload["channel_offset"] = 0
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {"handled": True, "type": "callback_global_placement_slot", "slot_type": slot_type}
+
+        if data == "launch:next":
+            if current_panel == "display" and payload.get("slot_type"):
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_global_placement_next", "panel": "channel"}
+            self._send_global_placement(chat_id, user, message, payload=payload, panel=current_panel)
+            return {"handled": True, "type": "callback_global_placement_next_blocked", "panel": current_panel}
+
+        if data == "launch:back":
+            previous_panel = "creative" if current_panel == "display" else "display" if current_panel == "channel" else "creative"
+            self._send_global_placement(chat_id, user, message, payload=payload, panel=previous_panel)
+            return {"handled": True, "type": "callback_global_placement_back", "panel": previous_panel}
+
+        if data == "launch:channel_mode:channels":
+            payload["channel_pick_mode"] = "channels"
+            payload["channel_offset"] = 0
+            payload["selected_collection_ids"] = []
+            payload["selected_collection_names"] = []
+            payload["selected_channel_ids"] = []
+            payload.pop("channel_id", None)
+            payload.pop("channel_title", None)
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {"handled": True, "type": "callback_global_placement_channel_mode", "mode": "channels"}
+
+        if data == "launch:channel_mode:folders":
+            payload["channel_pick_mode"] = "folders"
+            payload["channel_offset"] = 0
+            payload["selected_channel_ids"] = []
+            payload.pop("channel_id", None)
+            payload.pop("channel_title", None)
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {"handled": True, "type": "callback_global_placement_channel_mode", "mode": "folders"}
+
+        if data == "launch:new_folder":
+            self._set_conversation(chat_id, state["account_id"], "global_placement", "folder_name", payload)
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=message,
+                text="<b>➕ 新建频道文件夹</b>\n\n" + self._html_quote("发送文件夹名称，例如：国漫、工具号、成人用品。创建后会带你去频道广场收藏频道。"),
+                inline_keyboard=[[{"text": "⬅️ 返回选择文件夹", "callback_data": "launch:channel_mode:folders"}]],
+                parse_mode="HTML",
+            )
+            return {"handled": True, "type": "callback_global_placement_new_folder"}
+
+        if data.startswith("launch:folder:"):
+            index = int(data.removeprefix("launch:folder:"))
+            collection_ids = payload.get("collection_ids") or []
+            if index < 0 or index >= len(collection_ids):
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_global_placement_folder_missing"}
+            target_id = str(collection_ids[index])
+            selected_collection_ids = [str(collection_id) for collection_id in payload.get("selected_collection_ids") or []]
+            if target_id in selected_collection_ids:
+                selected_collection_ids = [collection_id for collection_id in selected_collection_ids if collection_id != target_id]
+            else:
+                selected_collection_ids.append(target_id)
+            with self.db.transaction() as conn:
+                self._apply_global_collection_selection_conn(conn, payload, selected_collection_ids)
+            payload["channel_pick_mode"] = "folders"
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {
+                "handled": True,
+                "type": "callback_global_placement_folder_toggled",
+                "selected_folder_count": len(payload.get("selected_collection_ids") or []),
+                "selected_count": len(payload.get("selected_channel_ids") or []),
+            }
+
+        if data.startswith("launch:page:"):
+            direction = data.removeprefix("launch:page:")
+            offset = int(payload.get("channel_offset") or 0)
+            total = int(payload.get("channel_total") or 0)
+            if direction == "next":
+                offset += 10
+            elif direction == "prev":
+                offset -= 10
+            if total and offset >= total:
+                offset = max(0, ((total - 1) // 10) * 10)
+            payload["channel_offset"] = max(0, offset)
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {"handled": True, "type": "callback_global_placement_channel_page", "offset": payload["channel_offset"]}
+
+        if data.startswith("launch:toggle:"):
+            index = int(data.removeprefix("launch:toggle:"))
+            channel_ids = payload.get("channel_ids") or []
+            if index < 0 or index >= len(channel_ids):
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_global_placement_channel_missing"}
+            target_id = str(channel_ids[index])
+            selected_ids = [str(channel_id) for channel_id in payload.get("selected_channel_ids") or []]
+            if target_id in selected_ids:
+                selected_ids = [channel_id for channel_id in selected_ids if channel_id != target_id]
+            else:
+                selected_ids.append(target_id)
+            payload["selected_channel_ids"] = selected_ids
+            payload["selected_collection_ids"] = []
+            payload["selected_collection_names"] = []
+            if selected_ids:
+                with self.db.transaction() as conn:
+                    channel = self.channels.get_channel(conn, selected_ids[0])
+                payload["channel_id"] = channel["id"]
+                payload["channel_title"] = channel["title"] if len(selected_ids) == 1 else f"已选 {len(selected_ids)} 个"
+            else:
+                payload.pop("channel_id", None)
+                payload.pop("channel_title", None)
+            self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+            return {"handled": True, "type": "callback_global_placement_channel_toggled", "selected_count": len(selected_ids)}
+
+        if data == "launch:start":
+            selected_ids = self._placement_channel_ids(payload)
+            if not selected_ids:
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_global_placement_channel_required"}
+            with self.db.transaction() as conn:
+                channel = self.channels.get_channel(conn, selected_ids[0])
+            payload["selected_channel_ids"] = selected_ids
+            payload["channel_id"] = channel["id"]
+            payload["channel_title"] = self._global_channel_label(payload) if payload.get("selected_collection_names") else (channel["title"] if len(selected_ids) == 1 else f"已选 {len(selected_ids)} 个")
+            slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            next_panel = "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "confirm"
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=next_panel)
+            return {"handled": True, "type": "callback_global_placement_channel_selected", "channel_ids": selected_ids, "panel": next_panel}
+
+        if data.startswith("launch:channel:"):
+            index = int(data.removeprefix("launch:channel:"))
+            channel_ids = payload.get("channel_ids") or []
+            if index < 0 or index >= len(channel_ids):
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_global_placement_channel_missing"}
+            with self.db.transaction() as conn:
+                channel = self.channels.get_channel(conn, channel_ids[index])
+            payload["channel_id"] = channel["id"]
+            payload["channel_title"] = channel["title"]
+            payload["selected_channel_ids"] = [str(channel["id"])]
+            slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+            next_panel = "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "confirm"
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel=next_panel)
+            return {"handled": True, "type": "callback_global_placement_channel_selected", "channel_id": channel["id"], "panel": next_panel}
+
+        self._send_global_placement(chat_id, user, message, payload=payload, panel=current_panel)
+        return {"handled": True, "type": "callback_global_placement_unknown"}
+
     def _handle_placement_message(self, message: dict[str, Any], state: dict[str, Any], text: str) -> dict[str, Any]:
         chat = message.get("chat") or {}
         user = message.get("from") or {}
         chat_id = chat.get("id") or user.get("id")
         if not chat_id:
             return {"handled": False, "reason": "missing_chat"}
-        if not text:
-            self.gateway.send_private_message(chat_id=chat_id, text="请发送文字内容，或点击取消。", inline_keyboard=self._cancel_keyboard("取消设置", "place:home"))
-            return {"handled": True, "type": "placement_text_required"}
-
         payload = json.loads(state["payload_json"] or "{}")
         clean_text = text.strip()
         step = state["step"]
 
         if step == "time_input":
+            if not clean_text:
+                self.gateway.send_private_message(chat_id=chat_id, text="请发送发布时间文字，或点击取消。", inline_keyboard=self._cancel_keyboard("取消设置", "place:home"))
+                return {"handled": True, "type": "placement_text_required"}
             payload["scheduled_label"] = clean_text
-            self._send_placement_configurator(chat_id, user, None, payload=payload, panel="home")
+            self._send_placement_configurator(chat_id, user, None, payload=payload, panel="schedule")
             return {"handled": True, "type": "placement_time_saved"}
 
-        if step == "light_short_text":
-            if len(clean_text) < 2 or len(clean_text) > 15:
-                self.gateway.send_private_message(chat_id=chat_id, text="文字插播短入口需要 2-15 个字。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
-                return {"handled": True, "type": "placement_invalid_light_short_text"}
-            payload["light_short_text"] = clean_text
-            payload["button_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "placement_config", "light_detail_text", payload)
-            self.gateway.send_private_message(
-                chat_id=chat_id,
-                text="✅ 短入口已保存\n\n请发送完整广告详情。用户点击文字插播后，会在 Bot 里看到这段内容。",
-                inline_keyboard=self._cancel_keyboard("取消创建", "place:home"),
-            )
-            return {"handled": True, "type": "placement_light_short_saved"}
+        if step == "ad_name":
+            if len(clean_text) < 2 or len(clean_text) > 24:
+                self.gateway.send_private_message(chat_id=chat_id, text="广告名称需要 2-24 个字，方便你下次复用。", inline_keyboard=self._placement_asset_keyboard(step))
+                return {"handled": True, "type": "placement_invalid_ad_name"}
+            payload["creative_name"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "placement_config", "media_detail", payload)
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "media_detail"), inline_keyboard=self._placement_asset_keyboard("media_detail"))
+            return {"handled": True, "type": "placement_ad_name_saved"}
 
-        if step == "light_detail_text":
-            if len(clean_text) < 4 or len(clean_text) > 1000:
-                self.gateway.send_private_message(chat_id=chat_id, text="广告详情需要 4-1000 个字。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
-                return {"handled": True, "type": "placement_invalid_light_detail"}
+        if step == "media_detail":
+            media = self._message_media(message)
+            if not media:
+                self.gateway.send_private_message(chat_id=chat_id, text="媒体文件需要发送一张图片或一个视频。详细介绍下一步再填。", inline_keyboard=self._placement_asset_keyboard(step))
+                return {"handled": True, "type": "placement_media_required"}
+            payload["media_file_id"] = media["file_id"]
+            payload["media_type"] = media["media_type"]
+            if clean_text:
+                if len(clean_text) < 4 or len(clean_text) > 2000:
+                    self.gateway.send_private_message(chat_id=chat_id, text="详细介绍需要 4-2000 个字。", inline_keyboard=self._placement_asset_keyboard(step))
+                    return {"handled": True, "type": "placement_invalid_detail"}
+                payload["creative_text"] = clean_text
+                self._set_conversation(chat_id, state["account_id"], "placement_config", "target_url", payload)
+                self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "target_url"), inline_keyboard=self._placement_asset_keyboard("target_url"))
+                return {"handled": True, "type": "placement_media_detail_saved"}
+            self._set_conversation(chat_id, state["account_id"], "placement_config", "detail_text", payload)
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "detail_text"), inline_keyboard=self._placement_asset_keyboard("detail_text"))
+            return {"handled": True, "type": "placement_media_saved"}
+
+        if step == "detail_text":
+            if len(clean_text) < 4 or len(clean_text) > 2000:
+                self.gateway.send_private_message(chat_id=chat_id, text="详细介绍需要 4-2000 个字。", inline_keyboard=self._placement_asset_keyboard(step))
+                return {"handled": True, "type": "placement_invalid_detail"}
             payload["creative_text"] = clean_text
             self._set_conversation(chat_id, state["account_id"], "placement_config", "target_url", payload)
-            self.gateway.send_private_message(chat_id=chat_id, text="请发送广告目标链接，必须以 http:// 或 https:// 开头。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
-            return {"handled": True, "type": "placement_light_detail_saved"}
-
-        if step == "creative_text":
-            if len(clean_text) < 4 or len(clean_text) > 800:
-                self.gateway.send_private_message(chat_id=chat_id, text="广告文案需要 4-800 个字。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
-                return {"handled": True, "type": "placement_invalid_creative"}
-            payload["creative_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "placement_config", "target_url", payload)
-            self.gateway.send_private_message(chat_id=chat_id, text="请发送广告目标链接，必须以 http:// 或 https:// 开头。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
-            return {"handled": True, "type": "placement_creative_saved"}
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "target_url"), inline_keyboard=self._placement_asset_keyboard("target_url"))
+            return {"handled": True, "type": "placement_detail_saved"}
 
         if step == "target_url":
             if not (clean_text.startswith("https://") or clean_text.startswith("http://")):
-                self.gateway.send_private_message(chat_id=chat_id, text="链接格式不对。请发送以 http:// 或 https:// 开头的目标链接。", inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
+                self.gateway.send_private_message(chat_id=chat_id, text="跳转链接格式不对。请发送以 http:// 或 https:// 开头的链接。", inline_keyboard=self._placement_asset_keyboard(step))
                 return {"handled": True, "type": "placement_invalid_url"}
             payload["target_url"] = clean_text
-            self._send_placement_configurator(chat_id, user, None, payload=payload, panel="home")
+            self._set_conversation(chat_id, state["account_id"], "placement_config", "button_text", payload)
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "button_text"), inline_keyboard=self._placement_asset_keyboard("button_text"))
             return {"handled": True, "type": "placement_url_saved"}
+
+        if step == "button_text":
+            if len(clean_text) < 2 or len(clean_text) > 5:
+                self.gateway.send_private_message(
+                    chat_id=chat_id,
+                    text="按钮名称需要 2-5 个字。这里只填按钮上显示的文字，例如：咨询、查看、领取、下单。",
+                    inline_keyboard=self._placement_asset_keyboard(step),
+                )
+                return {"handled": True, "type": "placement_invalid_button_text"}
+            payload["button_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "placement_config", "short_text", payload)
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "short_text"), inline_keyboard=self._placement_asset_keyboard("short_text"))
+            return {"handled": True, "type": "placement_button_text_saved"}
+
+        if step == "short_text":
+            if len(clean_text) < 2 or len(clean_text) > 15:
+                self.gateway.send_private_message(chat_id=chat_id, text="一句话广告需要 2-15 个字，会用于文字插播入口。", inline_keyboard=self._placement_asset_keyboard(step))
+                return {"handled": True, "type": "placement_invalid_short_text"}
+            payload["light_short_text"] = clean_text
+            self._set_conversation(chat_id, state["account_id"], "placement_config", "standard_text", payload)
+            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "standard_text"), inline_keyboard=self._placement_asset_keyboard("standard_text"))
+            return {"handled": True, "type": "placement_short_text_saved"}
+
+        if step == "standard_text":
+            if len(clean_text) < 4 or len(clean_text) > 220 or clean_text.count("\n") > 4:
+                self.gateway.send_private_message(chat_id=chat_id, text="简短文案请控制在 4-220 个字、最多 5 行。", inline_keyboard=self._placement_asset_keyboard(step))
+                return {"handled": True, "type": "placement_invalid_standard_text"}
+            payload["standard_text"] = clean_text
+            with self.db.transaction() as conn:
+                self._save_placement_creative_conn(conn, state["account_id"], payload)
+            if payload.get("launch_mode") == "global":
+                self._send_global_placement(chat_id, user, None, payload=payload, panel="display")
+            else:
+                self._send_placement_configurator(chat_id, user, None, payload=payload, panel="display")
+            return {"handled": True, "type": "placement_standard_text_saved"}
 
         return {"handled": False, "reason": "unknown_placement_step"}
 
@@ -788,57 +2111,260 @@ class UpdateHandler:
         payload: dict[str, Any],
         account_id: str | None,
     ) -> None:
-        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "standard_card")
-        payload["slot_type"] = slot_type
-        first_step = "light_short_text" if slot_type == "light_tail" else "creative_text"
-        self._set_conversation(chat_id, account_id, "placement_config", first_step, payload)
-        if slot_type == "light_tail":
-            text = (
-                "✍️ 创建文字插播\n\n"
-                "显示在频道内容帖底部。\n"
-                "短入口最多 15 个字，点击后打开完整广告详情。\n\n"
-                "请发送短入口。"
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if slot_type:
+            payload["slot_type"] = slot_type
+        self._set_conversation(chat_id, account_id, "placement_config", "ad_name", payload)
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=self._placement_creative_prompt(payload, "ad_name"),
+            inline_keyboard=self._placement_asset_keyboard("ad_name"),
+        )
+
+    def _placement_creative_prompt(self, payload: dict[str, Any], step: str) -> str:
+        labels = [
+            ("creative_name", "广告名称"),
+            ("media_file_id", "媒体文件"),
+            ("creative_text", "详细介绍"),
+            ("target_url", "跳转链接"),
+            ("button_text", "按钮名称"),
+            ("light_short_text", "一句话广告"),
+            ("standard_text", "简短文案"),
+        ]
+        def is_done(key: str) -> bool:
+            value = payload.get(key)
+            if key == "button_text":
+                return bool(value) and value not in {"打开链接", "查看详情"}
+            return bool(value)
+
+        done = sum(1 for key, _ in labels if is_done(key))
+        step_keys = {
+            "ad_name": "creative_name",
+            "media_detail": "media_file_id",
+            "detail_text": "creative_text",
+            "target_url": "target_url",
+            "button_text": "button_text",
+            "short_text": "light_short_text",
+            "standard_text": "standard_text",
+        }
+        current_key = step_keys.get(step, "creative_name")
+        current_index = next((index for index, (key, _) in enumerate(labels, start=1) if key == current_key), 1)
+        current_label = dict(labels).get(current_key, "广告信息")
+        prompts = {
+            "ad_name": "先给这套广告起个名字，只有你自己看得到，方便以后复用。例：AA 成人用品、记账工具 A 版。",
+            "media_detail": "请发送一张图片或一个视频。这一步只收媒体文件，详细介绍下一步填写。",
+            "detail_text": "媒体已收到。请发送详细介绍，定制插播和广告详情页会使用这段内容。",
+            "target_url": "发送跳转链接，必须以 http:// 或 https:// 开头。读者在广告详情里点击按钮会打开这个链接。",
+            "button_text": "发送按钮名称，2-5 个字。这里只填按钮上显示的文字，例如：咨询、查看、领取、下单。",
+            "short_text": "发送一句话广告，2-15 个字。它会显示在文字插播入口里，不是按钮名，也不是链接。",
+            "standard_text": "发送简短文案，4-220 个字、最多 5 行。它会配合媒体和按钮组成较克制的标准插播。",
+        }
+        return "\n".join(
+            [
+                "🧩 创建广告资产",
+                f"第 {current_index}/{len(labels)} 步",
+                f"👉 当前填写：{current_label}",
+                f"完成度：{done}/{len(labels)}",
+                "",
+                *self._placement_asset_status_lines(labels, payload, current_key),
+                "",
+                prompts.get(step, "请继续补充广告信息。"),
+            ]
+        )
+
+    def _placement_asset_status_lines(self, labels: list[tuple[str, str]], payload: dict[str, Any], current_key: str) -> list[str]:
+        lines: list[str] = []
+        for key, label in labels:
+            value = self._placement_asset_value_summary(key, payload)
+            if key == current_key and not value:
+                prefix = "👉"
+            elif value:
+                prefix = "✅"
+            else:
+                prefix = "⬜"
+            suffix = f"：{value}" if value else ""
+            lines.append(f"{prefix} {label}{suffix}")
+        return lines
+
+    def _placement_asset_value_summary(self, key: str, payload: dict[str, Any]) -> str:
+        if key == "button_text" and payload.get(key) in {"打开链接", "查看详情"}:
+            return ""
+        if key == "media_file_id":
+            if not payload.get("media_file_id"):
+                return ""
+            media_type = str(payload.get("media_type") or "")
+            if media_type == "video":
+                return "视频已收到"
+            if media_type == "animation":
+                return "动图已收到"
+            return "图片已收到"
+        value = str(payload.get(key) or "").replace("\n", " ").strip()
+        if not value:
+            return ""
+        return self._short_title(value, 12)
+
+    def _placement_asset_previous_step(self, step: str) -> str | None:
+        try:
+            index = PLACEMENT_ASSET_STEPS.index(step)
+        except ValueError:
+            return None
+        if index <= 0:
+            return None
+        return PLACEMENT_ASSET_STEPS[index - 1]
+
+    def _clear_placement_asset_from_step(self, payload: dict[str, Any], step: str) -> None:
+        try:
+            start_index = PLACEMENT_ASSET_STEPS.index(step)
+        except ValueError:
+            return
+        for clear_step in PLACEMENT_ASSET_STEPS[start_index:]:
+            for field in PLACEMENT_ASSET_STEP_FIELDS.get(clear_step, ()):
+                payload.pop(field, None)
+
+    def _placement_asset_keyboard(self, step: str) -> list[list[dict[str, str]]]:
+        keyboard: list[list[dict[str, str]]] = []
+        if self._placement_asset_previous_step(step):
+            keyboard.append([{"text": "⬅️ 返回上一步", "callback_data": "place:asset_back"}])
+        keyboard.append([{"text": "取消创建", "callback_data": "place:home"}])
+        return keyboard
+
+    def _message_media(self, message: dict[str, Any]) -> dict[str, str] | None:
+        photos = message.get("photo") or []
+        if photos:
+            largest = photos[-1]
+            file_id = largest.get("file_id")
+            if file_id:
+                return {"media_type": "photo", "file_id": file_id}
+        for media_type in ["video", "animation"]:
+            media = message.get(media_type) or {}
+            file_id = media.get("file_id")
+            if file_id:
+                return {"media_type": media_type, "file_id": file_id}
+        return None
+
+    def _save_placement_creative_conn(self, conn: Any, account_id: str | None, payload: dict[str, Any]) -> None:
+        if not account_id or payload.get("selected_creative_id"):
+            return
+        name = str(payload.get("creative_name") or "").strip() or "广告库素材"
+        text = str(payload.get("creative_text") or "").strip()
+        short_text = str(payload.get("light_short_text") or "").strip()
+        standard_text = str(payload.get("standard_text") or "").strip()
+        target_url = str(payload.get("target_url") or "").strip()
+        button_text = str(payload.get("button_text") or "打开链接").strip() or "打开链接"
+        media_file_id = str(payload.get("media_file_id") or "").strip()
+        media_type = str(payload.get("media_type") or "").strip()
+        if not text or not target_url:
+            return
+        if not short_text:
+            short_text = self._short_title(button_text, 15)
+            payload["light_short_text"] = short_text
+        if not standard_text:
+            standard_text = self._short_title(text.replace("\n", " "), 220)
+            payload["standard_text"] = standard_text
+        content_hash = hashlib.sha256(
+            f"{name}|{short_text}|{standard_text}|{text}|{target_url}|{button_text}|{media_file_id}".encode("utf-8")
+        ).hexdigest()
+        existing = conn.execute(
+            """
+            SELECT cr.*
+            FROM creatives cr
+            JOIN campaigns ca ON ca.id = cr.campaign_id
+            WHERE ca.advertiser_account_id = ?
+              AND cr.content_hash = ?
+              AND cr.status != 'rejected'
+            ORDER BY cr.updated_at DESC, cr.created_at DESC
+            LIMIT 1
+            """,
+            (account_id, content_hash),
+        ).fetchone()
+        if existing:
+            payload["selected_creative_id"] = existing["id"]
+            payload["button_text"] = existing["button_text"]
+            payload["light_short_text"] = existing["short_text"] or short_text
+            payload["standard_text"] = existing["standard_text"] or standard_text
+            return
+        campaign_id = new_id("camp")
+        creative_id = new_id("cre")
+        conn.execute(
+            """
+            INSERT INTO campaigns (id, advertiser_account_id, name)
+            VALUES (?, ?, ?)
+            """,
+            (campaign_id, account_id, name),
+        )
+        conn.execute(
+            """
+            INSERT INTO creatives (
+                id, campaign_id, text, target_url, button_text, short_text,
+                standard_text, media_file_id, media_type, content_hash
             )
-        else:
-            text = (
-                f"➕ 创建{self._slot_name(slot_type)}素材\n\n"
-                "请发送广告文案。\n"
-                "后续会补标题、图片/视频和按钮文案。"
-            )
-        self._reply_or_edit(chat_id=chat_id, source_message=source_message, text=text, inline_keyboard=self._cancel_keyboard("取消创建", "place:home"))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                creative_id,
+                campaign_id,
+                text,
+                target_url,
+                button_text,
+                short_text,
+                standard_text,
+                media_file_id or None,
+                media_type or None,
+                content_hash,
+            ),
+        )
+        payload["selected_creative_id"] = creative_id
 
     def _submit_placement_order(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None, payload: dict[str, Any]) -> dict[str, Any]:
         missing_panel = self._placement_missing_panel(payload)
         if missing_panel:
             self._send_placement_configurator(chat_id, user, source_message, payload=payload, panel=missing_panel)
             return {"handled": True, "type": "callback_placement_submit_incomplete", "missing": missing_panel}
+        channel_ids = self._placement_channel_ids(payload)
+        if not channel_ids:
+            if payload.get("launch_mode") == "global":
+                self._send_global_placement(chat_id, user, source_message, payload=payload, panel="channel")
+                return {"handled": True, "type": "callback_placement_submit_incomplete", "missing": "channel"}
+            self._send_placement_configurator(chat_id, user, source_message, payload=payload, panel="display")
+            return {"handled": True, "type": "callback_placement_submit_incomplete", "missing": "channel"}
 
         user_id = user.get("id") or chat_id
         quote = self._placement_quote(payload)
         scheduled_at = datetime.now(timezone.utc)
-        period = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
+        slot_type = self.channels.normalize_slot_type(payload["slot_type"])
+        period_key = "once" if slot_type in CHANNEL_PACED_PLACEMENT_SLOTS else payload.get("period") or "once"
+        period = PLACEMENT_PERIODS.get(period_key, PLACEMENT_PERIODS["once"])
         deliveries = int(period["deliveries"])
         end_at = scheduled_at + timedelta(days=deliveries - 1) if deliveries > 1 else None
         order_slot_type = "pin24h" if payload.get("pin") else self.channels.normalize_slot_type(payload["slot_type"])
         try:
             with self.db.transaction() as conn:
-                channel = self.channels.get_channel(conn, payload["channel_id"])
-            order = self.orders.create_order(
-                advertiser_telegram_user_id=user_id,
-                channel_token=channel["ref_token"],
-                slot_type=order_slot_type,
-                text=payload["creative_text"],
-                target_url=payload["target_url"],
-                button_text=payload.get("button_text") or "打开链接",
-                budget_cents=quote["total_cents"],
-                scheduled_at=scheduled_at,
-                end_at=end_at,
-                frequency_per_day=1,
-                unit_price_override_cents=quote["unit_cents"],
-                campaign_name="Bot 自助插播广告",
-            )
-            if self.settings.bot_auto_approve_orders:
-                order = self.orders.approve_order(order["id"])
+                account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user) or None)
+                if int(account["available_balance_cents"] or 0) < quote["total_cents"]:
+                    raise ChaboError("广告钱包余额不足，请先充值或减少投放频道。")
+                channels = [self.channels.get_channel(conn, channel_id) for channel_id in channel_ids]
+            orders = []
+            for channel in channels:
+                channel_quote = self._placement_quote_for_channel(str(channel["id"]), payload)
+                order = self.orders.create_order(
+                    advertiser_telegram_user_id=user_id,
+                    channel_token=channel["ref_token"],
+                    slot_type=order_slot_type,
+                    text=payload["creative_text"],
+                    target_url=payload["target_url"],
+                    button_text=payload.get("button_text") or "打开链接",
+                    budget_cents=channel_quote["total_cents"],
+                    scheduled_at=scheduled_at,
+                    end_at=end_at,
+                    frequency_per_day=1,
+                    unit_price_override_cents=channel_quote["unit_cents"],
+                    campaign_name="Bot 自助插播广告",
+                    existing_creative_id=payload.get("selected_creative_id"),
+                )
+                if self.settings.bot_auto_approve_orders:
+                    order = self.orders.approve_order(order["id"])
+                orders.append(order)
         except ChaboError as exc:
             self._reply_or_edit(
                 chat_id=chat_id,
@@ -852,7 +2378,31 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_placement_submit_failed", "error": str(exc)}
 
         self._clear_conversation(chat_id)
-        review_text = "✅ 已自动通过审核\n🚀 已进入排期" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
+        review_text = "✅ 已自动通过审核\n🚀 已进入发布队列" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
+        if len(orders) > 1:
+            channel_names = "、".join(self._short_title(str(channel["title"]), 8) for channel in channels[:3])
+            if len(channels) > 3:
+                channel_names += f" 等 {len(channels)} 个"
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=(
+                    "✅ 批量投放已提交\n\n"
+                    f"订单：{len(orders)} 个\n"
+                    f"频道：{channel_names}\n"
+                    f"展示：{self._placement_display_label(payload)}\n"
+                    f"发布：{self._placement_period_label(payload)}\n"
+                    f"冻结：USD {cents_to_money(quote['total_cents'])}\n\n"
+                    f"{review_text}"
+                ),
+                inline_keyboard=[
+                    [{"text": "📋 查看订单", "callback_data": "advertiser:orders"}],
+                    [{"text": "🏠 工作台", "callback_data": "menu:home"}],
+                ],
+            )
+            return {"handled": True, "type": "callback_placement_batch_created", "order_ids": [order["id"] for order in orders]}
+        order = orders[0]
+        channel = channels[0]
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -873,39 +2423,89 @@ class UpdateHandler:
         )
         return {"handled": True, "type": "callback_placement_order_created", "order_id": order["id"]}
 
-    def _placement_text(self, channel: dict[str, Any], payload: dict[str, Any], panel: str) -> str:
+    def _placement_text(self, channel: dict[str, Any], payload: dict[str, Any], panel: str, account: dict[str, Any] | None = None) -> str:
+        panel = self._placement_effective_panel(panel, payload)
+        status_block = self._html_pre(
+            [
+                f"广告素材：{self._placement_creative_label(payload)}",
+                f"频道：{self._placement_channel_summary_label(channel, payload)}",
+                f"位置：{self._placement_display_label(payload)}",
+                f"节奏：{self._placement_period_label(payload)}",
+                f"时间：{payload.get('scheduled_label') or '立即发布'}",
+                f"预算：{self._placement_cost_label(payload)}",
+            ]
+        )
         lines = [
-            f"🎯 给「{channel['title']}」投放广告",
+            f"<b>🎯 给「{self._h(self._placement_target_label(channel, payload))}」投放广告</b>",
             "",
-            f"展示：{self._placement_display_label(payload)}",
-            f"发布：{self._placement_period_label(payload)}",
-            f"时间：{payload.get('scheduled_label') or '立即发布'}",
-            f"素材：{self._placement_creative_label(payload)}",
-            f"费用：{self._placement_cost_label(payload)}",
+            status_block,
             "",
-            f"下一步：{self._placement_next_step(payload)}",
+            f"<b>下一步：{self._h(self._placement_next_step(payload, account, panel))}</b>",
+            "",
+            f"<b>{self._h(self._placement_step_title(panel, payload))}</b>",
         ]
-        if panel == "display":
-            lines.extend(["", "🧩 展示设置", "选择广告在频道里的呈现方式。"])
+        if panel == "creative":
+            if payload.get("creative_text") and payload.get("target_url"):
+                lines.append(self._html_quote("已选广告。可以直接下一步，也可以换一条广告。"))
+            else:
+                lines.append(self._html_quote("先选择一条已有广告；如果还没有，就添加一条新广告。"))
+        elif panel == "display":
+            lines.extend(
+                [
+                    self._html_quote("选择广告在频道里的插播位置。这里只能选一种。"),
+                ]
+            )
         elif panel == "schedule":
-            lines.extend(["", "⏱ 发布设置", "默认立即发布，每 24 小时重复一次。"])
-        elif panel == "creative":
-            lines.extend(["", "📁 广告素材", "选择已有素材，或创建一条新素材。"])
+            lines.extend(
+                [
+                    self._html_quote("设置发布周期。按广告生效开始计算，默认 24 小时发布一次。\n顶部预算会随发布周期和置顶选择自动变化。"),
+                ]
+            )
         elif panel == "confirm":
-            lines.extend(["", "✅ 费用确认", "确认后冻结预算，发布成功才扣费。"])
+            missing_panel = self._placement_missing_panel(payload)
+            if missing_panel:
+                lines.append(self._html_quote("还差一步配置，完成后再确认预算。"))
+            else:
+                quote = self._placement_quote(payload)
+                available = int((account or {}).get("available_balance_cents") or 0)
+                shortage = max(0, quote["total_cents"] - available)
+                lines.extend(
+                    [
+                        self._html_pre(
+                            [
+                                f"需要冻结：USD {cents_to_money(quote['total_cents'])}",
+                                f"广告钱包可用：USD {cents_to_money(available)}",
+                            ]
+                        ),
+                    ]
+                )
+                if shortage:
+                    lines.extend(["", self._html_quote(f"⚠️ 余额不足，还需充值 USD {cents_to_money(shortage)}。")])
+                else:
+                    lines.extend(["", self._html_quote("点击保存后广告生效；发布成功才扣费。")])
         return "\n".join(lines)
 
-    def _placement_keyboard(self, panel: str, payload: dict[str, Any], creatives: list[Any] | None = None) -> list[list[dict[str, str]]]:
+    def _placement_keyboard(
+        self,
+        panel: str,
+        payload: dict[str, Any],
+        creatives: list[Any] | None = None,
+        account: dict[str, Any] | None = None,
+    ) -> list[list[dict[str, str]]]:
+        panel = self._placement_effective_panel(panel, payload)
         if panel == "display":
             selected = self.channels.normalize_slot_type(payload.get("slot_type") or "")
-            buttons = []
-            for slot_type in PLACEMENT_SLOT_TYPES:
-                prefix = "✅ " if selected == slot_type else ""
-                buttons.append({"text": f"{prefix}{self._slot_label(slot_type)}", "callback_data": f"place:slot:{slot_type}"})
-            keyboard = self._button_grid(buttons, 2)
-            pin_text = "📌 置顶：开启" if payload.get("pin") else "📌 置顶：关闭"
-            keyboard.append([{"text": pin_text, "callback_data": "place:pin"}])
-            keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
+            keyboard: list[list[dict[str, str]]] = [
+                [
+                    {"text": self._placement_slot_button_text("button_tail", selected), "callback_data": "place:slot:button_tail"},
+                    {"text": self._placement_slot_button_text("light_tail", selected), "callback_data": "place:slot:light_tail"},
+                ],
+                [
+                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "place:slot:standard_card"},
+                    {"text": self._placement_slot_button_text("strong_post", selected), "callback_data": "place:slot:strong_post"},
+                ],
+            ]
+            keyboard.append(self._placement_nav_row(back=True, next_enabled=bool(selected)))
             return keyboard
 
         if panel == "schedule":
@@ -915,8 +2515,10 @@ class UpdateHandler:
                 for key, value in PLACEMENT_PERIODS.items()
             ]
             keyboard = self._button_grid(period_buttons, 2)
-            keyboard.append([{"text": "🕒 发布时间", "callback_data": "place:time"}, {"text": "📅 开始日期", "callback_data": "place:time"}])
-            keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
+            if self.channels.normalize_slot_type(payload.get("slot_type") or "") in PINNABLE_PLACEMENT_SLOTS:
+                keyboard.append([{"text": "📌 是否置顶：是" if payload.get("pin") else "📌 是否置顶：否", "callback_data": "place:pin"}])
+            keyboard.append([{"text": "🕒 发布时间", "callback_data": "place:time"}])
+            keyboard.append(self._placement_nav_row(back=True, next_enabled=True))
             return keyboard
 
         if panel == "creative":
@@ -924,41 +2526,110 @@ class UpdateHandler:
             creatives = creatives or []
             if creatives:
                 for index, creative in enumerate(creatives):
-                    label = self._short_title((creative["text"] or "").replace("\n", " "), 18)
+                    label = self._short_title((creative["campaign_name"] or creative["text"] or "").replace("\n", " "), 18)
                     keyboard.append([{"text": f"📄 {label}", "callback_data": f"place:pick:{index}"}])
-                keyboard.append([{"text": "➕ 新建素材", "callback_data": "place:new:auto"}])
+                keyboard.append([{"text": "➕ 添加新广告", "callback_data": "place:new:auto"}])
             else:
-                keyboard.extend(
-                    [
-                        [{"text": "➕ 创建文字插播素材", "callback_data": "place:new:light_tail"}],
-                        [{"text": "➕ 创建标准插播素材", "callback_data": "place:new:standard_card"}],
-                        [{"text": "➕ 创建定制插播素材", "callback_data": "place:new:strong_post"}],
-                    ]
-                )
-            keyboard.append([{"text": "⬅️ 返回配置", "callback_data": "place:home"}])
+                keyboard.append([{"text": "➕ 添加广告", "callback_data": "place:new:auto"}])
+            if payload.get("creative_text") and payload.get("target_url"):
+                keyboard.append([{"text": "下一步 ➡️", "callback_data": "place:next"}])
+            keyboard.append([{"text": "🏠 工作台", "callback_data": "menu:home"}])
             return keyboard
 
         if panel == "confirm":
             missing_panel = self._placement_missing_panel(payload)
             if missing_panel:
-                target_text = {"display": "🧩 选择展示", "creative": "📁 选择素材"}.get(missing_panel, "继续配置")
-                return [[{"text": target_text, "callback_data": f"place:{missing_panel}"}], [{"text": "⬅️ 返回配置", "callback_data": "place:home"}]]
+                target_text = {"display": "📍 选择位置", "creative": "📁 选择广告"}.get(missing_panel, "继续配置")
+                return [[{"text": target_text, "callback_data": f"place:{missing_panel}"}], [{"text": "⬅️ 上一步", "callback_data": "place:back"}]]
+            quote = self._placement_quote(payload)
+            available = int((account or {}).get("available_balance_cents") or 0)
+            if available < quote["total_cents"]:
+                return [
+                    [{"text": "💰 充值", "callback_data": "advertiser:balance"}, {"text": "📍 降低配置", "callback_data": "place:display"}],
+                    [{"text": "⬅️ 上一步", "callback_data": "place:back"}],
+                ]
             return [
-                [{"text": "✅ 确认投放", "callback_data": "place:submit"}],
-                [{"text": "修改配置", "callback_data": "place:home"}, {"text": "保存草稿", "callback_data": "place:draft"}],
+                [{"text": "✅ 保存并生效", "callback_data": "place:submit"}],
+                [{"text": "⬅️ 上一步", "callback_data": "place:back"}],
             ]
 
-        return [
-            [{"text": "🧩 展示设置", "callback_data": "place:display"}, {"text": "⏱ 发布设置", "callback_data": "place:schedule"}],
-            [{"text": "📁 广告素材", "callback_data": "place:creative"}, {"text": "✅ 费用确认", "callback_data": "place:confirm"}],
-            [{"text": "🏠 工作台", "callback_data": "menu:home"}],
-        ]
+        return [[{"text": "📁 选择广告", "callback_data": "place:creative"}], [{"text": "🏠 工作台", "callback_data": "menu:home"}]]
 
-    def _placement_missing_panel(self, payload: dict[str, Any]) -> str | None:
-        if not payload.get("slot_type"):
+    def _placement_effective_panel(self, panel: str, payload: dict[str, Any]) -> str:
+        if panel not in {"creative", "display", "schedule", "confirm"}:
+            return "creative"
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if panel == "schedule" and not slot_type:
             return "display"
+        if panel == "schedule" and slot_type in CHANNEL_PACED_PLACEMENT_SLOTS:
+            return "confirm"
+        return panel
+
+    def _placement_next_panel(self, payload: dict[str, Any], current_panel: str) -> str:
+        current_panel = self._placement_effective_panel(current_panel, payload)
         if not payload.get("creative_text") or not payload.get("target_url"):
             return "creative"
+        if current_panel == "creative":
+            return "display"
+        if not payload.get("slot_type"):
+            return "display"
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if current_panel == "display":
+            return "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "confirm"
+        if current_panel == "schedule":
+            return "confirm"
+        return "confirm"
+
+    def _placement_previous_panel(self, payload: dict[str, Any], current_panel: str) -> str:
+        current_panel = self._placement_effective_panel(current_panel, payload)
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if payload.get("launch_mode") == "global":
+            if current_panel == "confirm":
+                return "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "channel"
+            if current_panel == "schedule":
+                return "channel"
+        if current_panel == "confirm":
+            return "schedule" if slot_type in SCHEDULED_PLACEMENT_SLOTS else "display"
+        if current_panel == "schedule":
+            return "display"
+        if current_panel == "display":
+            return "creative"
+        return "creative"
+
+    def _placement_step_title(self, panel: str, payload: dict[str, Any] | None = None) -> str:
+        if (payload or {}).get("launch_mode") == "global":
+            titles = {
+                "creative": "第 1/5 步：选择广告素材",
+                "display": "第 2/5 步：选择插播位置",
+                "schedule": "第 4/5 步：配置发布节奏",
+                "confirm": "第 5/5 步：确认预算",
+            }
+            return titles.get(panel, titles["creative"])
+        titles = {
+            "creative": "第 1/4 步：选择广告",
+            "display": "第 2/4 步：选择插播位置",
+            "schedule": "第 3/4 步：配置发布节奏",
+            "confirm": "第 4/4 步：确认预算",
+        }
+        return titles.get(panel, titles["creative"])
+
+    def _placement_nav_row(self, *, back: bool, next_enabled: bool) -> list[dict[str, str]]:
+        row: list[dict[str, str]] = []
+        if back:
+            row.append({"text": "⬅️ 上一步", "callback_data": "place:back"})
+        if next_enabled:
+            row.append({"text": "下一步 ➡️", "callback_data": "place:next"})
+        return row
+
+    def _placement_slot_button_text(self, slot_type: str, selected: str) -> str:
+        prefix = "✅ " if selected == slot_type else ""
+        return f"{prefix}{self._slot_label(slot_type)}"
+
+    def _placement_missing_panel(self, payload: dict[str, Any]) -> str | None:
+        if not payload.get("creative_text") or not payload.get("target_url"):
+            return "creative"
+        if not payload.get("slot_type"):
+            return "display"
         return None
 
     def _placement_display_label(self, payload: dict[str, Any]) -> str:
@@ -971,12 +2642,47 @@ class UpdateHandler:
         return label
 
     def _placement_period_label(self, payload: dict[str, Any]) -> str:
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if not slot_type:
+            return "待选择"
+        if slot_type in CHANNEL_PACED_PLACEMENT_SLOTS:
+            return "随频道节奏"
         period = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
         return str(period["label"])
 
     def _placement_creative_label(self, payload: dict[str, Any]) -> str:
-        text = payload.get("light_short_text") or payload.get("creative_text")
+        text = payload.get("creative_name") or payload.get("light_short_text") or payload.get("creative_text")
         return self._short_title(text.replace("\n", " "), 18) if text else "未选择"
+
+    def _placement_channel_ids(self, payload: dict[str, Any]) -> list[str]:
+        selected_ids = [str(channel_id) for channel_id in payload.get("selected_channel_ids") or [] if channel_id]
+        if selected_ids:
+            return list(dict.fromkeys(selected_ids))
+        channel_id = payload.get("channel_id")
+        return [str(channel_id)] if channel_id else []
+
+    def _placement_target_label(self, channel: dict[str, Any], payload: dict[str, Any]) -> str:
+        collection_label = self._placement_collection_label(payload)
+        if collection_label:
+            return collection_label
+        channel_ids = self._placement_channel_ids(payload)
+        if len(channel_ids) > 1:
+            return f"{len(channel_ids)} 个频道"
+        return str(channel["title"])
+
+    def _placement_channel_summary_label(self, channel: dict[str, Any], payload: dict[str, Any]) -> str:
+        collection_label = self._placement_collection_label(payload)
+        if collection_label:
+            return collection_label
+        channel_ids = self._placement_channel_ids(payload)
+        if len(channel_ids) > 1:
+            return f"已选 {len(channel_ids)} 个（首个：{self._short_title(str(channel['title']), 12)}）"
+        return str(channel["title"])
+
+    def _placement_collection_label(self, payload: dict[str, Any]) -> str:
+        if payload.get("selected_collection_names") or payload.get("selected_collection_name"):
+            return self._global_channel_label(payload)
+        return ""
 
     def _placement_cost_label(self, payload: dict[str, Any]) -> str:
         if not payload.get("slot_type"):
@@ -984,18 +2690,49 @@ class UpdateHandler:
         quote = self._placement_quote(payload)
         return f"预计 USD {cents_to_money(quote['total_cents'])}"
 
-    def _placement_next_step(self, payload: dict[str, Any]) -> str:
-        if not payload.get("slot_type"):
-            return "选择展示设置"
+    def _placement_next_step(self, payload: dict[str, Any], account: dict[str, Any] | None = None, panel: str = "creative") -> str:
         if not payload.get("creative_text") or not payload.get("target_url"):
-            return "选择广告素材"
-        return "确认费用"
+            return "选择或添加广告"
+        if not payload.get("slot_type"):
+            return "选择插播位置"
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        if panel == "display" and slot_type in SCHEDULED_PLACEMENT_SLOTS:
+            return "配置发布节奏"
+        if panel in {"display", "schedule"}:
+            return "确认预算"
+        if account is not None:
+            quote = self._placement_quote(payload)
+            available = int(account.get("available_balance_cents") or 0)
+            if available < quote["total_cents"]:
+                return "充值或降低配置"
+        return "保存并生效"
 
     def _placement_quote(self, payload: dict[str, Any]) -> dict[str, int]:
-        base_unit = self._slot_price_cents(payload["channel_id"], payload["slot_type"])
+        channel_ids = self._placement_channel_ids(payload)
+        if not channel_ids:
+            raise ChaboError("请选择投放频道")
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        period_key = "once" if slot_type in CHANNEL_PACED_PLACEMENT_SLOTS else payload.get("period") or "once"
+        period = PLACEMENT_PERIODS.get(period_key, PLACEMENT_PERIODS["once"])
+        deliveries = int(period["deliveries"])
+        channel_quotes = [self._placement_quote_for_channel(channel_id, payload) for channel_id in channel_ids]
+        base_unit = sum(channel_quote["base_unit_cents"] for channel_quote in channel_quotes)
+        unit_cents = sum(channel_quote["unit_cents"] for channel_quote in channel_quotes)
+        return {
+            "base_unit_cents": base_unit,
+            "unit_cents": unit_cents,
+            "total_cents": unit_cents * deliveries,
+            "deliveries": deliveries,
+            "channel_count": len(channel_ids),
+        }
+
+    def _placement_quote_for_channel(self, channel_id: str, payload: dict[str, Any]) -> dict[str, int]:
+        base_unit = self._slot_price_cents(channel_id, payload["slot_type"])
         if payload.get("pin") and self.channels.normalize_slot_type(payload["slot_type"]) in PINNABLE_PLACEMENT_SLOTS:
             base_unit *= 2
-        period = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+        period_key = "once" if slot_type in CHANNEL_PACED_PLACEMENT_SLOTS else payload.get("period") or "once"
+        period = PLACEMENT_PERIODS.get(period_key, PLACEMENT_PERIODS["once"])
         deliveries = int(period["deliveries"])
         unit_cents = max(1, round(base_unit * int(period["discount_bps"]) / 10000))
         return {
@@ -1023,11 +2760,12 @@ class UpdateHandler:
         lines = ["🗂 广告库", ""]
         if creatives:
             for index, creative in enumerate(creatives, start=1):
-                text = (creative["text"] or "").replace("\n", " ")
+                text = (creative["campaign_name"] or creative["text"] or "").replace("\n", " ")
                 if len(text) > 28:
                     text = text[:28] + "..."
+                short = creative["short_text"] or creative["button_text"]
                 lines.append(f"{index}. {text}")
-                lines.append(f"   {self._creative_status_label(creative['status'])} · {creative['button_text']}")
+                lines.append(f"   {self._creative_status_label(creative['status'])} · {short} · {creative['button_text']}")
         else:
             lines.extend(
                 [
@@ -1064,14 +2802,14 @@ class UpdateHandler:
                 f"✅ {len(channels)} 个频道资产",
                 "选择频道配置插播。",
             ]
-            keyboard = [[{"text": f"📺 {channel['title']}", "callback_data": f"pub:channel:{channel['ref_token']}"}] for channel in channels[:8]]
-            keyboard.extend(
-                [
-                    [{"text": "➕ 添加频道", "url": self._add_channel_url()}],
-                    [{"text": "🔌 手动接入", "callback_data": "publisher:onboard"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
-                    [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
-                ]
-            )
+            if len(channels) > 10:
+                lines.append("先显示前 10 个。")
+            channel_buttons = [
+                {"text": f"📺 {channel['title']}", "callback_data": f"pub:channel:{channel['ref_token']}"}
+                for channel in channels[:10]
+            ]
+            keyboard = self._button_grid(channel_buttons, 2)
+            keyboard.append([{"text": "🏠 返回主菜单", "callback_data": "menu:home"}])
         else:
             lines = [
                 "📺 频道管理",
@@ -1082,7 +2820,7 @@ class UpdateHandler:
             keyboard = [
                 [{"text": "➕ 添加频道", "url": self._add_channel_url()}],
                 [{"text": "🔌 手动接入", "callback_data": "publisher:onboard"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
-                [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "🏠 返回主菜单", "callback_data": "menu:home"}],
             ]
         self._reply_or_edit(
             chat_id=chat_id,
@@ -1137,6 +2875,234 @@ class UpdateHandler:
             ],
         )
 
+    def _send_channel_template_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        target_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            target = self._sync_channel_profile_conn(conn, self._find_channel(conn, target_identifier))
+        if not self._user_can_manage_channel(user_id, target):
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 未确认你是该频道管理员。",
+                inline_keyboard=[[{"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{target['ref_token']}"}]],
+            )
+            return
+
+        candidates = [
+            channel
+            for channel in self._publisher_channels_for_user(user_id, self._display_name(user))
+            if channel["id"] != target["id"]
+        ]
+        lines = [
+            "📋 使用频道模版",
+            "",
+            f"目标频道：{target['title']}",
+            "选择一个已配置频道，把广告形态、价格和基础设置复制过来。",
+        ]
+        keyboard: list[list[dict[str, str]]]
+        if candidates:
+            template_buttons = [
+                {
+                    "text": f"📋 {self._short_title(channel['title'], 13)}",
+                    "callback_data": f"pub:tplapply:{target['ref_token']}:{channel['ref_token']}",
+                }
+                for channel in candidates[:10]
+            ]
+            keyboard = self._button_grid(template_buttons, 2)
+            if len(candidates) > 10:
+                lines.append("先显示前 10 个可用模版。")
+        else:
+            lines.extend(["", "还没有其他频道可作为模版。先完成一个频道的设置，再回来套用。"])
+            keyboard = []
+        keyboard.append([{"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{target['ref_token']}"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _apply_channel_template(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        target_identifier: str,
+        source_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            target = self._find_channel(conn, target_identifier)
+            source = self._find_channel(conn, source_identifier)
+        if not self._user_can_manage_channel(user_id, target) or not self._user_can_manage_channel(user_id, source):
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 只有两个频道的管理员才能套用模版。",
+                inline_keyboard=[[{"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{target['ref_token']}"}]],
+            )
+            return
+
+        with self.db.transaction() as conn:
+            self._copy_channel_template_conn(conn, source["id"], target["id"], actor_user_id=str(user_id))
+
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                "✅ 模版已应用\n\n"
+                f"已把「{source['title']}」的广告形态、价格和基础设置复制到「{target['title']}」。"
+            ),
+            inline_keyboard=[
+                [{"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{target['ref_token']}"}],
+                [{"text": "📋 换个模版", "callback_data": f"pub:template:{target['ref_token']}"}],
+            ],
+        )
+
+    def _copy_channel_template_conn(
+        self,
+        conn: Any,
+        source_channel_id: str,
+        target_channel_id: str,
+        *,
+        actor_user_id: str,
+    ) -> None:
+        source_config = conn.execute(
+            "SELECT * FROM channel_configs WHERE channel_id = ?",
+            (source_channel_id,),
+        ).fetchone()
+        if source_config:
+            conn.execute(
+                """
+                INSERT INTO channel_configs (
+                    channel_id, timezone, daily_ad_limit, allowed_start_hour, allowed_end_hour,
+                    allow_pin, category_blocklist_json, service_fee_bps, holdback_bps, holdback_days
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    timezone = excluded.timezone,
+                    daily_ad_limit = excluded.daily_ad_limit,
+                    allowed_start_hour = excluded.allowed_start_hour,
+                    allowed_end_hour = excluded.allowed_end_hour,
+                    allow_pin = excluded.allow_pin,
+                    category_blocklist_json = excluded.category_blocklist_json,
+                    service_fee_bps = excluded.service_fee_bps,
+                    holdback_bps = excluded.holdback_bps,
+                    holdback_days = excluded.holdback_days,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    target_channel_id,
+                    source_config["timezone"],
+                    source_config["daily_ad_limit"],
+                    source_config["allowed_start_hour"],
+                    source_config["allowed_end_hour"],
+                    source_config["allow_pin"],
+                    source_config["category_blocklist_json"],
+                    source_config["service_fee_bps"],
+                    source_config["holdback_bps"],
+                    source_config["holdback_days"],
+                ),
+            )
+
+        policies = conn.execute(
+            "SELECT * FROM channel_ad_format_policies WHERE channel_id = ?",
+            (source_channel_id,),
+        ).fetchall()
+        for policy in policies:
+            conn.execute(
+                """
+                INSERT INTO channel_ad_format_policies (
+                    id, channel_id, format_type, enabled, owner_price_band,
+                    platform_promo_enabled, custom_multiplier_bps
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, format_type) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    owner_price_band = excluded.owner_price_band,
+                    platform_promo_enabled = excluded.platform_promo_enabled,
+                    custom_multiplier_bps = excluded.custom_multiplier_bps,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    new_id("pol"),
+                    target_channel_id,
+                    policy["format_type"],
+                    policy["enabled"],
+                    policy["owner_price_band"],
+                    policy["platform_promo_enabled"],
+                    policy["custom_multiplier_bps"],
+                ),
+            )
+
+        slots = conn.execute(
+            """
+            SELECT s.slot_type, s.enabled, s.min_days,
+                   r.currency, r.unit_price_cents, r.pricing_unit
+            FROM ad_slots s
+            LEFT JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+            WHERE s.channel_id = ?
+            ORDER BY s.slot_type
+            """,
+            (source_channel_id,),
+        ).fetchall()
+        for slot in slots:
+            conn.execute(
+                """
+                INSERT INTO ad_slots (id, channel_id, slot_type, enabled, min_days)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, slot_type) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    min_days = excluded.min_days
+                """,
+                (new_id("slot"), target_channel_id, slot["slot_type"], slot["enabled"], slot["min_days"]),
+            )
+            target_slot = conn.execute(
+                "SELECT * FROM ad_slots WHERE channel_id = ? AND slot_type = ?",
+                (target_channel_id, slot["slot_type"]),
+            ).fetchone()
+            if slot["unit_price_cents"] is None:
+                continue
+            conn.execute("UPDATE rate_cards SET active = 0 WHERE slot_id = ?", (target_slot["id"],))
+            conn.execute(
+                """
+                INSERT INTO rate_cards (id, slot_id, currency, unit_price_cents, pricing_unit, active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    new_id("rate"),
+                    target_slot["id"],
+                    slot["currency"],
+                    slot["unit_price_cents"],
+                    slot["pricing_unit"],
+                ),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO audit_logs (id, action, entity_type, entity_id, payload_json)
+            VALUES (?, 'channel_template_applied', 'channel', ?, ?)
+            """,
+            (
+                new_id("aud"),
+                target_channel_id,
+                json.dumps(
+                    {
+                        "source_channel_id": source_channel_id,
+                        "target_channel_id": target_channel_id,
+                        "actor_telegram_user_id": actor_user_id,
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
     def _refresh_publisher_channel(
         self,
         chat_id: str | int,
@@ -1169,16 +3135,21 @@ class UpdateHandler:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+        notification_button = (
+            {"text": "🔕 关闭通知", "callback_data": "publisher:disable_income_notifications"}
+            if bool(account["publisher_income_notifications_enabled"])
+            else {"text": "🔔 开启通知", "callback_data": "publisher:enable_income_notifications"}
+        )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "💸 我的收益\n\n"
+                "💰 我的钱包\n\n"
                 f"⏳ 待确认：USD {account['pending_earnings_cents'] / 100:.2f}\n"
                 f"✅ 已确认：USD {account['confirmed_earnings_cents'] / 100:.2f}\n"
                 f"💵 可结算：USD {account['releasable_earnings_cents'] / 100:.2f}"
             ),
-            inline_keyboard=[[{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=[[notification_button, {"text": "💰 我的钱包", "callback_data": "publisher:earnings"}]],
         )
 
     def _handle_conversation_message(self, message: dict[str, Any], text: str) -> dict[str, Any]:
@@ -1195,6 +3166,10 @@ class UpdateHandler:
             return self._handle_timezone_message(message, state, text)
         if state["flow"] == "publisher_onboarding":
             return self._handle_publisher_onboarding_message(message, state)
+        if state["flow"] == "channel_market":
+            return self._handle_channel_market_message(message, state, text)
+        if state["flow"] == "global_placement":
+            return self._handle_global_placement_message(message, state, text)
         if state["flow"] == "placement_config":
             return self._handle_placement_message(message, state, text)
         if state["flow"] != "create_order":
@@ -1304,7 +3279,7 @@ class UpdateHandler:
                 )
                 return {"handled": True, "type": "order_form_create_failed", "error": str(exc)}
             self._clear_conversation(chat_id)
-            review_text = "✅ 已自动通过审核\n🚀 已进入排期" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
+            review_text = "✅ 已自动通过审核\n🚀 已进入发布队列" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
             self.gateway.send_private_message(
                 chat_id=chat_id,
                 text=(
@@ -1322,6 +3297,59 @@ class UpdateHandler:
             return {"handled": True, "type": "order_form_order_created", "order_id": order["id"]}
 
         return {"handled": False, "reason": "unknown_conversation_step"}
+
+    def _handle_channel_market_message(self, message: dict[str, Any], state: dict[str, Any], text: str) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        user_id = user.get("id") or chat_id
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        if state["step"] != "folder_name":
+            return {"handled": False, "reason": "unsupported_channel_market_step"}
+        clean_name = self._clean_collection_name(text)
+        previous_payload = json.loads(state["payload_json"] or "{}")
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            collection = self._ensure_channel_collection_conn(conn, account["id"], clean_name)
+            total = self._market_channel_count_conn(conn)
+            offset = int(previous_payload.get("offset") or 0)
+            if total and offset >= total:
+                offset = max(0, total - 1)
+            payload = {
+                "collection_id": collection["id"],
+                "collection_name": collection["name"],
+                "offset": offset,
+            }
+            if previous_payload.get("channel_id"):
+                payload["channel_id"] = previous_payload["channel_id"]
+            self._set_conversation_conn(conn, chat_id, account["id"], "channel_market", "browse", payload)
+        self._send_channel_market_browse(chat_id, user, None, payload=payload)
+        return {"handled": True, "type": "channel_market_folder_created", "collection_id": collection["id"]}
+
+    def _handle_global_placement_message(self, message: dict[str, Any], state: dict[str, Any], text: str) -> dict[str, Any]:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id") or user.get("id")
+        user_id = user.get("id") or chat_id
+        if not chat_id:
+            return {"handled": False, "reason": "missing_chat"}
+        if state["step"] != "folder_name":
+            return {"handled": False, "reason": "unsupported_global_placement_step"}
+        clean_name = self._clean_collection_name(text)
+        previous_payload = json.loads(state["payload_json"] or "{}")
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            collection = self._ensure_channel_collection_conn(conn, account["id"], clean_name)
+            payload = {
+                "collection_id": collection["id"],
+                "collection_name": collection["name"],
+                "offset": 0,
+            }
+            if previous_payload.get("channel_id"):
+                payload["channel_id"] = previous_payload["channel_id"]
+        self._send_channel_market_browse(chat_id, user, None, payload=payload)
+        return {"handled": True, "type": "global_placement_folder_created", "collection_id": collection["id"]}
 
     def _send_advertiser_orders(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
@@ -1351,7 +3379,14 @@ class UpdateHandler:
             inline_keyboard=[[{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
         )
 
-    def _send_channel_quote(self, chat_id: str | int, channel_id: str, source_message: dict[str, Any] | None = None) -> None:
+    def _send_channel_quote(
+        self,
+        chat_id: str | int,
+        channel_id: str,
+        user: dict[str, Any] | None = None,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user = user or {}
         with self.db.transaction() as conn:
             channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, channel_id))
             rates = conn.execute(
@@ -1364,11 +3399,18 @@ class UpdateHandler:
                 """,
                 (channel_id,),
             ).fetchall()
+        if self._user_can_manage_channel(user.get("id") or chat_id, channel):
+            keyboard = [
+                [{"text": "⚙️ 广告形态", "callback_data": f"pub:formats:{channel['ref_token']}"}],
+                [{"text": "⬅️ 频道详情", "callback_data": f"pub:channel:{channel['ref_token']}"}, {"text": "🏠 工作台", "callback_data": "menu:home"}],
+            ]
+        else:
+            keyboard = [self._channel_keyboard(channel_id)[0], [{"text": "🏠 工作台", "callback_data": "menu:home"}]]
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join([f"💵 {channel['title']}", *self._rate_lines(rates)]),
-            inline_keyboard=[self._channel_keyboard(channel_id)[0], [{"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=keyboard,
         )
 
     def _send_channel_order_help(self, chat_id: str | int, channel_id: str, source_message: dict[str, Any] | None = None) -> None:
@@ -1736,8 +3778,10 @@ class UpdateHandler:
                         "现在可以配置广告形态、价格和频道入口。"
                     ),
                     inline_keyboard=[
-                        [{"text": "⚙️ 管理频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
-                        [{"text": "📺 频道管理", "callback_data": "publisher:channels"}],
+                        [
+                            {"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{channel['ref_token']}"},
+                            {"text": "📋 使用模版", "callback_data": f"pub:template:{channel['ref_token']}"},
+                        ],
                     ],
                 )
                 notified += 1
@@ -1748,7 +3792,12 @@ class UpdateHandler:
                 self.gateway.send_private_message(
                     chat_id=actor_id,
                     text=f"✅ {channel['title']} 已加入插播，可以开始配置。",
-                    inline_keyboard=[[{"text": "⚙️ 管理频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+                    inline_keyboard=[
+                        [
+                            {"text": "⚙️ 频道设置", "callback_data": f"pub:channel:{channel['ref_token']}"},
+                            {"text": "📋 使用模版", "callback_data": f"pub:template:{channel['ref_token']}"},
+                        ],
+                    ],
                 )
                 notified += 1
             except TelegramError:
@@ -1837,6 +3886,7 @@ class UpdateHandler:
                 JOIN ad_slots s ON s.channel_id = p.channel_id AND s.slot_type = p.format_type
                 JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
                 WHERE p.channel_id = ?
+                  AND p.format_type IN ('light_tail', 'button_tail', 'standard_card', 'strong_post')
                 ORDER BY p.format_type
                 """,
                 (channel["id"],),
@@ -1849,7 +3899,12 @@ class UpdateHandler:
                 inline_keyboard=[[{"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}]],
             )
             return
-        lines = [f"⚙️ {channel['title']}", "", "点击开关广告形态。"]
+        lines = [
+            f"⚙️ {channel['title']}",
+            "",
+            "点击开关频道愿意接的广告形态。",
+            "置顶和循环发布由广告主在投放设置里选择。",
+        ]
         toggle_buttons = []
         for row in rows:
             status = "✅" if row["enabled"] else "⛔"
@@ -2113,7 +4168,7 @@ class UpdateHandler:
 
     def _channel_keyboard(self, channel_id: str) -> list[list[dict[str, str]]]:
         return [
-            [{"text": "🧾 创建订单", "callback_data": f"channel:order:{channel_id}"}],
+            [{"text": "📣 投放这个频道", "callback_data": f"channel:order:{channel_id}"}],
             [{"text": "💵 价格", "callback_data": f"channel:quote:{channel_id}"}, {"text": "💰 广告钱包", "callback_data": "advertiser:balance"}],
         ]
 
@@ -2134,7 +4189,11 @@ class UpdateHandler:
         return [payload]
 
     def _rate_lines(self, rates: list[Any]) -> list[str]:
-        return [f"• {self._slot_label(rate['slot_type'])}：{rate['currency']} {rate['unit_price_cents'] / 100:.2f}" for rate in rates]
+        return [
+            f"• {self._slot_label(rate['slot_type'])}：{rate['currency']} {rate['unit_price_cents'] / 100:.2f}"
+            for rate in rates
+            if self.channels.normalize_slot_type(rate["slot_type"]) in PLACEMENT_SLOT_TYPES
+        ]
 
     def _slot_name(self, slot_type: str) -> str:
         normalized = self.channels.normalize_slot_type(slot_type)
@@ -2159,6 +4218,15 @@ class UpdateHandler:
     def _button_grid(self, buttons: list[dict[str, str]], width: int) -> list[list[dict[str, str]]]:
         return [buttons[index : index + width] for index in range(0, len(buttons), width)]
 
+    def _h(self, value: Any) -> str:
+        return html.escape(str(value), quote=True)
+
+    def _html_pre(self, lines: list[str]) -> str:
+        return "<pre>" + self._h("\n".join(lines)) + "</pre>"
+
+    def _html_quote(self, text: str) -> str:
+        return "<blockquote>" + self._h(text) + "</blockquote>"
+
     def _reply_or_edit(
         self,
         *,
@@ -2166,6 +4234,7 @@ class UpdateHandler:
         text: str,
         inline_keyboard: list[list[dict[str, str]]] | None = None,
         source_message: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> str | None:
         message_id = source_message.get("message_id") if source_message else None
         if message_id:
@@ -2175,11 +4244,12 @@ class UpdateHandler:
                     message_id=message_id,
                     text=text,
                     inline_keyboard=inline_keyboard,
+                    parse_mode=parse_mode,
                 )
                 return str(message_id)
             except TelegramError:
                 pass
-        return self.gateway.send_private_message(chat_id=chat_id, text=text, inline_keyboard=inline_keyboard)
+        return self.gateway.send_private_message(chat_id=chat_id, text=text, inline_keyboard=inline_keyboard, parse_mode=parse_mode)
 
     def _status_label(self, status: str) -> str:
         labels = {

@@ -7,6 +7,7 @@ from typing import Callable
 from .bot import UpdateHandler
 from .config import Settings
 from .db import Database
+from .fulfillment import FulfillmentService
 from .telegram import BotApiClient, TelegramError
 
 
@@ -19,6 +20,7 @@ class PollingRunner:
         self.db.init()
         self.gateway = BotApiClient(settings.bot_token, settings.telegram_http_backend)
         self.handler = UpdateHandler(self.db, settings, self.gateway)
+        self.fulfillment = FulfillmentService(self.db, settings, self.gateway)
 
     def run(
         self,
@@ -54,9 +56,11 @@ class PollingRunner:
                     log(json.dumps({"event": "update_failed", "update_id": update_id, "error": str(exc)}, ensure_ascii=False))
                 offset = update_id + 1
                 self._save_offset(offset)
+                self._dispatch_due(log)
             if once:
                 return
             if not updates:
+                self._dispatch_due(log)
                 time.sleep(idle_sleep_seconds)
 
     def _load_offset(self) -> int | None:
@@ -74,3 +78,12 @@ class PollingRunner:
                 """,
                 (str(offset),),
             )
+
+    def _dispatch_due(self, log: Callable[[str], None]) -> None:
+        try:
+            result = self.fulfillment.dispatch_due()
+        except Exception as exc:
+            log(json.dumps({"event": "dispatch_due_failed", "error": str(exc)}, ensure_ascii=False))
+            return
+        if result:
+            log(json.dumps({"event": "dispatch_due", "result": result}, ensure_ascii=False, default=str))

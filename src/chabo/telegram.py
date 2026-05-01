@@ -18,8 +18,7 @@ class MessageGateway(Protocol):
         *,
         chat_id: str,
         text: str,
-        button_text: str,
-        button_url: str,
+        inline_keyboard: list[list[dict[str, str]]],
     ) -> str:
         ...
 
@@ -32,6 +31,7 @@ class MessageGateway(Protocol):
         caption: str,
         button_text: str,
         button_url: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
     ) -> str:
         ...
 
@@ -226,13 +226,13 @@ class BotApiClient:
     def get_chat_administrators(self, *, chat_id: str | int) -> list[dict[str, Any]]:
         return list(self._post("getChatAdministrators", {"chat_id": chat_id}))
 
-    def send_ad(self, *, chat_id: str, text: str, button_text: str, button_url: str) -> str:
+    def send_ad(self, *, chat_id: str, text: str, inline_keyboard: list[list[dict[str, str]]]) -> str:
         result = self._post(
             "sendMessage",
             {
                 "chat_id": chat_id,
                 "text": text,
-                "reply_markup": {"inline_keyboard": [[{"text": button_text, "url": button_url}]]},
+                "reply_markup": {"inline_keyboard": inline_keyboard},
                 "disable_web_page_preview": False,
             },
         )
@@ -247,6 +247,7 @@ class BotApiClient:
         caption: str,
         button_text: str,
         button_url: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
     ) -> str:
         method_by_type = {
             "photo": ("sendPhoto", "photo"),
@@ -261,7 +262,7 @@ class BotApiClient:
                 "chat_id": chat_id,
                 media_key: media_file_id,
                 "caption": safe_caption,
-                "reply_markup": {"inline_keyboard": [[{"text": button_text, "url": button_url}]]},
+                "reply_markup": {"inline_keyboard": inline_keyboard or [[{"text": button_text, "url": button_url}]]},
             },
         )
         return str(result["message_id"])
@@ -391,7 +392,7 @@ class BotApiClient:
 class NullGateway:
     """Useful for local CLI runs where no Telegram token is configured."""
 
-    def send_ad(self, *, chat_id: str, text: str, button_text: str, button_url: str) -> str:
+    def send_ad(self, *, chat_id: str, text: str, inline_keyboard: list[list[dict[str, str]]]) -> str:
         raise TelegramError("CHABO_BOT_TOKEN is not configured")
 
     def send_media_ad(
@@ -403,6 +404,7 @@ class NullGateway:
         caption: str,
         button_text: str,
         button_url: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
     ) -> str:
         raise TelegramError("CHABO_BOT_TOKEN is not configured")
 

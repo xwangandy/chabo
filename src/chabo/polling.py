@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Callable
 
@@ -9,6 +10,9 @@ from .config import Settings
 from .db import Database
 from .fulfillment import FulfillmentService
 from .telegram import BotApiClient, TelegramError
+
+
+logger = logging.getLogger(__name__)
 
 
 class PollingRunner:
@@ -30,8 +34,11 @@ class PollingRunner:
         once: bool = False,
         drop_pending_updates: bool = False,
         idle_sleep_seconds: float = 1.0,
-        log: Callable[[str], None] = print,
+        log: Callable[[str], None] | None = None,
     ) -> None:
+        if log is None:
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+            log = logger.info
         self.gateway.delete_webhook(drop_pending_updates=drop_pending_updates)
         offset = self._load_offset()
         log(json.dumps({"event": "polling_started", "bot_username": self.settings.bot_username}, ensure_ascii=False))

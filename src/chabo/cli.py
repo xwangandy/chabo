@@ -37,6 +37,133 @@ def cmd_init_db(args: argparse.Namespace) -> None:
     print(f"插播数据库已初始化：{settings.db_path}")
 
 
+def cmd_preflight(args: argparse.Namespace) -> None:
+    """Pre-launch check for production deployments.
+
+    Prints a structured JSON report of: DB ping, schema migration ok,
+    backup-dir writability, token strength, and the same /health-style
+    operational counters. Exits non-zero if any critical check fails so
+    deploy scripts can gate the launch.
+    """
+    from .web import check_token_strength
+
+    settings = Settings.from_env()
+    report: dict[str, Any] = {
+        "ok": True,
+        "issues": [],
+        "warnings": [],
+        "checks": {},
+    }
+
+    # DB connect + migrate
+    try:
+        db = Database(settings.db_path)
+        db.init()
+        with db.connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(creatives)").fetchall()]
+            schema_ok = all(name in cols for name in ("advertiser_account_id", "format_type", "light_short_text", "archived_at"))
+        report["checks"]["db"] = {"ok": True, "schema_up_to_date": schema_ok}
+        if not schema_ok:
+            report["issues"].append("creatives 表缺列；服务可能未初始化最新 schema")
+            report["ok"] = False
+    except Exception as exc:
+        report["checks"]["db"] = {"ok": False, "error": str(exc)[:200]}
+        report["issues"].append(f"DB 连接 / 迁移失败：{str(exc)[:120]}")
+        report["ok"] = False
+
+    # Backup dir writable
+    backups_dir = Path(settings.db_path).parent / "backups"
+    try:
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        probe = backups_dir / ".preflight-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        report["checks"]["backup_dir"] = {"ok": True, "path": str(backups_dir)}
+    except Exception as exc:
+        report["checks"]["backup_dir"] = {"ok": False, "path": str(backups_dir), "error": str(exc)[:200]}
+        report["issues"].append(f"备份目录不可写：{backups_dir}")
+        report["ok"] = False
+
+    # Token strength
+    token_warnings = check_token_strength(
+        admin_token=settings.admin_token,
+        webhook_secret=settings.webhook_secret,
+        host=args.host or settings.web_host,
+    )
+    report["checks"]["tokens"] = {
+        "ok": not token_warnings,
+        "host": args.host or settings.web_host,
+        "warnings": token_warnings,
+    }
+    if token_warnings:
+        report["warnings"].extend(token_warnings)
+        if not args.allow_weak_tokens:
+            report["ok"] = False
+
+    # Bot config sanity
+    bot_token_set = bool(settings.bot_token)
+    bot_username_set = bool(settings.bot_username)
+    bot_ok = (bot_token_set and bot_username_set) or (not bot_token_set and not bot_username_set)
+    report["checks"]["bot"] = {
+        "ok": bot_ok,
+        "bot_token_set": bot_token_set,
+        "bot_username_set": bot_username_set,
+    }
+    if not bot_ok:
+        report["warnings"].append("CHABO_BOT_TOKEN 与 CHABO_BOT_USERNAME 必须同时配置或同时不配置")
+
+    # Operational counters
+    try:
+        app = create_app(settings)
+        with app.db.transaction() as conn:
+            counters = {
+                "pending_review_orders": conn.execute(
+                    "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'pending_review'"
+                ).fetchone()["n"],
+                "running_orders": conn.execute(
+                    "SELECT COUNT(*) AS n FROM ad_orders WHERE status = 'running'"
+                ).fetchone()["n"],
+                "scheduled_due": conn.execute(
+                    "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'scheduled' "
+                    "AND scheduled_at <= datetime('now')"
+                ).fetchone()["n"],
+                "open_disputes": conn.execute(
+                    "SELECT COUNT(*) AS n FROM disputes WHERE status = 'open'"
+                ).fetchone()["n"],
+                "failed_recent": conn.execute(
+                    "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' "
+                    "AND updated_at >= datetime('now', '-1 day')"
+                ).fetchone()["n"],
+                "pending_topups": conn.execute(
+                    "SELECT COUNT(*) AS n FROM topup_requests WHERE status = 'pending'"
+                ).fetchone()["n"],
+            }
+        report["checks"]["ops"] = counters
+        if counters["scheduled_due"] > 0:
+            report["warnings"].append(
+                f"{counters['scheduled_due']} 个到期投放未发送，启动后请尽快跑 dispatch-due"
+            )
+    except Exception as exc:
+        report["checks"]["ops"] = {"error": str(exc)[:200]}
+        report["warnings"].append(f"运营计数读取失败：{str(exc)[:120]}")
+
+    print_json(report)
+    if not report["ok"]:
+        sys.exit(2)
+
+
+def cmd_backup_db(args: argparse.Namespace) -> None:
+    settings = Settings.from_env()
+    target = args.target
+    if not target:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backups_dir = Path(settings.db_path).parent / "backups"
+        target = str(backups_dir / f"chabo-{timestamp}.sqlite3")
+    written_to = Database(settings.db_path).backup_to(target)
+    print_json({"source": settings.db_path, "backup": written_to})
+
+
 def cmd_topup(args: argparse.Namespace) -> None:
     app = create_app()
     account = app.ledger.manual_topup(
@@ -340,16 +467,29 @@ def cmd_advertiser_report(args: argparse.Namespace) -> None:
 def cmd_batch_orders(args: argparse.Namespace) -> None:
     app = create_app()
     tokens = [token.strip() for token in args.channel_tokens.split(",") if token.strip()]
+    text = args.text
+    target_url = args.target_url
+    button_text = args.button_text
+    category = args.category
+    if args.material_id:
+        material = app.materials.get_material(
+            args.material_id,
+            advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        )
+        text = material["text"]
+        target_url = material["target_url"]
+        button_text = material["button_text"]
+        category = material["category"]
     print_json(
         app.advertisers.create_batch_orders(
             advertiser_telegram_user_id=args.advertiser_telegram_user_id,
             channel_tokens=tokens,
             slot_type=args.slot_type,
-            text=args.text,
-            target_url=args.target_url,
+            text=text,
+            target_url=target_url,
             budget_cents=money_to_cents(args.budget),
-            button_text=args.button_text,
-            category=args.category,
+            button_text=button_text,
+            category=category,
         )
     )
 
@@ -370,12 +510,130 @@ def cmd_create_order(args: argparse.Namespace) -> None:
         budget_cents=money_to_cents(args.budget),
         button_text=args.button_text,
         category=args.category,
+        light_short_text=args.light_short_text,
+        material_id=args.material_id,
         scheduled_at=datetime.fromisoformat(args.scheduled_at) if args.scheduled_at else None,
         end_at=datetime.fromisoformat(args.end_at) if args.end_at else None,
         frequency_per_day=args.frequency_per_day,
         campaign_name=args.campaign_name,
     )
     print_json(order)
+
+
+def cmd_create_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.create_material(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        format_type=args.format_type,
+        text=args.text,
+        target_url=args.target_url,
+        button_text=args.button_text,
+        category=args.category,
+        light_short_text=args.light_short_text,
+        display_name=args.display_name,
+    )
+    print_json(material)
+
+
+def cmd_list_materials(args: argparse.Namespace) -> None:
+    app = create_app()
+    items = app.materials.list_materials(
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+        format_type=args.format_type,
+        include_archived=args.include_archived,
+        limit=args.limit,
+    )
+    print_json(items)
+
+
+def cmd_show_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.get_material(
+        args.material_id,
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+    )
+    print_json(material)
+
+
+def cmd_archive_material(args: argparse.Namespace) -> None:
+    app = create_app()
+    material = app.materials.archive_material(
+        args.material_id,
+        advertiser_telegram_user_id=args.advertiser_telegram_user_id,
+    )
+    print_json(material)
+
+
+def cmd_request_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.request_topup(
+            recipient_telegram_user_id=args.recipient_telegram_user_id,
+            amount_cents=money_to_cents(args.amount),
+            reason=args.reason,
+            requester_telegram_user_id=args.requester_telegram_user_id,
+            evidence_url=args.evidence_url,
+            request_note=args.note,
+        )
+    )
+
+
+def cmd_approve_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.approve_topup(
+            request_id=args.request_id,
+            approver_telegram_user_id=args.approver_telegram_user_id,
+            approval_note=args.note,
+        )
+    )
+
+
+def cmd_reject_topup(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.reject_topup(
+            request_id=args.request_id,
+            approver_telegram_user_id=args.approver_telegram_user_id,
+            approval_note=args.note,
+        )
+    )
+
+
+def cmd_list_topup_requests(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.topup_approvals.list_requests(status=args.status, limit=args.limit)
+    )
+
+
+def cmd_list_tool_calls(args: argparse.Namespace) -> None:
+    app = create_app()
+    print_json(
+        app.tool_call_logs.list_calls(
+            actor_telegram_user_id=args.actor_telegram_user_id,
+            tool_name=args.tool_name,
+            result_status=args.result_status,
+            limit=args.limit,
+        )
+    )
+
+
+def cmd_log_tool_call(args: argparse.Namespace) -> None:
+    app = create_app()
+    arguments = json.loads(args.arguments) if args.arguments else {}
+    print_json(
+        app.tool_call_logs.log_call(
+            tool_name=args.tool_name,
+            actor_telegram_user_id=args.actor_telegram_user_id,
+            actor_kind=args.actor_kind,
+            session_id=args.session_id,
+            arguments=arguments,
+            result_status=args.result_status,
+            result_summary=args.result_summary,
+            error_type=args.error_type,
+        )
+    )
 
 
 def cmd_approve_order(args: argparse.Namespace) -> None:
@@ -520,6 +778,15 @@ def _account_view(account: dict[str, Any]) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chabo", description="插播 Telegram 广告插播 MVP 管理工具")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("backup-db", help="把 SQLite 数据库备份到文件；不传 --target 时自动写到 <db_dir>/backups/chabo-YYYYMMDD-HHMMSS.sqlite3")
+    p.add_argument("--target", help="备份输出路径")
+    p.set_defaults(func=cmd_backup_db)
+
+    p = sub.add_parser("preflight", help="生产部署前自检：DB / schema / 备份目录 / token 强度 / Bot 配置 / 运营计数；critical 问题非零退出")
+    p.add_argument("--host", help="覆盖 web_host 用于 token 强度判断（loopback 可放过缺 token）")
+    p.add_argument("--allow-weak-tokens", action="store_true", help="只在告警里报 token 弱，不影响退出码（仅限 staging 调试用）")
+    p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("init-db", help="初始化 SQLite 数据库")
     p.set_defaults(func=cmd_init_db)
@@ -720,8 +987,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-tokens", required=True, help="多个 ref_token，用逗号分隔")
     p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
-    p.add_argument("--text", required=True)
-    p.add_argument("--target-url", required=True)
+    p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
+    p.add_argument("--text", help="提供 --material-id 时无需传入")
+    p.add_argument("--target-url", help="提供 --material-id 时无需传入")
     p.add_argument("--budget", required=True, help="每个频道的预算")
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
@@ -738,16 +1006,98 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-token", required=True)
     p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
-    p.add_argument("--text", required=True)
-    p.add_argument("--target-url", required=True)
+    p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
+    p.add_argument("--text", help="标准/定制插播文案；提供 --material-id 时无需传入")
+    p.add_argument("--target-url", help="提供 --material-id 时无需传入")
     p.add_argument("--budget", required=True)
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
+    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字），仅 light_tail 形态需要")
     p.add_argument("--scheduled-at", help="ISO 时间，默认立即")
     p.add_argument("--end-at", help="ISO 时间，循环插播可用")
     p.add_argument("--frequency-per-day", type=int, default=1)
     p.add_argument("--campaign-name", default="插播广告")
     p.set_defaults(func=cmd_create_order)
+
+    p = sub.add_parser("create-material", help="把广告素材保存到广告库")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument(
+        "--format-type",
+        required=True,
+        choices=["light_tail", "standard_card", "strong_post"],
+        help="文字插播=light_tail / 标准插播=standard_card / 定制插播=strong_post",
+    )
+    p.add_argument("--text", required=True, help="完整广告文案；文字插播时为详情页内容")
+    p.add_argument("--target-url", required=True)
+    p.add_argument("--button-text", default="查看详情")
+    p.add_argument("--category", default="general")
+    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字）")
+    p.add_argument("--display-name", help="第一次出现广告主时使用的展示名")
+    p.set_defaults(func=cmd_create_material)
+
+    p = sub.add_parser("list-materials", help="列出广告主广告库里的素材")
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.add_argument("--format-type", choices=["light_tail", "standard_card", "strong_post"])
+    p.add_argument("--include-archived", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_materials)
+
+    p = sub.add_parser("show-material", help="查看单条广告库素材")
+    p.add_argument("--material-id", required=True)
+    p.add_argument(
+        "--advertiser-telegram-user-id",
+        help="提供后会校验素材归属，避免越权读取",
+    )
+    p.set_defaults(func=cmd_show_material)
+
+    p = sub.add_parser("archive-material", help="把广告库里的素材归档；归档后不可再用于新订单")
+    p.add_argument("--material-id", required=True)
+    p.add_argument("--advertiser-telegram-user-id", required=True)
+    p.set_defaults(func=cmd_archive_material)
+
+    p = sub.add_parser("request-topup", help="提交人工入账请求（双人复核第一步）")
+    p.add_argument("--recipient-telegram-user-id", required=True, help="收款方 Telegram 用户 ID")
+    p.add_argument("--amount", required=True, help="美元金额，例如 50.00")
+    p.add_argument("--reason", required=True, help="入账原因 / 凭证摘要")
+    p.add_argument("--requester-telegram-user-id", required=True, help="申请人 Telegram 用户 ID")
+    p.add_argument("--evidence-url", help="链外凭证 URL（截图、对账单等）")
+    p.add_argument("--note", help="申请备注")
+    p.set_defaults(func=cmd_request_topup)
+
+    p = sub.add_parser("approve-topup", help="审批入账请求；审批人必须与申请人是不同账号")
+    p.add_argument("--request-id", required=True)
+    p.add_argument("--approver-telegram-user-id", required=True)
+    p.add_argument("--note", help="审批备注")
+    p.set_defaults(func=cmd_approve_topup)
+
+    p = sub.add_parser("reject-topup", help="拒绝入账请求；不会动账本")
+    p.add_argument("--request-id", required=True)
+    p.add_argument("--approver-telegram-user-id", required=True)
+    p.add_argument("--note", help="拒绝备注")
+    p.set_defaults(func=cmd_reject_topup)
+
+    p = sub.add_parser("list-topup-requests", help="查看入账请求列表")
+    p.add_argument("--status", choices=["pending", "approved", "rejected"])
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_topup_requests)
+
+    p = sub.add_parser("list-tool-calls", help="查看 AI / 运营工具调用审计日志")
+    p.add_argument("--actor-telegram-user-id", help="按操作者 Telegram 用户 ID 过滤")
+    p.add_argument("--tool-name", help="按工具名过滤，例如 create_material / approve_order")
+    p.add_argument("--result-status", choices=["success", "error"])
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_list_tool_calls)
+
+    p = sub.add_parser("log-tool-call", help="手动记录一条工具调用日志（测试或外部 AI 调用回写）")
+    p.add_argument("--tool-name", required=True)
+    p.add_argument("--actor-telegram-user-id")
+    p.add_argument("--actor-kind", choices=["human", "ai", "admin", "system"], default="human")
+    p.add_argument("--session-id")
+    p.add_argument("--arguments", help="JSON 字符串，调用参数摘要")
+    p.add_argument("--result-status", choices=["success", "error"], default="success")
+    p.add_argument("--result-summary")
+    p.add_argument("--error-type")
+    p.set_defaults(func=cmd_log_tool_call)
 
     p = sub.add_parser("approve-order", help="审核通过订单并创建首个投放任务")
     p.add_argument("--order-id", required=True)

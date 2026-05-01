@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import html
 from typing import Any
@@ -8,8 +9,12 @@ from typing import Any
 from .config import Settings
 from .db import Database
 from .ids import new_id
+from .money import cents_to_money
 from .services import ChannelService, LedgerService, OrderService, iso, utcnow
 from .telegram import MessageGateway, TelegramError
+
+
+logger = logging.getLogger(__name__)
 
 
 class FulfillmentService:
@@ -17,9 +22,9 @@ class FulfillmentService:
         self.db = db
         self.settings = settings
         self.gateway = gateway
-        self.channels = ChannelService(db, settings)
+        self.channels = ChannelService(db, settings, gateway=gateway)
         self.ledger = LedgerService(db, settings)
-        self.orders = OrderService(db, settings)
+        self.orders = OrderService(db, settings, gateway=gateway)
 
     def dispatch_due(self, limit: int = 20) -> list[dict[str, Any]]:
         sent: list[dict[str, Any]] = []
@@ -77,11 +82,11 @@ class FulfillmentService:
             return {"delivery_id": delivery["id"], "status": "budget_exhausted"}
 
         track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery['id']}"
+        sales_url = f"https://t.me/{self.settings.bot_username}?start=ch_{channel['ref_token']}"
         ad_text = creative["text"]
-        button_text = creative["button_text"]
         message_id: str
         if slot["slot_type"] in {"light_tail", "button_tail"}:
-            short_text = creative["short_text"] or creative["button_text"] or "查看详情"
+            short_text = creative["light_short_text"] or creative["short_text"] or creative["button_text"] or "查看详情"
             inserted_message_id = self._insert_tail_into_latest_post(
                 conn,
                 channel,
@@ -93,18 +98,18 @@ class FulfillmentService:
                 message_id = inserted_message_id
             else:
                 ad_text = f"🔖 {short_text}" if slot["slot_type"] == "light_tail" else f"🔗 {creative['button_text'] or '查看详情'}"
-                button_text = "查看完整广告"
                 try:
                     message_id = self.gateway.send_ad(
                         chat_id=channel["telegram_chat_id"],
                         text=ad_text,
-                        button_text=button_text,
-                        button_url=track_url,
+                        inline_keyboard=[[{"text": "查看完整广告" if slot["slot_type"] == "light_tail" else creative["button_text"] or "查看详情", "url": track_url}]],
                     )
                 except TelegramError as exc:
                     self._mark_delivery_failed(conn, delivery, order, str(exc))
                     return {"delivery_id": delivery["id"], "status": "failed", "error": str(exc)}
         else:
+            keyboard = self._build_post_keyboard(creative, sales_url=sales_url, track_url=track_url)
+            button_text = (creative["button_text"] or "").strip() or "查看详情"
             if slot["slot_type"] in {"standard_card", "pin24h"} and creative["standard_text"]:
                 ad_text = creative["standard_text"]
             try:
@@ -116,13 +121,13 @@ class FulfillmentService:
                         caption=ad_text,
                         button_text=button_text,
                         button_url=track_url,
+                        inline_keyboard=keyboard,
                     )
                 else:
                     message_id = self.gateway.send_ad(
                         chat_id=channel["telegram_chat_id"],
                         text=ad_text,
-                        button_text=button_text,
-                        button_url=track_url,
+                        inline_keyboard=keyboard,
                     )
             except TelegramError as exc:
                 self._mark_delivery_failed(conn, delivery, order, str(exc))
@@ -174,10 +179,34 @@ class FulfillmentService:
         )
         self._snapshot(conn, order["id"], delivery["id"], "send_log", {"message_id": message_id, "pinned": bool(pinned)})
         self._snapshot(conn, order["id"], delivery["id"], "channel_config", dict(config))
+        self._notify_advertiser_delivered(
+            conn,
+            order=order,
+            channel=channel,
+            delivery_id=delivery["id"],
+            charge_cents=order["unit_price_cents"],
+        )
         self._notify_publisher_income(conn, channel, creative, message_id, publisher_net)
         self._maybe_notify_budget(conn, order["id"])
         self.orders.maybe_schedule_next(conn, order["id"])
         return {"delivery_id": delivery["id"], "status": "sent", "message_id": message_id}
+
+    def _build_post_keyboard(
+        self,
+        creative: sqlite3.Row,
+        *,
+        sales_url: str,
+        track_url: str,
+    ) -> list[list[dict[str, str]]]:
+        cta_text = (creative["button_text"] or "").strip() or "查看详情"
+        target_url = creative["target_url"]
+        return [
+            [
+                {"text": "📣 频道招商", "url": sales_url},
+                {"text": "🔍 查看详情", "url": track_url},
+            ],
+            [{"text": cta_text, "url": target_url}],
+        ]
 
     def _insert_tail_into_latest_post(
         self,
@@ -255,6 +284,53 @@ class FulfillmentService:
         self._snapshot(conn, order["id"], delivery["id"], "send_failure", {"error": error})
         self.orders.pause_and_release(conn, order["id"], f"插播发布失败：{error}")
 
+    def _notify_advertiser_delivered(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        order: dict[str, Any],
+        channel: sqlite3.Row,
+        delivery_id: str,
+        charge_cents: int,
+    ) -> None:
+        """Push '✅ 已发布' to the advertiser after a successful send.
+
+        Failure to reach Telegram does not affect the delivery transaction —
+        we log and continue. The advertiser can still find the same info
+        under '📣 我的广告'.
+        """
+        account = conn.execute(
+            "SELECT telegram_user_id FROM accounts WHERE id = ?",
+            (order["advertiser_account_id"],),
+        ).fetchone()
+        if not account or not account["telegram_user_id"]:
+            return
+        track_url = f"https://t.me/{self.settings.bot_username}?start=ad_{delivery_id}"
+        remaining_cents = max(0, int(order["reserved_cents"]) - int(charge_cents))
+        text = (
+            "✅ 你的广告已发布\n\n"
+            f"📺 {channel['title']}\n"
+            f"💰 本次扣费 USD {cents_to_money(charge_cents)}\n"
+            f"💵 订单剩余预算 USD {cents_to_money(remaining_cents)}"
+        )
+        keyboard = [
+            [{"text": "🔍 查看详情", "url": track_url}],
+            [{"text": "📣 我的广告", "callback_data": "advertiser:orders"}],
+        ]
+        try:
+            self.gateway.send_private_message(
+                chat_id=account["telegram_user_id"],
+                text=text,
+                inline_keyboard=keyboard,
+            )
+        except TelegramError as exc:
+            logger.warning(
+                "notify_advertiser_delivered_failed order=%s delivery=%s error=%s",
+                order["id"],
+                delivery_id,
+                exc,
+            )
+
     def _maybe_notify_budget(self, conn: sqlite3.Connection, order_id: str) -> None:
         order = self.orders.get_order(conn, order_id)
         if order["budget_cents"] <= 0 or order["low_budget_notified_at"]:
@@ -268,8 +344,8 @@ class FulfillmentService:
             if account and account["telegram_user_id"]:
                 self.gateway.send_private_message(
                     chat_id=account["telegram_user_id"],
-                text=f"你的插播预算已低于 20%，订单 {order_id} 剩余预算即将用完。",
-            )
+                    text=f"你的插播预算已低于 20%，订单 {order_id} 剩余预算即将用完。",
+                )
             self.orders.mark_low_budget_notified(conn, order_id)
 
     def _notify_publisher_income(

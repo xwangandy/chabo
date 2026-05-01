@@ -5,60 +5,17 @@ import json
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Settings
 from .db import Database
 from .ids import new_id
 from .money import cents_to_money, money_to_cents
-from .services import AccountService, ChaboError, ChannelService, LedgerService, LightProbeService, NotFound, OrderService, StarsPaymentService
+from .services import AccountService, AdvertiserService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
+from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
 
 
-DEFAULT_USER_TIMEZONE = "Asia/Shanghai"
 STALE_CHANNEL_POST_SECONDS = 10 * 60
-
-
-TIMEZONE_ALIASES = {
-    "beijing": "Asia/Shanghai",
-    "北京": "Asia/Shanghai",
-    "北京时间": "Asia/Shanghai",
-    "shanghai": "Asia/Shanghai",
-    "上海": "Asia/Shanghai",
-    "china": "Asia/Shanghai",
-    "中国": "Asia/Shanghai",
-    "manila": "Asia/Manila",
-    "马尼拉": "Asia/Manila",
-    "philippines": "Asia/Manila",
-    "菲律宾": "Asia/Manila",
-    "hongkong": "Asia/Hong_Kong",
-    "hong kong": "Asia/Hong_Kong",
-    "香港": "Asia/Hong_Kong",
-    "taipei": "Asia/Taipei",
-    "台北": "Asia/Taipei",
-    "taiwan": "Asia/Taipei",
-    "台湾": "Asia/Taipei",
-    "singapore": "Asia/Singapore",
-    "新加坡": "Asia/Singapore",
-    "tokyo": "Asia/Tokyo",
-    "东京": "Asia/Tokyo",
-    "seoul": "Asia/Seoul",
-    "首尔": "Asia/Seoul",
-    "bangkok": "Asia/Bangkok",
-    "曼谷": "Asia/Bangkok",
-    "dubai": "Asia/Dubai",
-    "迪拜": "Asia/Dubai",
-    "rome": "Europe/Rome",
-    "罗马": "Europe/Rome",
-    "london": "Europe/London",
-    "伦敦": "Europe/London",
-    "new york": "America/New_York",
-    "newyork": "America/New_York",
-    "纽约": "America/New_York",
-    "los angeles": "America/Los_Angeles",
-    "losangeles": "America/Los_Angeles",
-    "洛杉矶": "America/Los_Angeles",
-}
 
 
 SLOT_DISPLAY_NAMES = {
@@ -109,11 +66,14 @@ class UpdateHandler:
         self.settings = settings
         self.gateway = gateway
         self.accounts = AccountService(db, settings)
-        self.channels = ChannelService(db, settings)
+        self.channels = ChannelService(db, settings, gateway=gateway)
         self.ledger = LedgerService(db, settings)
         self.light_probes = LightProbeService(db, settings)
-        self.orders = OrderService(db, settings)
+        self.materials = MaterialService(db, settings)
+        self.orders = OrderService(db, settings, gateway=gateway)
+        self.self_promos = SelfPromoService(db, settings)
         self.stars_payments = StarsPaymentService(db, settings)
+        self.advertisers = AdvertiserService(db, settings)
 
     def handle(self, update: dict[str, Any]) -> dict[str, Any]:
         if "pre_checkout_query" in update:
@@ -196,15 +156,41 @@ class UpdateHandler:
                         (new_id("met"), delivery_id, json.dumps({"telegram_user_id": str(user_id)}, ensure_ascii=False)),
                     )
                     creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (delivery["creative_id"],)).fetchone()
-                    if creative:
+                    source_channel = conn.execute(
+                        "SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)
+                    ).fetchone()
+                    if creative and source_channel:
+                        text, keyboard = self._build_ad_detail_view(creative, source_channel)
                         self.gateway.send_private_message(
                             chat_id=chat.get("id", user_id),
-                            text="\n".join(["📄 插播广告详情", "", creative["text"], "", f"🔗 {creative['target_url']}"]),
-                            inline_keyboard=[[{"text": "🔗 打开链接", "url": creative["target_url"]}]],
+                            text=text,
+                            inline_keyboard=keyboard,
                         )
                     else:
                         self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
                     return {"handled": True, "type": "ad_start", "delivery_id": delivery_id}
+            if payload.startswith("sp_"):
+                self_promo_id = payload.removeprefix("sp_")
+                row = conn.execute(
+                    "SELECT * FROM self_promo_publishes WHERE id = ?", (self_promo_id,)
+                ).fetchone()
+                if row:
+                    creative = conn.execute(
+                        "SELECT * FROM creatives WHERE id = ?", (row["creative_id"],)
+                    ).fetchone()
+                    source_channel = conn.execute(
+                        "SELECT * FROM channels WHERE id = ?", (row["channel_id"],)
+                    ).fetchone()
+                    if creative and source_channel:
+                        text, keyboard = self._build_ad_detail_view(creative, source_channel)
+                        self.gateway.send_private_message(
+                            chat_id=chat.get("id", user_id),
+                            text=text,
+                            inline_keyboard=keyboard,
+                        )
+                    else:
+                        self.gateway.send_private_message(chat_id=chat.get("id", user_id), text="广告详情暂不可用")
+                    return {"handled": True, "type": "self_promo_start", "self_promo_id": self_promo_id}
             if payload.startswith("probe_"):
                 probe_id = payload.removeprefix("probe_")
                 probe = conn.execute("SELECT * FROM light_probes WHERE id = ?", (probe_id,)).fetchone()
@@ -301,9 +287,32 @@ class UpdateHandler:
         if data == "publisher:enable_income_notifications":
             self._set_publisher_income_notifications(chat_id, user, message, enabled=True)
             return {"handled": True, "type": "callback_publisher_income_notifications_enabled"}
+        if data == "earnings:channels":
+            self._send_earnings_channels(chat_id, user, message)
+            return {"handled": True, "type": "callback_earnings_channels"}
+        if data == "earnings:statement":
+            self._send_earnings_statement(chat_id, user, message)
+            return {"handled": True, "type": "callback_earnings_statement"}
         if data == "advertiser:balance":
             self._send_advertiser_balance(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_balance"}
+        if data == "wallet:topup":
+            self._send_wallet_topup_picker(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_topup_picker"}
+        if data.startswith("wallet:topup:"):
+            stars_str = data.removeprefix("wallet:topup:")
+            try:
+                stars_amount = int(stars_str)
+            except ValueError:
+                self._send_wallet_topup_picker(chat_id, user, message)
+                return {"handled": True, "type": "callback_wallet_topup_invalid"}
+            return self._trigger_wallet_topup(chat_id, user, stars_amount, message)
+        if data == "wallet:reserved":
+            self._send_wallet_reserved(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_reserved"}
+        if data == "wallet:statement":
+            self._send_wallet_statement(chat_id, user, message)
+            return {"handled": True, "type": "callback_wallet_statement"}
         if data == "advertiser:library":
             self._send_advertiser_library(chat_id, user, message)
             return {"handled": True, "type": "callback_advertiser_library"}
@@ -366,6 +375,44 @@ class UpdateHandler:
             channel_identifier, slot_type = rest.rsplit(":", 1)
             self._toggle_publisher_format(chat_id, user, channel_identifier, slot_type, message)
             return {"handled": True, "type": "callback_publisher_format_toggled", "channel": channel_identifier, "slot_type": slot_type}
+        if data.startswith("pub:approval:"):
+            channel_identifier = data.removeprefix("pub:approval:")
+            self._send_publisher_approval_settings(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_approval", "channel": channel_identifier}
+        if data.startswith("pub:band:set:"):
+            rest = data.removeprefix("pub:band:set:")
+            channel_identifier, format_type, band = rest.rsplit(":", 2)
+            self._set_publisher_band(chat_id, user, channel_identifier, format_type, band, message)
+            return {"handled": True, "type": "callback_publisher_band_set", "channel": channel_identifier, "format_type": format_type, "band": band}
+        if data.startswith("pub:band:"):
+            channel_identifier = data.removeprefix("pub:band:")
+            self._send_publisher_band_picker(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_band_picker", "channel": channel_identifier}
+        if data.startswith("pub:limit:set:"):
+            rest = data.removeprefix("pub:limit:set:")
+            channel_identifier, limit_str = rest.rsplit(":", 1)
+            self._set_publisher_daily_limit(chat_id, user, channel_identifier, int(limit_str), message)
+            return {"handled": True, "type": "callback_publisher_limit_set", "channel": channel_identifier, "limit": int(limit_str)}
+        if data.startswith("pub:limit:"):
+            channel_identifier = data.removeprefix("pub:limit:")
+            self._send_publisher_limit_panel(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_limit_panel", "channel": channel_identifier}
+        if data.startswith("pub:self:pick:"):
+            rest = data.removeprefix("pub:self:pick:")
+            channel_identifier, material_id = rest.rsplit(":", 1)
+            return self._publish_self_promo(chat_id, user, channel_identifier, material_id, message)
+        if data.startswith("pub:self:"):
+            channel_identifier = data.removeprefix("pub:self:")
+            self._send_publisher_self_promo_panel(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_self_promo", "channel": channel_identifier}
+        if data.startswith("pub:stats:"):
+            channel_identifier = data.removeprefix("pub:stats:")
+            self._send_publisher_channel_stats(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_channel_stats", "channel": channel_identifier}
+        if data.startswith("pub:earnings:"):
+            channel_identifier = data.removeprefix("pub:earnings:")
+            self._send_publisher_channel_earnings(chat_id, user, channel_identifier, message)
+            return {"handled": True, "type": "callback_publisher_channel_earnings", "channel": channel_identifier}
         if data.startswith("channel:quote:"):
             channel_id = data.removeprefix("channel:quote:")
             self._send_channel_quote(chat_id, channel_id, user, message)
@@ -1114,7 +1161,9 @@ class UpdateHandler:
                     SELECT cr.*, ca.name AS campaign_name
                     FROM creatives cr
                     JOIN campaigns ca ON ca.id = cr.campaign_id
-                    WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
+                    WHERE ca.advertiser_account_id = ?
+                      AND cr.status != 'rejected'
+                      AND cr.archived_at IS NULL
                     ORDER BY cr.updated_at DESC, cr.created_at DESC
                     LIMIT 8
                     """,
@@ -1475,19 +1524,16 @@ class UpdateHandler:
         panel = self._placement_effective_panel(panel, payload)
         with self.db.transaction() as conn:
             channel = self._sync_channel_profile_conn(conn, self.channels.get_channel(conn, payload["channel_id"]))
-            creatives = []
+            creatives: list[dict[str, Any]] = []
             if panel == "creative":
-                creatives = conn.execute(
-                    """
-                    SELECT cr.*, ca.name AS campaign_name
-                    FROM creatives cr
-                    JOIN campaigns ca ON ca.id = cr.campaign_id
-                    WHERE ca.advertiser_account_id = ? AND cr.status != 'rejected'
-                    ORDER BY cr.updated_at DESC, cr.created_at DESC
-                    LIMIT 5
-                    """,
-                    (account["id"],),
-                ).fetchall()
+                slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "")
+                format_type = slot_type if slot_type in PLACEMENT_SLOT_TYPES else None
+                creatives = self.materials.list_materials_in_conn(
+                    conn,
+                    advertiser_account_id=account["id"],
+                    format_type=format_type,
+                    limit=5,
+                )
                 payload["creative_ids"] = [row["id"] for row in creatives]
             self._set_conversation_conn(conn, chat_id, account["id"], "placement_config", panel, payload)
 
@@ -1631,16 +1677,17 @@ class UpdateHandler:
                     """,
                     (creative_ids[index],),
                 ).fetchone()
-            if not creative:
-                self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 广告素材不存在。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
+            if not creative or creative["archived_at"]:
+                self._reply_or_edit(chat_id=chat_id, source_message=message, text="⚠️ 广告素材已不可用。", inline_keyboard=[[{"text": "📁 广告素材", "callback_data": "place:creative"}]])
                 return {"handled": True, "type": "callback_placement_creative_missing"}
             payload.update(
                 {
+                    "material_id": creative["id"],
                     "creative_text": creative["text"],
-                    "creative_name": creative["campaign_name"],
+                    "creative_name": creative["campaign_name"] or "广告库素材",
                     "target_url": creative["target_url"],
                     "button_text": creative["button_text"],
-                    "light_short_text": creative["short_text"] or creative["button_text"],
+                    "light_short_text": creative["light_short_text"] or creative["short_text"] or creative["button_text"],
                     "standard_text": creative["standard_text"] or creative["text"],
                     "media_file_id": creative["media_file_id"],
                     "media_type": creative["media_type"],
@@ -1648,7 +1695,30 @@ class UpdateHandler:
                 }
             )
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
-            return {"handled": True, "type": "callback_placement_creative_selected"}
+            return {"handled": True, "type": "callback_placement_creative_selected", "material_id": creative["id"]}
+
+        if data.startswith("place:archive:"):
+            index = int(data.removeprefix("place:archive:"))
+            creative_ids = payload.get("creative_ids") or []
+            if index < 0 or index >= len(creative_ids):
+                self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_placement_archive_missing"}
+            target_id = creative_ids[index]
+            try:
+                with self.db.transaction() as conn:
+                    self.materials.archive_material_in_conn(
+                        conn,
+                        material_id=target_id,
+                        advertiser_account_id=state["account_id"],
+                    )
+            except NotFound:
+                self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+                return {"handled": True, "type": "callback_placement_archive_missing"}
+            if payload.get("material_id") == target_id:
+                for key in ("material_id", "selected_creative_id", "creative_text", "target_url", "button_text", "light_short_text", "standard_text", "media_file_id", "media_type"):
+                    payload.pop(key, None)
+            self._send_placement_configurator(chat_id, user, message, payload=payload, panel="creative")
+            return {"handled": True, "type": "callback_placement_creative_archived", "material_id": target_id}
 
         if data.startswith("place:new:"):
             requested_slot = data.removeprefix("place:new:")
@@ -1813,16 +1883,17 @@ class UpdateHandler:
                     """,
                     (creative_ids[index],),
                 ).fetchone()
-            if not creative:
+            if not creative or creative["archived_at"]:
                 self._send_global_placement(chat_id, user, message, payload=payload, panel="creative")
                 return {"handled": True, "type": "callback_global_placement_creative_missing"}
             payload.update(
                 {
+                    "material_id": creative["id"],
                     "creative_text": creative["text"],
                     "creative_name": creative["campaign_name"],
                     "target_url": creative["target_url"],
                     "button_text": creative["button_text"],
-                    "light_short_text": creative["short_text"] or creative["button_text"],
+                    "light_short_text": creative["light_short_text"] or creative["short_text"] or creative["button_text"],
                     "standard_text": creative["standard_text"] or creative["text"],
                     "media_file_id": creative["media_file_id"],
                     "media_type": creative["media_type"],
@@ -2273,19 +2344,25 @@ class UpdateHandler:
             WHERE ca.advertiser_account_id = ?
               AND cr.content_hash = ?
               AND cr.status != 'rejected'
+              AND cr.archived_at IS NULL
             ORDER BY cr.updated_at DESC, cr.created_at DESC
             LIMIT 1
             """,
             (account_id, content_hash),
         ).fetchone()
         if existing:
+            payload["material_id"] = existing["id"]
             payload["selected_creative_id"] = existing["id"]
             payload["button_text"] = existing["button_text"]
-            payload["light_short_text"] = existing["short_text"] or short_text
+            payload["light_short_text"] = existing["light_short_text"] or existing["short_text"] or short_text
             payload["standard_text"] = existing["standard_text"] or standard_text
+            payload["media_file_id"] = existing["media_file_id"]
+            payload["media_type"] = existing["media_type"]
             return
         campaign_id = new_id("camp")
         creative_id = new_id("cre")
+        slot_type = self.channels.normalize_slot_type(payload.get("slot_type") or "standard_card")
+        format_type = slot_type if slot_type in PLACEMENT_SLOT_TYPES else "standard_card"
         conn.execute(
             """
             INSERT INTO campaigns (id, advertiser_account_id, name)
@@ -2296,14 +2373,17 @@ class UpdateHandler:
         conn.execute(
             """
             INSERT INTO creatives (
-                id, campaign_id, text, target_url, button_text, short_text,
-                standard_text, media_file_id, media_type, content_hash
+                id, campaign_id, advertiser_account_id, format_type,
+                text, target_url, button_text, short_text, standard_text,
+                media_file_id, media_type, category, light_short_text, content_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'general', ?, ?)
             """,
             (
                 creative_id,
                 campaign_id,
+                account_id,
+                format_type,
                 text,
                 target_url,
                 button_text,
@@ -2311,9 +2391,11 @@ class UpdateHandler:
                 standard_text,
                 media_file_id or None,
                 media_type or None,
+                short_text,
                 content_hash,
             ),
         )
+        payload["material_id"] = creative_id
         payload["selected_creative_id"] = creative_id
 
     def _submit_placement_order(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2347,12 +2429,19 @@ class UpdateHandler:
             orders = []
             for channel in channels:
                 channel_quote = self._placement_quote_for_channel(str(channel["id"]), payload)
+                creative_args = (
+                    {"material_id": payload["material_id"]}
+                    if payload.get("material_id")
+                    else {
+                        "text": payload["creative_text"],
+                        "target_url": payload["target_url"],
+                        "light_short_text": payload.get("light_short_text"),
+                    }
+                )
                 order = self.orders.create_order(
                     advertiser_telegram_user_id=user_id,
                     channel_token=channel["ref_token"],
                     slot_type=order_slot_type,
-                    text=payload["creative_text"],
-                    target_url=payload["target_url"],
                     button_text=payload.get("button_text") or "打开链接",
                     budget_cents=channel_quote["total_cents"],
                     scheduled_at=scheduled_at,
@@ -2360,22 +2449,28 @@ class UpdateHandler:
                     frequency_per_day=1,
                     unit_price_override_cents=channel_quote["unit_cents"],
                     campaign_name="Bot 自助插播广告",
-                    existing_creative_id=payload.get("selected_creative_id"),
+                    **creative_args,
                 )
                 if self.settings.bot_auto_approve_orders:
                     order = self.orders.approve_order(order["id"])
                 orders.append(order)
         except ChaboError as exc:
+            short = str(exc)
+            insufficient = isinstance(exc, InsufficientBalance) or "余额" in short
+            primary_row: list[dict[str, str]] = []
+            if insufficient:
+                primary_row.append({"text": "💳 立即充值", "callback_data": "wallet:topup"})
+            primary_row.append({"text": "🧩 降低配置", "callback_data": "place:display"})
             self._reply_or_edit(
                 chat_id=chat_id,
                 source_message=source_message,
                 text=f"⚠️ 暂时无法提交投放\n\n{exc}",
                 inline_keyboard=[
-                    [{"text": "💰 充值", "callback_data": "advertiser:balance"}, {"text": "🧩 降低配置", "callback_data": "place:display"}],
-                    [{"text": "🏠 工作台", "callback_data": "menu:home"}],
+                    primary_row,
+                    [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "🏠 工作台", "callback_data": "menu:home"}],
                 ],
             )
-            return {"handled": True, "type": "callback_placement_submit_failed", "error": str(exc)}
+            return {"handled": True, "type": "callback_placement_submit_failed", "error": short}
 
         self._clear_conversation(chat_id)
         review_text = "✅ 已自动通过审核\n🚀 已进入发布队列" if self.settings.bot_auto_approve_orders else "⏳ 等待审核"
@@ -2437,30 +2532,29 @@ class UpdateHandler:
         )
         lines = [
             f"<b>🎯 给「{self._h(self._placement_target_label(channel, payload))}」投放广告</b>",
-            "",
-            status_block,
-            "",
-            f"<b>下一步：{self._h(self._placement_next_step(payload, account, panel))}</b>",
-            "",
-            f"<b>{self._h(self._placement_step_title(panel, payload))}</b>",
         ]
+        quality_lines = self._channel_quality_lines(channel["id"])
+        if quality_lines:
+            lines.extend(["", self._html_quote("\n".join(quality_lines))])
+        lines.extend(
+            [
+                "",
+                status_block,
+                "",
+                f"<b>下一步：{self._h(self._placement_next_step(payload, account, panel))}</b>",
+                "",
+                f"<b>{self._h(self._placement_step_title(panel, payload))}</b>",
+            ]
+        )
         if panel == "creative":
             if payload.get("creative_text") and payload.get("target_url"):
                 lines.append(self._html_quote("已选广告。可以直接下一步，也可以换一条广告。"))
             else:
                 lines.append(self._html_quote("先选择一条已有广告；如果还没有，就添加一条新广告。"))
         elif panel == "display":
-            lines.extend(
-                [
-                    self._html_quote("选择广告在频道里的插播位置。这里只能选一种。"),
-                ]
-            )
+            lines.append(self._html_quote("选择广告在频道里的插播位置。这里只能选一种。"))
         elif panel == "schedule":
-            lines.extend(
-                [
-                    self._html_quote("设置发布周期。按广告生效开始计算，默认 24 小时发布一次。\n顶部预算会随发布周期和置顶选择自动变化。"),
-                ]
-            )
+            lines.append(self._html_quote("设置发布周期。按广告生效开始计算，默认 24 小时发布一次。\n顶部预算会随发布周期和置顶选择自动变化。"))
         elif panel == "confirm":
             missing_panel = self._placement_missing_panel(payload)
             if missing_panel:
@@ -2469,21 +2563,128 @@ class UpdateHandler:
                 quote = self._placement_quote(payload)
                 available = int((account or {}).get("available_balance_cents") or 0)
                 shortage = max(0, quote["total_cents"] - available)
-                lines.extend(
-                    [
-                        self._html_pre(
-                            [
-                                f"需要冻结：USD {cents_to_money(quote['total_cents'])}",
-                                f"广告钱包可用：USD {cents_to_money(available)}",
-                            ]
-                        ),
-                    ]
+                lines.append(
+                    self._html_pre(
+                        [
+                            f"需要冻结：USD {cents_to_money(quote['total_cents'])}",
+                            f"广告钱包可用：USD {cents_to_money(available)}",
+                        ]
+                    )
                 )
+                breakdown = [line for line in self._placement_cost_breakdown(channel, payload) if line]
+                if breakdown:
+                    lines.extend(["", self._html_quote("\n".join(breakdown))])
                 if shortage:
                     lines.extend(["", self._html_quote(f"⚠️ 余额不足，还需充值 USD {cents_to_money(shortage)}。")])
                 else:
                     lines.extend(["", self._html_quote("点击保存后广告生效；发布成功才扣费。")])
         return "\n".join(lines)
+
+    # 类目商业价值: 施工图 §8.4 — 高 / 中高 / 中 / 中低 / 低 / 高风险
+    CATEGORY_VALUE = {
+        "finance": ("金融", "高"),
+        "web3": ("Web3", "高"),
+        "crypto": ("加密", "高"),
+        "ai": ("AI", "高"),
+        "software": ("软件", "高"),
+        "education": ("教育", "中高"),
+        "hiring": ("招聘", "中高"),
+        "ecommerce": ("电商", "中高"),
+        "tools": ("工具", "中高"),
+        "vertical": ("垂直社群", "中高"),
+        "news": ("新闻资讯", "中"),
+        "gossip": ("吃瓜", "中低"),
+        "fun": ("搞笑", "中低"),
+        "entertainment": ("娱乐", "中低"),
+        "movies": ("影视", "低"),
+        "anime": ("动漫", "低"),
+        "adult": ("成人", "高风险"),
+        "general": ("通用", "中"),
+    }
+
+    def _channel_quality_lines(self, channel_id: str) -> list[str]:
+        """Latest channel assessment as a 1-2 line quality signal block.
+
+        Returned lines are appended right under the channel title in the
+        placement configurator so advertisers see traffic / category / risk
+        before they commit a budget. No assessment yet → empty list.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT category, median_24h_views, subscribers, risk_level, score
+                FROM channel_pricing_assessments
+                WHERE channel_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (channel_id,),
+            ).fetchone()
+        if not row:
+            return []
+        # Line 1: traffic snapshot
+        traffic_parts: list[str] = []
+        if row["subscribers"]:
+            traffic_parts.append(f"👥 订阅 {int(row['subscribers']):,}")
+        if row["median_24h_views"]:
+            traffic_parts.append(f"📈 24h 中位浏览 {int(row['median_24h_views']):,}")
+        # Line 2: category + business value + risk
+        category_label, value_label = self.CATEGORY_VALUE.get(
+            (row["category"] or "general").lower(),
+            (row["category"] or "未分类", "未评估"),
+        )
+        risk_emoji = {"normal": "🟢", "watch": "🟡", "high": "🟠", "blocked": "🔴"}.get(row["risk_level"], "⚪️")
+        category_line = f"🏷 {category_label} (商业价值 {value_label}) · {risk_emoji} 风控 {row['risk_level']}"
+
+        result: list[str] = []
+        if traffic_parts:
+            result.append(" · ".join(traffic_parts))
+        result.append(category_line)
+        return result
+
+    def _placement_cost_breakdown(self, channel: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+        """One-shot cost breakdown for the placement confirm panel.
+
+        Shows: per-delivery base / pin multiplier / period multiplier / total,
+        plus the publisher-net / platform-fee split so advertisers know how
+        the cents are routed.
+        """
+        slot_type = payload.get("slot_type")
+        if not slot_type:
+            return ["报价待计算 — 先选展示形态。"]
+        normalized = self.channels.normalize_slot_type(slot_type)
+        base_unit = self._slot_price_cents(payload["channel_id"], normalized)
+        pin_on = bool(payload.get("pin")) and normalized in PINNABLE_PLACEMENT_SLOTS
+        pin_unit = base_unit * 2 if pin_on else base_unit
+        period_cfg = PLACEMENT_PERIODS.get(payload.get("period") or "once", PLACEMENT_PERIODS["once"])
+        deliveries = int(period_cfg["deliveries"])
+        discount_bps = int(period_cfg["discount_bps"])
+        per_delivery = max(1, round(pin_unit * discount_bps / 10000))
+        total = per_delivery * deliveries
+
+        with self.db.transaction() as conn:
+            cfg = conn.execute(
+                "SELECT service_fee_bps FROM channel_configs WHERE channel_id = ?",
+                (payload["channel_id"],),
+            ).fetchone()
+        fee_bps = int(cfg["service_fee_bps"]) if cfg else self.settings.default_service_fee_bps
+        platform_fee = (total * fee_bps) // 10_000
+        publisher_net = total - platform_fee
+
+        lines = ["📊 报价拆解"]
+        lines.append(f"• 基准 USD {cents_to_money(base_unit)} / 次")
+        if pin_on:
+            lines.append(f"• 置顶加价 ×2 → USD {cents_to_money(pin_unit)} / 次")
+        if discount_bps != 10_000:
+            discount_pct = discount_bps / 100  # bps→%
+            lines.append(f"• {period_cfg['label']}: {deliveries} 次 × {discount_pct:.0f}% 折扣")
+        lines.append(f"• 单次结算 USD {cents_to_money(per_delivery)} × {deliveries} 次 = USD {cents_to_money(total)}")
+        if fee_bps > 0:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 USD {cents_to_money(platform_fee)} ({fee_bps/100:.1f}%)")
+        else:
+            lines.append(f"💼 频道主净收 USD {cents_to_money(publisher_net)}｜平台服务费 0% (推广按钮 / 高级订阅)")
+        lines.append("")
+        return lines
 
     def _placement_keyboard(
         self,
@@ -2526,8 +2727,15 @@ class UpdateHandler:
             creatives = creatives or []
             if creatives:
                 for index, creative in enumerate(creatives):
-                    label = self._short_title((creative["campaign_name"] or creative["text"] or "").replace("\n", " "), 18)
-                    keyboard.append([{"text": f"📄 {label}", "callback_data": f"place:pick:{index}"}])
+                    label_source = creative.get("campaign_name") or creative.get("light_short_text") or creative.get("short_text") or creative.get("text") or ""
+                    label = self._short_title(str(label_source).replace("\n", " "), 18)
+                    marker = "✅" if creative.get("id") == payload.get("material_id") else "📄"
+                    keyboard.append(
+                        [
+                            {"text": f"{marker} {label}", "callback_data": f"place:pick:{index}"},
+                            {"text": "🗑 归档", "callback_data": f"place:archive:{index}"},
+                        ]
+                    )
                 keyboard.append([{"text": "➕ 添加新广告", "callback_data": "place:new:auto"}])
             else:
                 keyboard.append([{"text": "➕ 添加广告", "callback_data": "place:new:auto"}])
@@ -2839,6 +3047,7 @@ class UpdateHandler:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             channel = self._sync_channel_profile_conn(conn, self._find_channel(conn, channel_identifier))
+            stats = self._channel_dashboard_stats(conn, channel["id"])
         channels = self._publisher_channels_for_user(user_id, self._display_name(user))
         if not any(row["id"] == channel["id"] for row in channels):
             self._reply_or_edit(
@@ -2849,29 +3058,27 @@ class UpdateHandler:
             )
             return
         permission = self._check_channel_permissions(channel["telegram_chat_id"], user_id)
-        rates = self._channel_rates(channel["id"])
-        admin_count = self._channel_admin_count(channel["id"])
-        ready = "✅ 可接广告" if permission["ok"] else "⚠️ 待补权限"
+        ready = "✅ 可接广告" if permission["ok"] and stats["enabled_formats"] else "⚠️ 待补权限/形态"
+        formats_label = "、".join(self._slot_name(f) for f in stats["enabled_formats"]) or "未开启"
         lines = [
             f"📺 {channel['title']}",
             "",
             f"状态：{ready}",
             f"权限：{self._permission_summary(permission)}",
-            f"管理员：{admin_count} 位",
-            "",
-            "💵 当前价",
-            *self._rate_lines(rates),
-            "",
-            f"🔗 {self.channels.start_url(channel)}",
+            f"今日广告：{stats['today_ads']} / {stats['daily_limit']}",
+            f"可投形态：{formats_label}",
+            f"当前档位：{self._price_band_summary(stats['price_bands'])}",
+            f"待确认收益：USD {cents_to_money(stats['pending_earnings_cents'])}",
         ]
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text="\n".join(lines),
             inline_keyboard=[
-                [{"text": "⚙️ 广告形态", "callback_data": f"pub:formats:{channel['ref_token']}"}],
-                [{"text": "💵 价格", "callback_data": f"channel:quote:{channel['id']}"}, {"text": "🔄 检查权限", "callback_data": f"pub:refresh:{channel['ref_token']}"}],
-                [{"text": "💸 收益", "callback_data": "publisher:earnings"}, {"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}],
+                [{"text": "⚙️ 接广告设置", "callback_data": f"pub:approval:{channel['ref_token']}"}, {"text": "💵 价格档位", "callback_data": f"pub:band:{channel['ref_token']}"}],
+                [{"text": "🧩 展示形态", "callback_data": f"pub:formats:{channel['ref_token']}"}, {"text": "⏱ 频控时间", "callback_data": f"pub:limit:{channel['ref_token']}"}],
+                [{"text": "🪧 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}, {"text": "📊 数据", "callback_data": f"pub:stats:{channel['ref_token']}"}],
+                [{"text": "💸 收益明细", "callback_data": f"pub:earnings:{channel['ref_token']}"}, {"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}],
             ],
         )
 
@@ -3102,6 +3309,46 @@ class UpdateHandler:
                 ),
             ),
         )
+    def _channel_dashboard_stats(self, conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
+        config = conn.execute(
+            "SELECT daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        daily_limit = config["daily_ad_limit"] if config else 3
+        today_ads = conn.execute(
+            "SELECT COUNT(*) AS n FROM deliveries WHERE channel_id = ? AND status IN ('sent', 'confirmed') AND DATE(sent_at) = DATE('now')",
+            (channel_id,),
+        ).fetchone()["n"]
+        policies = conn.execute(
+            "SELECT format_type, enabled, owner_price_band FROM channel_ad_format_policies WHERE channel_id = ? ORDER BY format_type",
+            (channel_id,),
+        ).fetchall()
+        enabled_formats = [row["format_type"] for row in policies if row["enabled"]]
+        price_bands = [row["owner_price_band"] for row in policies if row["enabled"]] or [row["owner_price_band"] for row in policies]
+        pending = conn.execute(
+            """
+            SELECT COALESCE(SUM(d.publisher_net_cents - d.publisher_reversed_cents), 0) AS total
+            FROM deliveries d
+            WHERE d.channel_id = ? AND d.status IN ('sent', 'confirmed')
+            """,
+            (channel_id,),
+        ).fetchone()["total"]
+        return {
+            "daily_limit": daily_limit,
+            "today_ads": today_ads,
+            "enabled_formats": enabled_formats,
+            "price_bands": price_bands,
+            "pending_earnings_cents": pending,
+        }
+
+    def _price_band_summary(self, bands: list[str]) -> str:
+        labels = {"low": "低档", "medium": "中档", "high": "高档", "custom": "自定义"}
+        if not bands:
+            return "未设置"
+        unique = list(dict.fromkeys(bands))
+        if len(unique) == 1:
+            return labels.get(unique[0], unique[0])
+        return "混合（" + " / ".join(labels.get(b, b) for b in unique) + "）"
 
     def _refresh_publisher_channel(
         self,
@@ -3115,26 +3362,208 @@ class UpdateHandler:
         self._sync_channel_admins(channel["id"], channel["telegram_chat_id"])
         self._send_publisher_channel_dashboard(chat_id, user, channel["ref_token"], source_message)
 
-    def _send_advertiser_balance(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
+    def _send_advertiser_balance(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+        *,
+        prefix: str | None = None,
+    ) -> None:
         user_id = user.get("id") or chat_id
-        with self.db.transaction() as conn:
-            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", user.get("first_name") or user.get("username"))
+        summary = self.ledger.get_wallet_summary(telegram_user_id=user_id)
+        body = (
+            "💰 广告钱包\n\n"
+            f"💵 可用：USD {cents_to_money(summary['available_balance_cents'])}\n"
+            f"🔒 冻结：USD {cents_to_money(summary['reserved_balance_cents'])}\n"
+            f"📊 已花：USD {cents_to_money(summary['spent_balance_cents'])}"
+        )
+        text = f"{prefix}\n\n{body}" if prefix else body
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[
+                [{"text": "💳 Stars 充值", "callback_data": "wallet:topup"}],
+                [{"text": "🔒 冻结明细", "callback_data": "wallet:reserved"}, {"text": "📜 账单流水", "callback_data": "wallet:statement"}],
+                [{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    WALLET_TOPUP_PRESETS = (100, 500, 1000, 2000)
+
+    def _send_wallet_topup_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        rate = self.settings.star_credit_cents
+        lines = [
+            "💳 Stars 充值",
+            "",
+            f"汇率：1 ⭐ = USD {cents_to_money(rate)} 插播余额",
+            "选一个金额，会发一张 Telegram Stars 发票，付款成功即到账。",
+        ]
+        amount_buttons = [
+            {
+                "text": f"{stars} ⭐ → USD {cents_to_money(stars * rate)}",
+                "callback_data": f"wallet:topup:{stars}",
+            }
+            for stars in self.WALLET_TOPUP_PRESETS
+        ]
+        keyboard = self._button_grid(amount_buttons, 2)
+        keyboard.append([{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _trigger_wallet_topup(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        stars_amount: int,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = user.get("id") or chat_id
+        try:
+            invoice_response = self.stars_payments.create_balance_topup_invoice(
+                telegram_user_id=user_id,
+                stars_amount=stars_amount,
+                display_name=self._display_name(user),
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法发起充值\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+            )
+            return {"handled": True, "type": "callback_wallet_topup_failed", "error": str(exc)}
+        invoice = invoice_response["invoice"]
+        try:
+            invoice_message_id = self.gateway.send_invoice(
+                chat_id=user_id,
+                title=invoice["title"],
+                description=invoice["description"],
+                payload=invoice["payload"],
+                currency=invoice["currency"],
+                prices=invoice["prices"],
+            )
+        except TelegramError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 发票发送失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+            )
+            return {"handled": True, "type": "callback_wallet_topup_failed", "error": str(exc)}
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "💰 广告钱包\n\n"
-                f"💵 可用：USD {account['available_balance_cents'] / 100:.2f}\n"
-                f"🔒 冻结：USD {account['reserved_balance_cents'] / 100:.2f}\n"
-                f"📊 已花：USD {account['spent_balance_cents'] / 100:.2f}"
+                f"💳 已发送 {stars_amount} ⭐ 充值发票\n\n"
+                "在 Telegram 内打开发票完成支付，到账后回到广告钱包查看余额。"
             ),
-            inline_keyboard=[[{"text": "📣 我的广告", "callback_data": "role:advertiser"}, {"text": "🏠 主菜单", "callback_data": "menu:home"}]],
+            inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
         )
+        return {
+            "handled": True,
+            "type": "callback_wallet_topup_invoice_sent",
+            "stars_amount": stars_amount,
+            "invoice_message_id": invoice_message_id,
+        }
+
+    def _send_wallet_reserved(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_reserved_orders(telegram_user_id=user_id)
+        lines = ["🔒 冻结明细", ""]
+        if not rows:
+            lines.append("当前没有冻结的预算。")
+        else:
+            for row in rows:
+                title = row["channel_title"] or "（未知频道）"
+                lines.append(
+                    f"📌 {title}｜{row['currency']} {cents_to_money(row['reserved_cents'])}（订单 {row['order_id']}）"
+                )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[
+                [{"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
+                [{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}],
+            ],
+        )
+
+    def _send_wallet_statement(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_transactions(telegram_user_id=user_id, limit=10)
+        lines = ["📜 账单流水（最近 10 条）", ""]
+        if not rows:
+            lines.append("还没有账务记录。")
+        else:
+            for row in rows:
+                sign = "+" if row["amount_cents"] >= 0 else "-"
+                amount = cents_to_money(abs(row["amount_cents"]))
+                kind = self._wallet_tx_label(row["type"])
+                memo = row["memo"] or ""
+                detail = f" — {memo}" if memo else ""
+                lines.append(f"{sign} {row['currency']} {amount}｜{kind}{detail}")
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[[{"text": "⬅️ 返回钱包", "callback_data": "advertiser:balance"}]],
+        )
+
+    LEDGER_TX_LABELS = {
+        "manual_topup": "人工入账",
+        "stars_topup": "Stars 充值",
+        "budget_reserved": "预算冻结",
+        "budget_released": "释放冻结",
+        "delivery_charged": "投放扣费",
+        "delivery_refunded": "投放退款",
+        "advertiser_subscription_charged": "高级服务扣费",
+        "publisher_pending_earning": "频道入账（待确认）",
+        "publisher_earning_confirmed": "收益确认",
+        "publisher_earning_reversed": "收益回滚",
+        "publisher_subscription_charged": "频道订阅扣费",
+        "publisher_subscription_revenue": "频道订阅收入",
+        "advertiser_subscription_revenue": "广告主订阅收入",
+        "platform_service_fee": "平台服务费",
+        "platform_fee_reversed": "服务费回滚",
+    }
+
+    PUBLISHER_TX_TYPES = {
+        "publisher_pending_earning",
+        "publisher_earning_confirmed",
+        "publisher_earning_reversed",
+        "publisher_subscription_charged",
+    }
+
+    @classmethod
+    def _wallet_tx_label(cls, tx_type: str) -> str:
+        return cls.LEDGER_TX_LABELS.get(tx_type, tx_type)
 
     def _send_publisher_earnings(self, chat_id: str | int, user: dict[str, Any], source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+        summary = self.ledger.get_earnings_summary(telegram_user_id=user_id)
         notification_button = (
             {"text": "🔕 关闭通知", "callback_data": "publisher:disable_income_notifications"}
             if bool(account["publisher_income_notifications_enabled"])
@@ -3144,12 +3573,75 @@ class UpdateHandler:
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "💰 我的钱包\n\n"
-                f"⏳ 待确认：USD {account['pending_earnings_cents'] / 100:.2f}\n"
-                f"✅ 已确认：USD {account['confirmed_earnings_cents'] / 100:.2f}\n"
-                f"💵 可结算：USD {account['releasable_earnings_cents'] / 100:.2f}"
+                "💰 我的钱包\n"
+                "💸 我的收益\n\n"
+                f"⏳ 待确认：USD {cents_to_money(summary['pending_earnings_cents'])}\n"
+                f"✅ 已确认：USD {cents_to_money(summary['confirmed_earnings_cents'])}\n"
+                f"💵 可结算：USD {cents_to_money(summary['releasable_earnings_cents'])}"
             ),
-            inline_keyboard=[[notification_button, {"text": "💰 我的钱包", "callback_data": "publisher:earnings"}]],
+            inline_keyboard=[
+                [{"text": "📊 频道分布", "callback_data": "earnings:channels"}, {"text": "📜 收益流水", "callback_data": "earnings:statement"}],
+                [notification_button, {"text": "📺 频道管理", "callback_data": "publisher:channels"}],
+                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+            ],
+        )
+
+    def _send_earnings_channels(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_channel_earnings(publisher_telegram_user_id=user_id)
+        lines = ["📊 频道分布", ""]
+        keyboard: list[list[dict[str, str]]] = []
+        if not rows:
+            lines.append("还没有可结算的频道。")
+        else:
+            for row in rows:
+                lines.append(
+                    f"📺 {row['title']}\n"
+                    f"  ⏳ 待确认 USD {cents_to_money(row['pending_cents'])}｜"
+                    f"✅ 已确认 USD {cents_to_money(row['confirmed_cents'])}｜"
+                    f"📊 平台已收 USD {cents_to_money(row['platform_fee_cents'])}"
+                )
+                keyboard.append(
+                    [{"text": f"📺 {row['title']}", "callback_data": f"pub:channel:{row['ref_token']}"}]
+                )
+        keyboard.append([{"text": "⬅️ 我的收益", "callback_data": "publisher:earnings"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _send_earnings_statement(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        rows = self.ledger.list_transactions(telegram_user_id=user_id, limit=30)
+        rows = [r for r in rows if r["type"] in self.PUBLISHER_TX_TYPES][:10]
+        lines = ["📜 收益流水（最近 10 条）", ""]
+        if not rows:
+            lines.append("还没有收益记录。")
+        else:
+            for row in rows:
+                sign = "+" if row["amount_cents"] >= 0 else "-"
+                amount = cents_to_money(abs(row["amount_cents"]))
+                kind = self._wallet_tx_label(row["type"])
+                memo = row["memo"] or ""
+                detail = f" — {memo}" if memo else ""
+                lines.append(f"{sign} {row['currency']} {amount}｜{kind}{detail}")
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=[[{"text": "⬅️ 我的收益", "callback_data": "publisher:earnings"}]],
         )
 
     def _handle_conversation_message(self, message: dict[str, Any], text: str) -> dict[str, Any]:
@@ -3366,12 +3858,48 @@ class UpdateHandler:
                 """,
                 (account["id"],),
             ).fetchall()
+
+        # P1-8: aggregate report header so advertiser sees totals at a glance
+        try:
+            report = self.advertisers.report(user_id)
+        except Exception:
+            report = None
+
+        lines: list[str] = []
+        if report:
+            lines.append("📊 投放总览")
+            lines.append(
+                f"• 订单 {report['orders_count']}｜已发 {report['sent_count']}/{report['deliveries_count']}"
+            )
+            lines.append(
+                f"• 总预算 USD {cents_to_money(report['total_budget_cents'])}"
+                f"｜已扣费 USD {cents_to_money(report['charged_cents'])}"
+            )
+            lines.append(f"• 详情页点击 {report['bot_starts']}")
+            if report.get("by_channel") and not report.get("limited"):
+                lines.append("")
+                lines.append("📺 频道分布")
+                for channel_row in report["by_channel"][:5]:
+                    lines.append(
+                        f"• {channel_row['title']}｜{channel_row['orders_count']} 单｜"
+                        f"已扣费 USD {cents_to_money(channel_row['charged_cents'])}"
+                    )
+            elif report.get("limited"):
+                lines.append("")
+                lines.append("ℹ️ 频道分布与完整报表需要 Pro / Enterprise 套餐。")
+            lines.append("")
+
         if rows:
-            lines = ["📋 最近订单"]
+            lines.append("📋 最近订单")
             for row in rows:
-                lines.append(f"• {row['title']}｜{self._status_label(row['status'])}｜预算 {row['budget_cents'] / 100:.2f}｜已花 {row['spent_cents'] / 100:.2f}")
+                lines.append(
+                    f"• {row['title']}｜{self._status_label(row['status'])}"
+                    f"｜预算 USD {cents_to_money(int(row['budget_cents']))}"
+                    f"｜已花 USD {cents_to_money(int(row['spent_cents']))}"
+                )
         else:
-            lines = ["📋 暂无订单\n\n从频道按钮进入即可创建。"]
+            lines.append("📋 暂无订单\n\n从频道按钮进入即可创建。")
+
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -3627,21 +4155,10 @@ class UpdateHandler:
         self._send_main_menu(chat_id, source_message, user)
 
     def _resolve_timezone(self, raw_value: str) -> str | None:
-        value = raw_value.strip()
-        if not value:
-            return None
-        normalized = value.lower().replace("_", " ")
-        aliased = TIMEZONE_ALIASES.get(normalized) or TIMEZONE_ALIASES.get(normalized.replace(" ", ""))
-        timezone_name = aliased or value
-        try:
-            ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
-            return None
-        return timezone_name
+        return resolve_timezone(raw_value)
 
     def _timezone_now(self, timezone_name: str) -> str:
-        now = datetime.now(ZoneInfo(timezone_name))
-        return f"{timezone_name}（{now.strftime('%Y-%m-%d %H:%M')}）"
+        return format_timezone_now(timezone_name)
 
     def _add_channel_url(self) -> str:
         return f"https://t.me/{self.settings.bot_username}?startchannel&admin=post_messages+edit_messages+pin_messages"
@@ -3955,6 +4472,416 @@ class UpdateHandler:
             return
         self._send_publisher_formats(chat_id, user, channel["ref_token"], source_message)
 
+    def _resolve_publisher_channel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        with self.db.transaction() as conn:
+            channel = self._find_channel(conn, channel_identifier)
+        if not self._user_can_manage_channel(user.get("id") or chat_id, channel):
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text="⚠️ 未确认你是该频道管理员。",
+                inline_keyboard=[[{"text": "⬅️ 频道管理", "callback_data": "publisher:channels"}]],
+            )
+            return None
+        return channel
+
+    def _send_publisher_approval_settings(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"⚙️ 接广告设置\n\n频道：{channel['title']}\n\n"
+                "默认：规则内自动接单。\n\n"
+                "需要人工确认的订单：\n"
+                "· 定制插播\n"
+                "· 高风险类目\n"
+                "· 超出当日频控\n\n"
+                "其余订单按当前展示形态、价格档位和频控自动接单。"
+            ),
+            inline_keyboard=[
+                [{"text": "🧩 展示形态", "callback_data": f"pub:formats:{channel['ref_token']}"}, {"text": "💵 价格档位", "callback_data": f"pub:band:{channel['ref_token']}"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
+        )
+
+    def _send_publisher_band_picker(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            policies = conn.execute(
+                """
+                SELECT format_type, owner_price_band, enabled
+                FROM channel_ad_format_policies
+                WHERE channel_id = ?
+                  AND format_type IN ('light_tail', 'standard_card', 'strong_post')
+                ORDER BY format_type
+                """,
+                (channel["id"],),
+            ).fetchall()
+        labels = {"low": "低档 0.85x", "medium": "中档 1.0x", "high": "高档 1.25x"}
+        lines = [f"💵 价格档位\n\n频道：{channel['title']}", ""]
+        keyboard: list[list[dict[str, str]]] = []
+        for policy in policies:
+            current = policy["owner_price_band"] if policy["owner_price_band"] in labels else "medium"
+            status = "✅" if policy["enabled"] else "⛔"
+            lines.append(f"{status} {self._slot_name(policy['format_type'])}：{labels.get(current, current)}")
+            row: list[dict[str, str]] = []
+            for band in ("low", "medium", "high"):
+                marker = "✅ " if current == band else ""
+                row.append(
+                    {
+                        "text": f"{marker}{labels[band].split(' ')[0]}",
+                        "callback_data": f"pub:band:set:{channel['ref_token']}:{policy['format_type']}:{band}",
+                    }
+                )
+            keyboard.append(row)
+        keyboard.append([{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _set_publisher_band(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        format_type: str,
+        band: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        if band not in {"low", "medium", "high"}:
+            self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+            return
+        with self.db.transaction() as conn:
+            policy = conn.execute(
+                "SELECT * FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = ?",
+                (channel["id"], self.channels.normalize_slot_type(format_type)),
+            ).fetchone()
+        if not policy:
+            self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+            return
+        user_id = user.get("id") or chat_id
+        try:
+            self.channels.set_format_policy_for_publisher(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                format_type=format_type,
+                enabled=bool(policy["enabled"]),
+                owner_price_band=band,
+                platform_promo_enabled=bool(policy["platform_promo_enabled"]),
+                custom_multiplier_bps=policy["custom_multiplier_bps"],
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法修改：{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+            )
+            return
+        self._send_publisher_band_picker(chat_id, user, channel["ref_token"], source_message)
+
+    def _send_publisher_limit_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            config = conn.execute(
+                "SELECT daily_ad_limit, allowed_start_hour, allowed_end_hour FROM channel_configs WHERE channel_id = ?",
+                (channel["id"],),
+            ).fetchone()
+        limit = config["daily_ad_limit"] if config else 3
+        start = config["allowed_start_hour"] if config else 9
+        end = config["allowed_end_hour"] if config else 23
+        text = (
+            f"⏱ 频控时间\n\n频道：{channel['title']}\n\n"
+            f"每日最多：{limit} 条\n"
+            f"可投时间：{start:02d}:00 — {end:02d}:00\n\n"
+            "调整每日上限："
+        )
+        adjust_row: list[dict[str, str]] = []
+        for option in (1, 2, 3, 5, 10):
+            marker = "✅ " if option == limit else ""
+            adjust_row.append(
+                {
+                    "text": f"{marker}{option}",
+                    "callback_data": f"pub:limit:set:{channel['ref_token']}:{option}",
+                }
+            )
+        keyboard = [
+            adjust_row,
+            [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+        ]
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=keyboard,
+        )
+
+    def _set_publisher_daily_limit(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        limit: int,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        user_id = user.get("id") or chat_id
+        try:
+            self.channels.set_daily_ad_limit_for_publisher(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                daily_ad_limit=limit,
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 无法修改：{exc}",
+                inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+            )
+            return
+        self._send_publisher_limit_panel(chat_id, user, channel["ref_token"], source_message)
+
+    def _send_publisher_self_promo_panel(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        user_id = user.get("id") or chat_id
+        materials = self.self_promos.list_publishable_materials(
+            publisher_telegram_user_id=user_id
+        )
+        lines = [
+            f"🪧 自用发布\n\n频道：{channel['title']}",
+            "",
+            "给自己的频道发布运营内容或广告。",
+            "自用发布不扣广告费，但会保留插播增长入口。",
+        ]
+        keyboard: list[list[dict[str, str]]] = []
+        if materials:
+            lines.append("")
+            lines.append("选择一条素材发布：")
+            for material in materials:
+                preview = self._short_title((material["text"] or "").replace("\n", " "), 18)
+                label = f"{self._slot_name(material['format_type'])}｜{preview}"
+                keyboard.append(
+                    [
+                        {
+                            "text": f"📤 {label}",
+                            "callback_data": f"pub:self:pick:{channel['ref_token']}:{material['id']}",
+                        }
+                    ]
+                )
+        else:
+            lines.append("")
+            lines.append("还没有可用的标准/定制插播素材。")
+            lines.append("先去【🎯 频道招商】或 CLI 创建一条素材，再回到这里发布。")
+        keyboard.append([{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}])
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text="\n".join(lines),
+            inline_keyboard=keyboard,
+        )
+
+    def _publish_self_promo(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        material_id: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return {"handled": True, "type": "callback_self_promo_unauthorized"}
+        user_id = user.get("id") or chat_id
+        try:
+            prepared = self.self_promos.prepare_publish(
+                publisher_telegram_user_id=user_id,
+                channel_id=channel["id"],
+                material_id=material_id,
+            )
+        except ChaboError as exc:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 自用发布失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}]],
+            )
+            return {"handled": True, "type": "callback_self_promo_failed", "error": str(exc)}
+
+        material = prepared["material"]
+        self_promo_id = prepared["self_promo_id"]
+        sales_url = f"https://t.me/{self.settings.bot_username}?start=ch_{channel['ref_token']}"
+        track_url = f"https://t.me/{self.settings.bot_username}?start=sp_{self_promo_id}"
+        cta_text = (material["button_text"] or "").strip() or "查看详情"
+        keyboard = [
+            [
+                {"text": "📣 频道招商", "url": sales_url},
+                {"text": "🔍 查看详情", "url": track_url},
+            ],
+            [{"text": cta_text, "url": material["target_url"]}],
+        ]
+        from .telegram import TelegramError as _TelegramError  # local import to avoid top-level cycle
+        try:
+            message_id = self.gateway.send_ad(
+                chat_id=channel["telegram_chat_id"],
+                text=material["text"],
+                inline_keyboard=keyboard,
+            )
+        except _TelegramError as exc:
+            self.self_promos.mark_failed(self_promo_id, error=str(exc))
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=f"⚠️ 自用发布失败\n\n{exc}",
+                inline_keyboard=[[{"text": "⬅️ 自用发布", "callback_data": f"pub:self:{channel['ref_token']}"}]],
+            )
+            return {"handled": True, "type": "callback_self_promo_failed", "error": str(exc)}
+
+        self.self_promos.mark_sent(self_promo_id, message_id=message_id)
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"✅ 自用发布成功\n\n频道：{channel['title']}\n"
+                f"素材：{self._short_title((material['text'] or '').replace(chr(10), ' '), 24)}\n"
+                f"消息：{message_id}\n\n"
+                "已附带频道招商 + 查看详情 + 广告主 CTA 三按钮。"
+            ),
+            inline_keyboard=[
+                [{"text": "🔁 再发一条", "callback_data": f"pub:self:{channel['ref_token']}"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
+        )
+        return {
+            "handled": True,
+            "type": "callback_self_promo_published",
+            "self_promo_id": self_promo_id,
+            "message_id": message_id,
+        }
+
+    def _send_publisher_channel_stats(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            stats = self._channel_dashboard_stats(conn, channel["id"])
+            totals = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS sent_total,
+                    COALESCE(SUM(CASE WHEN sent_at >= datetime('now', '-7 days') THEN 1 ELSE 0 END), 0) AS sent_week,
+                    COALESCE(SUM(charge_cents), 0) AS gross_total
+                FROM deliveries
+                WHERE channel_id = ? AND status IN ('sent', 'confirmed')
+                """,
+                (channel["id"],),
+            ).fetchone()
+        text = (
+            f"📊 数据\n\n频道：{channel['title']}\n\n"
+            f"今日已发：{stats['today_ads']} / {stats['daily_limit']}\n"
+            f"近 7 天发布：{totals['sent_week']} 条\n"
+            f"累计发布：{totals['sent_total']} 条\n"
+            f"累计成交：USD {cents_to_money(totals['gross_total'])}\n"
+            f"待确认收益：USD {cents_to_money(stats['pending_earnings_cents'])}"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[[{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}]],
+        )
+
+    def _send_publisher_channel_earnings(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        channel_identifier: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        channel = self._resolve_publisher_channel(chat_id, user, channel_identifier, source_message)
+        if not channel:
+            return
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'sent' THEN publisher_net_cents - publisher_reversed_cents ELSE 0 END), 0) AS pending,
+                    COALESCE(SUM(CASE WHEN status = 'confirmed' THEN publisher_net_cents - publisher_reversed_cents ELSE 0 END), 0) AS confirmed,
+                    COALESCE(SUM(platform_fee_cents - platform_fee_reversed_cents), 0) AS platform_fee
+                FROM deliveries
+                WHERE channel_id = ?
+                """,
+                (channel["id"],),
+            ).fetchone()
+        text = (
+            f"💸 收益明细\n\n频道：{channel['title']}\n\n"
+            f"⏳ 待确认：USD {cents_to_money(row['pending'])}\n"
+            f"✅ 已确认：USD {cents_to_money(row['confirmed'])}\n"
+            f"📊 平台已收：USD {cents_to_money(row['platform_fee'])}"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=text,
+            inline_keyboard=[
+                [{"text": "💸 我的全部收益", "callback_data": "publisher:earnings"}],
+                [{"text": "⬅️ 返回频道", "callback_data": f"pub:channel:{channel['ref_token']}"}],
+            ],
+        )
+
     def _start_order_flow(self, chat_id: str | int, user: dict[str, Any], channel_id: str, source_message: dict[str, Any] | None = None) -> None:
         user_id = user.get("id") or chat_id
         with self.db.transaction() as conn:
@@ -4141,6 +5068,24 @@ class UpdateHandler:
             rate = self.channels.get_rate(conn, channel_id, slot_type)
             return int(rate["unit_price_cents"])
 
+    def _placement_slot_prices(self, channel_id: str) -> dict[str, int]:
+        """Per-slot unit_price_cents for the placement display panel.
+
+        Single query to label all three format buttons with their per-delivery
+        price; the cost panel still computes the full quote (period × pin × ...).
+        """
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.slot_type, r.unit_price_cents
+                FROM ad_slots s
+                JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
+                WHERE s.channel_id = ?
+                """,
+                (channel_id,),
+            ).fetchall()
+        return {row["slot_type"]: int(row["unit_price_cents"]) for row in rows}
+
     def _find_channel(self, conn: Any, identifier: str) -> dict[str, Any]:
         row = conn.execute(
             "SELECT * FROM channels WHERE id = ? OR ref_token = ? OR telegram_chat_id = ? OR username = ?",
@@ -4206,6 +5151,31 @@ class UpdateHandler:
 
     def _short_title(self, title: str, limit: int) -> str:
         return title if len(title) <= limit else title[:limit] + "..."
+
+    def _build_ad_detail_view(
+        self,
+        creative: sqlite3.Row,
+        source_channel: sqlite3.Row,
+    ) -> tuple[str, list[list[dict[str, str]]]]:
+        title = source_channel["title"] or "未命名频道"
+        username = source_channel["username"]
+        channel_label = f"@{username}" if username else title
+        text = "\n".join(
+            [
+                "📄 插播广告详情",
+                "",
+                creative["text"],
+                "",
+                f"📺 来源频道：{title}（{channel_label}）",
+            ]
+        )
+        cta_text = (creative["button_text"] or "").strip() or "查看链接"
+        keyboard = [
+            [{"text": cta_text, "url": creative["target_url"]}],
+            [{"text": "📣 我也想在这个频道投广告", "callback_data": f"channel:order:{source_channel['id']}"}],
+            [{"text": "🏠 工作台", "callback_data": "menu:home"}],
+        ]
+        return text, keyboard
 
     def _creative_status_label(self, status: str) -> str:
         labels = {

@@ -720,6 +720,45 @@ def _0007_guided_placement_assets(conn: sqlite3.Connection) -> None:
     )
 
 
+def _0008_button_tail_defaults(conn: sqlite3.Connection) -> None:
+    channels = conn.execute("SELECT id FROM channels").fetchall()
+    for channel in channels:
+        channel_id = channel["id"]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO ad_slots (id, channel_id, slot_type)
+            VALUES ('slot_' || lower(hex(randomblob(16))), ?, 'button_tail')
+            """,
+            (channel_id,),
+        )
+        slot = conn.execute(
+            "SELECT id FROM ad_slots WHERE channel_id = ? AND slot_type = 'button_tail'",
+            (channel_id,),
+        ).fetchone()
+        if slot:
+            active_rate = conn.execute(
+                "SELECT id FROM rate_cards WHERE slot_id = ? AND active = 1",
+                (slot["id"],),
+            ).fetchone()
+            if not active_rate:
+                conn.execute(
+                    """
+                    INSERT INTO rate_cards (id, slot_id, unit_price_cents, pricing_unit)
+                    VALUES ('rate_' || lower(hex(randomblob(16))), ?, 500, 'per_button')
+                    """,
+                    (slot["id"],),
+                )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channel_ad_format_policies (
+                id, channel_id, format_type, enabled, owner_price_band, platform_promo_enabled
+            )
+            VALUES ('pol_' || lower(hex(randomblob(16))), ?, 'button_tail', 1, 'medium', 1)
+            """,
+            (channel_id,),
+        )
+
+
 MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0001_price_offers_v2", _0001_price_offers_v2),
     ("0002_orders_price_offer_link", _0002_orders_price_offer_link),
@@ -728,4 +767,5 @@ MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0005_creatives_library_columns", _0005_creatives_library_columns),
     ("0006_creative_library_backfill", _0006_creative_library_backfill),
     ("0007_guided_placement_assets", _0007_guided_placement_assets),
+    ("0008_button_tail_defaults", _0008_button_tail_defaults),
 ]

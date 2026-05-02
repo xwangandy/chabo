@@ -1,0 +1,41 @@
+# 插播 FastAPI 网页端 API systemd 服务样例
+#
+# 用法：
+#   sudo cp DOC/部署/systemd-chabo-api.service /etc/systemd/system/chabo-api.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now chabo-api
+#   sudo systemctl status chabo-api
+#
+# 说明：
+# - 该服务只跑 React 网页端使用的 FastAPI JSON API，默认监听 127.0.0.1:8081。
+# - Telegram webhook / 旧 stdlib admin 仍可继续使用 systemd-chabo.service 的 `chabo run-web`。
+# - CHABO_ADMIN_TOKEN / CHABO_BOT_TOKEN / CHABO_API_SECRET_KEY 不要写在 unit 文件里；
+#   放到 /etc/chabo/env，权限建议 0640，owner root:chabo。
+
+[Unit]
+Description=ChaBo Web API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chabo
+Group=chabo
+WorkingDirectory=/opt/chabo
+EnvironmentFile=/etc/chabo/env
+ExecStart=/opt/chabo/.venv/bin/chabo run-api --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=5
+ReadWritePaths=/var/lib/chabo /var/log/chabo
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

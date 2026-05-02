@@ -46,6 +46,21 @@ cp .env.example .env
 chabo init-db
 ```
 
+网页端开发环境（React + FastAPI API）：
+
+```bash
+pip install -e ".[web]"
+chabo run-api --host 127.0.0.1 --port 8081
+
+cd web
+npm install
+npm run dev
+```
+
+打开 `http://127.0.0.1:5173/login`，用 `.env` 里的 `CHABO_ADMIN_TOKEN` 创建本地开发会话。正式登录会切换为 Telegram Mini App / 一次性链接，开发登录只用于本地和联调。
+
+React 网页端生产部署见 [DOC/部署/web-spa-api-deploy.md](DOC/部署/web-spa-api-deploy.md)，包含 SPA 构建产物、`chabo-api.service`、nginx `/api` 反代和 `/api/health` readiness 配置。
+
 生产部署前自检（CI / 部署脚本可 gate）：
 
 ```bash
@@ -333,11 +348,11 @@ CHABO_BOT_USERNAME=ChaBoADBot \
 chabo run-polling --once --timeout 1
 ```
 
-Bot 支持 `/menu`，会展示双身份“📌 插播工作台”：顶部是“➕ 添加频道”，下面是“📺 频道管理 / 📣 我的广告”“💸 我的收益 / 💰 广告钱包”“💵 定价规则 / 🌐 时区”。核心菜单使用短文案和 emoji 引导；主动作整行展示，次级动作两列并排。点击 inline 按钮后会先返回“处理中...”，并优先原地更新当前 Bot 消息，减少刷屏。频道 deep link 进入后，会直接进入“投放配置器”，先完成“给当前频道投广告”：展示设置、发布设置、广告素材、费用确认。钱包和广告库不应抢在第一屏，只有选择素材或余额不足时才进入对应流程。
+Bot 支持 `/menu`。首次进入会先确认时区，再选择当前主要身份：频道主或广告主。之后 `/start` 和 `/menu` 默认进入该身份的独立工作台：频道主只看到添加频道、频道管理、收益和定价；广告主只看到广告投放、广告库、频道广场、收藏夹和广告钱包。身份切换收在设置页，也可用 `/start role` 或 `/start switch` 显式切换，避免在首页同时堆两套角色功能。频道 deep link 进入后，如果用户当前身份是广告主，会直接进入“投放配置器”；如果尚未选择身份，会先完成时区和身份确认。
 
 频道主点击“🔌 手动接入”后会进入接入向导：先把 Bot 加为频道管理员并授予发消息、编辑消息权限，再从频道转发任意消息给 Bot。Bot 会识别频道、检查频道主与 Bot 权限，成功后绑定频道并展示“展示形态”配置入口。
 
-首次 `/start` 会先确认时区，默认 `Asia/Shanghai`；用户可输入北京、Manila、Asia/Tokyo、Europe/Rome 等城市或 IANA 时区名。频道主资产识别：Bot 的 polling/webhook 会接收 `my_chat_member` 和 `chat_member` update。Bot 被加入频道或升为管理员后，会自动绑定频道资产、同步频道管理员列表，并尝试通知已经能私聊 Bot 的管理员。频道主无参数 `/start` 时，如果当前账号是已接入频道管理员，会直接进入“📺 频道管理”并列出频道资产；点击频道可查看入口链接、中文展示形态价格、权限状态和展示形态配置。
+首次 `/start` 会先确认时区，默认 `Asia/Shanghai`；用户可输入北京、Manila、Asia/Tokyo、Europe/Rome 等城市或 IANA 时区名。时区确认后会选择频道主/广告主身份，并保存为当前工作台。频道主资产识别：Bot 的 polling/webhook 会接收 `my_chat_member` 和 `chat_member` update。Bot 被加入频道或升为管理员后，会自动绑定频道资产、同步频道管理员列表，并尝试通知已经能私聊 Bot 的管理员。
 
 `CHABO_TELEGRAM_HTTP_BACKEND=auto` 会优先使用 Python `urllib`，遇到本机证书链问题时自动退回系统 `curl`。
 

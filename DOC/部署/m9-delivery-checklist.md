@@ -1,6 +1,6 @@
 # M9 网页端上线交付清单
 
-更新时间：2026-05-02
+更新时间：2026-05-11
 
 ## 1. 交付范围
 
@@ -74,6 +74,7 @@ bash -n scripts/deploy-web-production.sh scripts/rollback-web-production.sh scri
 - 打开 `/admin#audit`，选择上线时间窗，勾选“严格”，点击“校验链路”。
 - 打开 `/advertiser`，手机宽度下生成计划摘要并确认按钮可用。
 - 打开 `/publisher`，手机宽度下进入频道配置抽屉，确认无横向溢出。
+- 按 `DOC/部署/staging-uat-checklist.md` 用测试 Bot 跑广告主真实路径：找频道、收藏、广告库新建/编辑、批量投放、订单详情、停止投放、申诉、套餐升级发票。
 
 ## 5. 建议提交信息
 
@@ -107,6 +108,7 @@ feat(web): add React portals and FastAPI web API
 ### Deployment Notes
 
 - 生产密钥只写 `/etc/chabo/env`。
+- 生产前必须先在 staging 域名配置测试 Bot webhook 并完成真实 Bot UAT。
 - 发布前执行 `scripts/export-audit-integrity-report.sh` 和 `scripts/rehearse-sqlite-restore.sh`。
 - 正式发布按 `DOC/部署/production-runbook.md` 执行。
 - AG Grid Enterprise 商业授权仍需上线前确认。

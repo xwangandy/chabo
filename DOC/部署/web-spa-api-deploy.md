@@ -116,6 +116,8 @@ chabo verify-web --profile production \
 
 这条命令是生产 gate：任一关键项失败都会返回非零退出码。它会跑 Python 编译、后端单测、前端构建、生产 preflight、审计链完整性校验和 `/api/health`。
 
+`/api/health` 只能证明 FastAPI 网页端可用，不能证明 Telegram webhook 可用。真实发布前还要按 `DOC/部署/staging-uat-checklist.md` 在 staging 域名上启动 `chabo.service`，合并 `/telegram/webhook/<secret>` nginx location，执行 `chabo set-webhook`，并跑广告主 Bot 路径验收。
+
 上线后如需按时间窗复核审计链，可单独执行：
 
 ```bash

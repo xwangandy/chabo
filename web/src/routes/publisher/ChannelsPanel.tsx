@@ -185,7 +185,7 @@ function ChannelSettings({ channelId }: { channelId: string }) {
   const rateMap = new Map(channel.rate_cards.map((item) => [item.slot_type, item]));
   const policyMap = new Map(channel.format_policies.map((item) => [item.format_type, item]));
   const formatRows = [
-    ["light_tail", "文字插播"],
+    ["button_tail", "按钮插播"],
     ["standard_card", "标准插播"],
     ["strong_post", "定制插播"]
   ] as const;

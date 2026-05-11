@@ -13,7 +13,7 @@ interface ChannelRow {
   score: number | null;
   risk_level: string | null;
   standard_price_cents: number | null;
-  light_enabled: boolean;
+  button_enabled: boolean;
   standard_enabled: boolean;
   strong_enabled: boolean;
 }
@@ -98,7 +98,7 @@ export function ChannelMarketGrid() {
         minWidth: 260,
         valueGetter: ({ data }) =>
           [
-            data?.light_enabled ? "文字" : null,
+            data?.button_enabled ? "按钮" : null,
             data?.standard_enabled ? "标准" : null,
             data?.strong_enabled ? "定制" : null
           ]
@@ -129,7 +129,7 @@ export function ChannelMarketGrid() {
   };
   const formatLabels = (channel: ChannelRow) =>
     [
-      channel.light_enabled ? "文字" : null,
+      channel.button_enabled ? "按钮" : null,
       channel.standard_enabled ? "标准" : null,
       channel.strong_enabled ? "定制" : null
     ].filter(Boolean);
@@ -210,7 +210,7 @@ export function ChannelMarketGrid() {
             onChange={setSlotType}
             style={{ width: 140 }}
             options={[
-              { label: "文字插播", value: "light_tail" },
+              { label: "按钮插播", value: "button_tail" },
               { label: "标准插播", value: "standard_card" },
               { label: "定制插播", value: "strong_post" }
             ]}

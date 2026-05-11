@@ -103,7 +103,7 @@ def _ensure_demo_channels(app: ChaboApp, user_id: str, display_name: str) -> lis
             display_name,
         )
         app.channels.update_rate(channel["id"], "standard_card", item["standard_price_cents"])
-        app.channels.update_rate(channel["id"], "light_tail", max(300, item["standard_price_cents"] // 3))
+        app.channels.update_rate(channel["id"], "button_tail", max(500, item["standard_price_cents"] // 2))
         app.channels.update_rate(channel["id"], "strong_post", item["standard_price_cents"] * 2)
         app.channels.set_daily_ad_limit(channel["id"], 6)
         app.channels.set_format_policy(
@@ -115,7 +115,7 @@ def _ensure_demo_channels(app: ChaboApp, user_id: str, display_name: str) -> lis
         )
         app.channels.set_format_policy(
             channel["id"],
-            "light_tail",
+            "button_tail",
             enabled=True,
             owner_price_band="low",
             platform_promo_enabled=True,
@@ -186,12 +186,11 @@ def _ensure_demo_materials(app: ChaboApp, user_id: str, display_name: str) -> di
             "button_text": "查看方案",
             "category": "software",
         },
-        "light_tail": {
-            "text": "M6 演示文字插播详情页，用于手机端快速验证摘要和提交链路。",
-            "target_url": "https://example.com/chabo-light",
+        "button_tail": {
+            "text": "M6 演示按钮插播：只追加按钮入口，用于快速验证详情页和提交链路。",
+            "target_url": "https://example.com/chabo-button",
             "button_text": "了解插播",
             "category": "software",
-            "light_short_text": "频道投放",
         },
         "strong_post": {
             "text": "M6 演示定制插播：适合预算更高、需要强曝光的广告主。",

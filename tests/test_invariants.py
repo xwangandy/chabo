@@ -585,7 +585,7 @@ class AdvertiserNotificationTest(unittest.TestCase):
         )
         all_buttons = [btn for row in keyboard for btn in row]
         format_buttons = [b for b in all_buttons if b["callback_data"].startswith("place:slot:")]
-        self.assertEqual([btn["text"] for btn in format_buttons], ["🔘 按钮插播", "✍️ 文字插播", "✅ 🧾 标准插播", "🎨 定制插播"])
+        self.assertEqual([btn["text"] for btn in format_buttons], ["🔘 按钮插播", "✅ 🧾 标准插播", "🎨 定制插播"])
         for btn in format_buttons:
             self.assertNotIn(" · USD ", btn["text"])
 

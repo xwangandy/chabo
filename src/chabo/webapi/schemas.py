@@ -150,7 +150,7 @@ class ChannelMarketRow(BaseModel):
     score: int | None = None
     risk_level: str | None = None
     standard_price_cents: int | None = None
-    light_enabled: bool = False
+    button_enabled: bool = False
     standard_enabled: bool = False
     strong_enabled: bool = False
 

@@ -24,15 +24,15 @@
 - Bot polling 运行器：支持真实 `getUpdates`、offset 持久化、callback query 和菜单按钮。
 - Bot v1 投放配置器：频道 deep link 会直接进入“给当前频道投放广告”的状态卡，可配置展示形态、发布周期、广告素材和费用确认；旧版预算输入表单仍保留为兼容路径。
 - Bot 频道主接入向导：频道主转发频道消息后，系统检查频道主/Bot 权限，绑定频道，展示插播入口、默认报价和展示形态开关。
-- 内部四种投放位置字段：`button_tail`、`light_tail`、`standard_card`、`strong_post`；用户界面应显示“按钮插播、文字插播、标准插播、定制插播”，`pin24h`、`loop_daily` 只作为投放设置兼容字段。
+- 内部三种投放位置字段：`button_tail`、`standard_card`、`strong_post`；用户界面显示“按钮插播、标准插播、定制插播”，`pin24h`、`loop_daily` 只作为投放设置兼容字段。旧版 `light_tail` 已停用，不再作为新投放入口。
 - 频道定价评估、低/中/高价格档、广告主砍价报价。
 - 频道主高级订阅：按频道订阅人数计算月费，控制关闭推广按钮/自定义价格等高级功能。
 - 频道主接受砍价后，系统自动创建待审核订单并冻结广告主预算。
-- 文字插播探针：频道新帖自动追加低打扰探针按钮，统计点击和独立点击用户。
+- 频道探针按钮：频道新帖自动追加低打扰探针按钮，统计点击和独立点击用户。
 - 广告主高级服务：优质频道发现、频道收藏、新频道提醒、批量投放、投放报表、套餐权限和到期限制。
 - 同一 Telegram 用户可同时作为广告主和频道主，账户角色会合并为 `mixed`。
 - 真实频道联测已验证：频道帖自动追加入口、deep link 归因、自助下单、审核、发布、扣费、低预算提醒、广告详情点击归因、争议和退款。
-- 广告库服务层：广告素材（creatives）按广告主独立归属、按形态（文字/标准/定制）分类、可归档；`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都自带归属校验。下单、批量下单、砍价成交都已经走同一套素材创建路径。
+- 广告库服务层：广告素材（creatives）按广告主独立归属、按形态（按钮/标准/定制）分类、可归档；`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都自带归属校验。下单、批量下单、砍价成交都已经走同一套素材创建路径。
 - 人工入账双人复核：`request-topup` 写一行 pending 不动账本；`approve-topup` 必须由不同账号执行才会调 `manual_topup` 入账；`reject-topup` 不动钱。`/admin` 顶部"待审入账"一栏、CLI 列表都能看到全部待审请求；所有动作都进 `tool_call_logs` 审计。
 - 生产部署样例：`DOC/部署/systemd-chabo.service`、`DOC/部署/nginx-chabo.conf`、`DOC/部署/token-rotation.md` 给出 systemd 服务 / nginx 反向代理 / admin & webhook secret 轮换的完整样板和应急清单。
 
@@ -241,13 +241,13 @@ chabo show-subscription --channel <ref_token>
 
 `activate-subscription` 保留为运营后台手动开通入口；正式购买路径使用 `purchase-subscription`，会从频道主余额扣款并把收入写入平台账本。
 
-创建文字插播探针并查看点击统计：
+创建频道探针按钮并查看点击统计：
 
 ```bash
 chabo create-probe \
   --channel <ref_token> \
   --short-text "想在这个频道投广告？" \
-  --detail-text "这里是文字插播详情页文案" \
+  --detail-text "这里是探针详情页文案" \
   --target-url "https://example.com" \
   --button-text "想投广告？"
 
@@ -321,9 +321,8 @@ chabo create-material \
 
 chabo create-material \
   --advertiser-telegram-user-id 10001 \
-  --format-type light_tail \
-  --light-short-text "想投这里？" \
-  --text "完整文字插播详情文案" \
+  --format-type button_tail \
+  --text "按钮插播详情文案" \
   --target-url "https://example.com"
 
 chabo list-materials --advertiser-telegram-user-id 10001
@@ -331,7 +330,7 @@ chabo show-material --material-id <material_id> --advertiser-telegram-user-id 10
 chabo archive-material --material-id <material_id> --advertiser-telegram-user-id 10001
 ```
 
-`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都按 `advertiser_telegram_user_id` 校验归属。文字插播必须配 2-15 字短入口；标准/定制插播不带短入口。归档后的素材不能再用于新订单，但仍能通过 `--include-archived` 看到。
+`MaterialService` 是 Bot、CLI、Admin 和未来 AI 助理共用的素材入口，所有方法都按 `advertiser_telegram_user_id` 校验归属。按钮/标准/定制素材都使用广告文案、目标链接和按钮文案；归档后的素材不能再用于新订单，但仍能通过 `--include-archived` 看到。
 
 创建订单、审核并调度：
 

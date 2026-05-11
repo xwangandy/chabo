@@ -2167,7 +2167,7 @@ class UpdateHandler:
             payload["slot_type"] = slot_type
             if slot_type not in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = False
-            if slot_type != previous_slot:
+            if previous_slot and slot_type != previous_slot:
                 self._swap_placement_creative_draft(payload, previous_slot, slot_type)
             self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
             return {"handled": True, "type": "callback_placement_slot", "slot_type": slot_type}

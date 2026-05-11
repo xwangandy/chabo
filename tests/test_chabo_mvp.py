@@ -696,6 +696,8 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(
             main_buttons,
             [
+                "🔍 找频道",
+                "⭐ 我的收藏",
                 "➕ 广告投放",
                 "🗂 广告库",
                 "📋 投放订单",
@@ -703,6 +705,7 @@ class ChaboMvpTest(unittest.TestCase):
                 "⭐ 频道收藏夹",
                 "🌐 打开网页端",
                 "💰 广告钱包",
+                "📦 我的套餐",
                 "⚙️ 设置",
             ],
         )

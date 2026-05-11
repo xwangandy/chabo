@@ -86,23 +86,27 @@ class FulfillmentService:
         ad_text = creative["text"]
         message_id: str
         if slot["slot_type"] in {"light_tail", "button_tail"}:
-            short_text = creative["light_short_text"] or creative["short_text"] or creative["button_text"] or "查看详情"
+            button_text = (
+                creative["button_text"]
+                or creative["light_short_text"]
+                or creative["short_text"]
+                or "查看详情"
+            ).strip() or "查看详情"
             inserted_message_id = self._insert_tail_into_latest_post(
                 conn,
                 channel,
-                short_text if slot["slot_type"] == "light_tail" else None,
-                "查看完整广告" if slot["slot_type"] == "light_tail" else creative["button_text"] or "查看详情",
+                button_text,
                 track_url,
             )
             if inserted_message_id:
                 message_id = inserted_message_id
             else:
-                ad_text = f"🔖 {short_text}" if slot["slot_type"] == "light_tail" else f"🔗 {creative['button_text'] or '查看详情'}"
+                ad_text = f"🔗 {button_text}"
                 try:
                     message_id = self.gateway.send_ad(
                         chat_id=channel["telegram_chat_id"],
                         text=ad_text,
-                        inline_keyboard=[[{"text": "查看完整广告" if slot["slot_type"] == "light_tail" else creative["button_text"] or "查看详情", "url": track_url}]],
+                        inline_keyboard=[[{"text": button_text, "url": track_url}]],
                     )
                 except TelegramError as exc:
                     self._mark_delivery_failed(conn, delivery, order, str(exc))
@@ -212,7 +216,6 @@ class FulfillmentService:
         self,
         conn: sqlite3.Connection,
         channel: sqlite3.Row,
-        short_text: str | None,
         button_text: str,
         track_url: str,
     ) -> str | None:
@@ -226,10 +229,7 @@ class FulfillmentService:
         original_text = str(latest.get("text") or "").strip()
         if not original_text:
             return None
-        insertion = f"🔖 {short_text}" if short_text else ""
-        updated_text = original_text if not insertion or insertion in original_text else f"{original_text}\n\n{insertion}"
-        if len(updated_text) > 3900:
-            return None
+        updated_text = original_text
         keyboard = latest.get("inline_keyboard") or []
         detail_button = {"text": button_text, "url": track_url}
         if not any(button.get("url") == track_url for row_buttons in keyboard for button in row_buttons):

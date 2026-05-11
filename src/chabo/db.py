@@ -1030,6 +1030,13 @@ def _0012_audit_query_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created ON audit_logs(action, created_at)")
 
 
+def _0013_disable_light_tail_format(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE ad_slots SET enabled = 0 WHERE slot_type = 'light_tail'")
+    conn.execute(
+        "UPDATE channel_ad_format_policies SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE format_type = 'light_tail'"
+    )
+
+
 MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0001_price_offers_v2", _0001_price_offers_v2),
     ("0002_orders_price_offer_link", _0002_orders_price_offer_link),
@@ -1043,4 +1050,5 @@ MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0010_accounts_active_role", _0010_accounts_active_role),
     ("0011_audit_hash_chain", _0011_audit_hash_chain),
     ("0012_audit_query_indexes", _0012_audit_query_indexes),
+    ("0013_disable_light_tail_format", _0013_disable_light_tail_format),
 ]

@@ -21,7 +21,6 @@ interface MaterialForm {
   text: string;
   target_url: string;
   button_text: string;
-  light_short_text?: string;
 }
 
 export function MaterialsPanel() {
@@ -65,7 +64,7 @@ export function MaterialsPanel() {
           <Select
             style={{ width: 140 }}
             options={[
-              { label: "文字插播", value: "light_tail" },
+              { label: "按钮插播", value: "button_tail" },
               { label: "标准插播", value: "standard_card" },
               { label: "定制插播", value: "strong_post" }
             ]}
@@ -76,9 +75,6 @@ export function MaterialsPanel() {
         </Form.Item>
         <Form.Item name="target_url" rules={[{ required: true }]}>
           <Input placeholder="目标链接" style={{ width: 220 }} />
-        </Form.Item>
-        <Form.Item name="light_short_text">
-          <Input placeholder="文字插播短入口" style={{ width: 160 }} />
         </Form.Item>
         <Form.Item name="button_text">
           <Input placeholder="按钮文字" style={{ width: 120 }} />

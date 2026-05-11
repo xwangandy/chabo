@@ -21,7 +21,7 @@ STALE_CHANNEL_POST_SECONDS = 10 * 60
 
 
 SLOT_DISPLAY_NAMES = {
-    "light_tail": "文字插播",
+    "light_tail": "旧版插播（已停用）",
     "button_tail": "按钮插播",
     "standard": "标准插播",
     "standard_card": "标准插播",
@@ -31,7 +31,7 @@ SLOT_DISPLAY_NAMES = {
 }
 
 SLOT_EMOJIS = {
-    "light_tail": "✍️",
+    "light_tail": "🔘",
     "button_tail": "🔘",
     "standard": "🧾",
     "standard_card": "🧾",
@@ -40,18 +40,17 @@ SLOT_EMOJIS = {
     "loop_daily": "🔁",
 }
 
-PLACEMENT_SLOT_TYPES = ("strong_post", "standard_card", "button_tail", "light_tail")
+PLACEMENT_SLOT_TYPES = ("button_tail", "standard_card", "strong_post")
 PINNABLE_PLACEMENT_SLOTS = {"standard_card", "strong_post"}
 SCHEDULED_PLACEMENT_SLOTS = {"standard_card", "strong_post"}
-CHANNEL_PACED_PLACEMENT_SLOTS = {"button_tail", "light_tail"}
-PLACEMENT_ASSET_STEPS = ("ad_name", "media_detail", "detail_text", "target_url", "button_text", "short_text", "standard_text")
+CHANNEL_PACED_PLACEMENT_SLOTS = {"button_tail"}
+PLACEMENT_ASSET_STEPS = ("ad_name", "media_detail", "detail_text", "target_url", "button_text", "standard_text")
 PLACEMENT_ASSET_STEP_FIELDS = {
     "ad_name": ("creative_name",),
     "media_detail": ("media_file_id", "media_type"),
     "detail_text": ("creative_text",),
     "target_url": ("target_url",),
     "button_text": ("button_text",),
-    "short_text": ("light_short_text",),
     "standard_text": ("standard_text",),
 }
 PLACEMENT_PERIODS = {
@@ -1179,11 +1178,11 @@ class UpdateHandler:
               ON r.slot_id = s.id
              AND r.active = 1
             WHERE p.channel_id = ? AND p.enabled = 1
+              AND p.format_type IN ('button_tail', 'standard_card', 'strong_post')
             ORDER BY CASE p.format_type
                 WHEN 'button_tail' THEN 1
-                WHEN 'light_tail' THEN 2
-                WHEN 'standard_card' THEN 3
-                WHEN 'strong_post' THEN 4
+                WHEN 'standard_card' THEN 2
+                WHEN 'strong_post' THEN 3
                 ELSE 9
             END
             """,
@@ -1944,10 +1943,9 @@ class UpdateHandler:
             keyboard = [
                 [
                     {"text": self._placement_slot_button_text("button_tail", selected), "callback_data": "launch:slot:button_tail"},
-                    {"text": self._placement_slot_button_text("light_tail", selected), "callback_data": "launch:slot:light_tail"},
+                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "launch:slot:standard_card"},
                 ],
                 [
-                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "launch:slot:standard_card"},
                     {"text": self._placement_slot_button_text("strong_post", selected), "callback_data": "launch:slot:strong_post"},
                 ],
             ]
@@ -2171,6 +2169,9 @@ class UpdateHandler:
         if data.startswith("place:slot:"):
             previous_slot = self.channels.normalize_slot_type(payload.get("slot_type") or "")
             slot_type = self.channels.normalize_slot_type(data.removeprefix("place:slot:"))
+            if slot_type not in PLACEMENT_SLOT_TYPES:
+                self._send_placement_configurator(chat_id, user, message, payload=payload, panel="display")
+                return {"handled": True, "type": "callback_placement_invalid_slot", "slot_type": slot_type}
             payload["slot_type"] = slot_type
             if slot_type not in PINNABLE_PLACEMENT_SLOTS:
                 payload["pin"] = False
@@ -2469,6 +2470,9 @@ class UpdateHandler:
 
         if data.startswith("launch:slot:"):
             slot_type = self.channels.normalize_slot_type(data.removeprefix("launch:slot:"))
+            if slot_type not in PLACEMENT_SLOT_TYPES:
+                self._send_global_placement(chat_id, user, message, payload=payload, panel="display")
+                return {"handled": True, "type": "callback_global_placement_invalid_slot", "slot_type": slot_type}
             payload["slot_type"] = slot_type
             payload["pin"] = False
             if payload.get("selected_collection_id"):
@@ -2710,18 +2714,9 @@ class UpdateHandler:
                 )
                 return {"handled": True, "type": "placement_invalid_button_text"}
             payload["button_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "placement_config", "short_text", payload)
-            self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "short_text"), inline_keyboard=self._placement_asset_keyboard("short_text"))
-            return {"handled": True, "type": "placement_button_text_saved"}
-
-        if step == "short_text":
-            if len(clean_text) < 2 or len(clean_text) > 15:
-                self.gateway.send_private_message(chat_id=chat_id, text="一句话广告需要 2-15 个字，会用于文字插播入口。", inline_keyboard=self._placement_asset_keyboard(step))
-                return {"handled": True, "type": "placement_invalid_short_text"}
-            payload["light_short_text"] = clean_text
             self._set_conversation(chat_id, state["account_id"], "placement_config", "standard_text", payload)
             self.gateway.send_private_message(chat_id=chat_id, text=self._placement_creative_prompt(payload, "standard_text"), inline_keyboard=self._placement_asset_keyboard("standard_text"))
-            return {"handled": True, "type": "placement_short_text_saved"}
+            return {"handled": True, "type": "placement_button_text_saved"}
 
         if step == "standard_text":
             if len(clean_text) < 4 or len(clean_text) > 220 or clean_text.count("\n") > 4:
@@ -2764,7 +2759,6 @@ class UpdateHandler:
             ("creative_text", "详细介绍"),
             ("target_url", "跳转链接"),
             ("button_text", "按钮名称"),
-            ("light_short_text", "一句话广告"),
             ("standard_text", "简短文案"),
         ]
         def is_done(key: str) -> bool:
@@ -2780,7 +2774,6 @@ class UpdateHandler:
             "detail_text": "creative_text",
             "target_url": "target_url",
             "button_text": "button_text",
-            "short_text": "light_short_text",
             "standard_text": "standard_text",
         }
         current_key = step_keys.get(step, "creative_name")
@@ -2792,7 +2785,6 @@ class UpdateHandler:
             "detail_text": "媒体已收到。请发送详细介绍，定制插播和广告详情页会使用这段内容。",
             "target_url": "发送跳转链接，必须以 http:// 或 https:// 开头。读者在广告详情里点击按钮会打开这个链接。",
             "button_text": "发送按钮名称，2-5 个字。这里只填按钮上显示的文字，例如：咨询、查看、领取、下单。",
-            "short_text": "发送一句话广告，2-15 个字。它会显示在文字插播入口里，不是按钮名，也不是链接。",
             "standard_text": "发送简短文案，4-220 个字、最多 5 行。它会配合媒体和按钮组成较克制的标准插播。",
         }
         return "\n".join(
@@ -3263,10 +3255,9 @@ class UpdateHandler:
             keyboard: list[list[dict[str, str]]] = [
                 [
                     {"text": self._placement_slot_button_text("button_tail", selected), "callback_data": "place:slot:button_tail"},
-                    {"text": self._placement_slot_button_text("light_tail", selected), "callback_data": "place:slot:light_tail"},
+                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "place:slot:standard_card"},
                 ],
                 [
-                    {"text": self._placement_slot_button_text("standard_card", selected), "callback_data": "place:slot:standard_card"},
                     {"text": self._placement_slot_button_text("strong_post", selected), "callback_data": "place:slot:strong_post"},
                 ],
             ]
@@ -3624,10 +3615,6 @@ class UpdateHandler:
             "prompt": "请发送新的目标链接，必须以 http:// 或 https:// 开头。",
         },
         "button_text": {"label": "🔘 按钮文案", "prompt": "请发送新的按钮文案。"},
-        "light_short_text": {
-            "label": "✨ 短入口",
-            "prompt": "请发送新的短入口（2-15 个字，仅文字插播）。",
-        },
     }
 
     @staticmethod
@@ -3687,16 +3674,12 @@ class UpdateHandler:
             f"链接：{material['target_url'] or '—'}",
             f"按钮文案：{material['button_text']}",
         ]
-        if material["format_type"] == "light_tail":
-            body_lines.append(f"短入口：{material['light_short_text'] or '—'}")
         body_lines.extend([
             "",
             "选一个字段修改。已发布订单的展示快照不变，仅影响后续投放。",
         ])
 
         field_keys = ["text", "target_url", "button_text"]
-        if material["format_type"] == "light_tail":
-            field_keys.append("light_short_text")
         field_buttons = [
             {
                 "text": self.MATERIAL_EDIT_FIELDS[key]["label"],
@@ -3735,10 +3718,6 @@ class UpdateHandler:
         if material["archived_at"]:
             self._send_material_edit_panel(chat_id, user, material_id, source_message)
             return
-        if field == "light_short_text" and material["format_type"] != "light_tail":
-            self._send_material_edit_panel(chat_id, user, material_id, source_message)
-            return
-
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(
                 conn, user_id, "advertiser", self._display_name(user)
@@ -3825,12 +3804,12 @@ class UpdateHandler:
         text = (
             "➕ 新建素材\n\n"
             "选择形态。素材会保存到你的广告库，下单时可重复挑选。\n"
-            "• 文字插播：频道帖底部短入口，点击进入详情\n"
+            "• 按钮插播：只追加按钮入口，点击进入详情\n"
             "• 标准插播：图文卡片，平台模板\n"
             "• 定制插播：广告主自由排版"
         )
         keyboard = [
-            [{"text": "✍️ 文字插播", "callback_data": "advertiser:material:new:light_tail"}],
+            [{"text": "🔘 按钮插播", "callback_data": "advertiser:material:new:button_tail"}],
             [{"text": "🧾 标准插播", "callback_data": "advertiser:material:new:standard_card"}],
             [{"text": "🎨 定制插播", "callback_data": "advertiser:material:new:strong_post"}],
             [{"text": "🗂 返回广告库", "callback_data": "advertiser:library"}],
@@ -3853,7 +3832,7 @@ class UpdateHandler:
             self._send_material_format_picker(chat_id, user, source_message)
             return
         user_id = user.get("id") or chat_id
-        first_step = "light_short_text" if format_type == "light_tail" else "creative_text"
+        first_step = "creative_text"
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(
                 conn, user_id, "advertiser", self._display_name(user)
@@ -3866,18 +3845,11 @@ class UpdateHandler:
                 first_step,
                 {"format_type": format_type},
             )
-        if format_type == "light_tail":
-            prompt = (
-                "✍️ 新建文字插播\n\n"
-                "短入口最多 15 个字，会显示在频道帖底部。\n"
-                "请发送短入口。"
-            )
-        else:
-            label = self._slot_name(format_type)
-            prompt = (
-                f"➕ 新建{label}素材\n\n"
-                "请发送广告文案（4-800 字）。下一步会要链接和按钮文案。"
-            )
+        label = self._slot_name(format_type)
+        prompt = (
+            f"➕ 新建{label}素材\n\n"
+            "请发送广告文案（4-800 字）。下一步会要链接和按钮文案。"
+        )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -3913,40 +3885,10 @@ class UpdateHandler:
             )
             return {"handled": True, "type": "material_create_text_required"}
 
-        if step == "light_short_text":
-            if len(clean_text) < 2 or len(clean_text) > 15:
-                self.gateway.send_private_message(
-                    chat_id=chat_id,
-                    text="文字插播短入口需要 2-15 个字。",
-                    inline_keyboard=cancel_keyboard,
-                )
-                return {"handled": True, "type": "material_create_invalid_short"}
-            payload["light_short_text"] = clean_text
-            payload["button_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "material_create", "light_detail_text", payload)
-            self.gateway.send_private_message(
-                chat_id=chat_id,
-                text="✅ 短入口已保存\n\n请发送完整广告详情（4-1000 字），用户点击短入口后会看到这段。",
-                inline_keyboard=cancel_keyboard,
-            )
-            return {"handled": True, "type": "material_create_short_saved"}
-
-        if step == "light_detail_text":
-            if len(clean_text) < 4 or len(clean_text) > 1000:
-                self.gateway.send_private_message(
-                    chat_id=chat_id,
-                    text="广告详情需要 4-1000 个字。",
-                    inline_keyboard=cancel_keyboard,
-                )
-                return {"handled": True, "type": "material_create_invalid_detail"}
-            payload["creative_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "material_create", "target_url", payload)
-            self.gateway.send_private_message(
-                chat_id=chat_id,
-                text="请发送广告目标链接，必须以 http:// 或 https:// 开头。",
-                inline_keyboard=cancel_keyboard,
-            )
-            return {"handled": True, "type": "material_create_detail_saved"}
+        if format_type not in MaterialService.SUPPORTED_FORMATS or step in {"light_short_text", "light_detail_text"}:
+            self._clear_material_create_state(chat_id)
+            self._send_material_format_picker(chat_id, user, None)
+            return {"handled": True, "type": "material_create_legacy_format_disabled"}
 
         if step == "creative_text":
             if len(clean_text) < 4 or len(clean_text) > 800:
@@ -5084,41 +5026,22 @@ class UpdateHandler:
         step = state["step"]
         clean_text = text.strip()
         if step == "light_short_text":
-            if len(clean_text) < 2:
-                self.gateway.send_private_message(chat_id=chat_id, text="轻插播短入口太短了，请输入 2-15 个字。", inline_keyboard=self._cancel_keyboard())
-                return {"handled": True, "type": "order_form_invalid_light_short_text"}
-            if len(clean_text) > 15:
-                self.gateway.send_private_message(chat_id=chat_id, text="轻插播短入口最多 15 个字，请重新发送。", inline_keyboard=self._cancel_keyboard())
-                return {"handled": True, "type": "order_form_invalid_light_short_text"}
-            payload["light_short_text"] = clean_text
-            payload["button_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "create_order", "light_detail_text", payload)
+            self._clear_conversation(chat_id)
             self.gateway.send_private_message(
                 chat_id=chat_id,
-                text=(
-                    "✅ 短入口已保存\n\n"
-                    "请发送完整广告详情。\n"
-                    "用户点击轻插播后，会在 Bot 里看到这段完整内容。"
-                ),
-                inline_keyboard=self._cancel_keyboard(),
+                text="旧版创建步骤已停用，请重新选择按钮插播、标准插播或定制插播。",
+                inline_keyboard=[[{"text": "🏠 工作台", "callback_data": "menu:home"}]],
             )
-            return {"handled": True, "type": "order_form_light_short_text_saved"}
+            return {"handled": True, "type": "order_form_legacy_light_disabled"}
 
         if step == "light_detail_text":
-            if len(clean_text) < 4:
-                self.gateway.send_private_message(chat_id=chat_id, text="广告详情太短了，请至少输入 4 个字。", inline_keyboard=self._cancel_keyboard())
-                return {"handled": True, "type": "order_form_invalid_light_detail"}
-            if len(clean_text) > 1000:
-                self.gateway.send_private_message(chat_id=chat_id, text="广告详情太长了，请控制在 1000 字以内。", inline_keyboard=self._cancel_keyboard())
-                return {"handled": True, "type": "order_form_invalid_light_detail"}
-            payload["creative_text"] = clean_text
-            self._set_conversation(chat_id, state["account_id"], "create_order", "target_url", payload)
+            self._clear_conversation(chat_id)
             self.gateway.send_private_message(
                 chat_id=chat_id,
-                text="请发送广告目标链接，用户看完完整广告后可继续打开。必须以 http:// 或 https:// 开头。",
-                inline_keyboard=self._cancel_keyboard(),
+                text="旧版创建步骤已停用，请重新选择按钮插播、标准插播或定制插播。",
+                inline_keyboard=[[{"text": "🏠 工作台", "callback_data": "menu:home"}]],
             )
-            return {"handled": True, "type": "order_form_light_detail_saved"}
+            return {"handled": True, "type": "order_form_legacy_light_disabled"}
 
         if step == "creative_text":
             if len(clean_text) < 4:
@@ -5166,7 +5089,7 @@ class UpdateHandler:
                     target_url=payload["target_url"],
                     button_text=payload.get("button_text", "查看详情"),
                     budget_cents=budget_cents,
-                    campaign_name="Bot 自助轻插播广告" if payload["slot_type"] == "light_tail" else "Bot 自助插播广告",
+                    campaign_name="Bot 自助插播广告",
                 )
                 if self.settings.bot_auto_approve_orders:
                     order = self.orders.approve_order(order["id"])
@@ -6316,7 +6239,7 @@ class UpdateHandler:
                 JOIN ad_slots s ON s.channel_id = p.channel_id AND s.slot_type = p.format_type
                 JOIN rate_cards r ON r.slot_id = s.id AND r.active = 1
                 WHERE p.channel_id = ?
-                  AND p.format_type IN ('light_tail', 'button_tail', 'standard_card', 'strong_post')
+                  AND p.format_type IN ('button_tail', 'standard_card', 'strong_post')
                 ORDER BY p.format_type
                 """,
                 (channel["id"],),
@@ -6448,7 +6371,7 @@ class UpdateHandler:
                 SELECT format_type, owner_price_band, enabled
                 FROM channel_ad_format_policies
                 WHERE channel_id = ?
-                  AND format_type IN ('light_tail', 'standard_card', 'strong_post')
+                  AND format_type IN ('button_tail', 'standard_card', 'strong_post')
                 ORDER BY format_type
                 """,
                 (channel["id"],),
@@ -6875,21 +6798,12 @@ class UpdateHandler:
             payload = json.loads(state["payload_json"] or "{}")
             account_id = state["account_id"]
         normalized_slot = self.channels.normalize_slot_type(payload["slot_type"])
-        first_step = "light_short_text" if normalized_slot == "light_tail" else "creative_text"
+        first_step = "creative_text"
         self._set_conversation(chat_id, account_id, "create_order", first_step, payload)
-        if normalized_slot == "light_tail":
-            text = (
-                "➕ 新建轻插播广告\n\n"
-                "轻插播会在频道最新帖子底部放一行短入口，尽量不打扰阅读。\n"
-                "用户点击后，会打开 Bot 里的完整广告详情。\n\n"
-                "第一步：请发送 15 个字以内的短入口。\n"
-                "例如：领资料、点我下单、限时福利"
-            )
-        else:
-            text = (
-                f"➕ 新建{self._slot_name(normalized_slot)}广告\n\n"
-                "请发送广告文案。"
-            )
+        text = (
+            f"➕ 新建{self._slot_name(normalized_slot)}广告\n\n"
+            "请发送广告文案。"
+        )
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
@@ -7034,6 +6948,7 @@ class UpdateHandler:
         slot_buttons = [
             {"text": self._slot_label(rate["slot_type"]), "callback_data": f"order:slot:{channel_id}:{rate['slot_type']}"}
             for rate in rates
+            if self.channels.normalize_slot_type(rate["slot_type"]) in PLACEMENT_SLOT_TYPES
         ]
         keyboard = self._button_grid(slot_buttons, 2)
         keyboard.append([{"text": "💵 价格说明", "callback_data": f"channel:quote:{channel_id}"}, {"text": "🏠 工作台", "callback_data": "menu:home"}])

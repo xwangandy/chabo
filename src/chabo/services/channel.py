@@ -40,7 +40,6 @@ class ChannelService:
         "scheduled": "standard_card",
     }
     DEFAULT_RATES = {
-        "light_tail": ("per_tail", 300),
         "button_tail": ("per_button", 500),
         "standard_card": ("per_post", 1_000),
         "strong_post": ("per_post", 1_800),
@@ -386,7 +385,7 @@ class ChannelService:
             return
 
         slot_label = {
-            "light_tail": "文字插播",
+            "light_tail": "旧版插播（已停用）",
             "button_tail": "按钮插播",
             "standard_card": "标准插播",
             "strong_post": "定制插播",
@@ -561,6 +560,8 @@ class ChannelService:
 
     def update_rate(self, channel_id: str, slot_type: str, unit_price_cents: int) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
+        if slot_type not in self.DEFAULT_RATES:
+            raise NotFound(f"slot not found: {slot_type}")
         if unit_price_cents <= 0:
             raise InvalidState("刊例价必须大于 0")
         with self.db.transaction() as conn:
@@ -784,11 +785,11 @@ class LightProbeService:
         end_at: datetime | None = None,
     ) -> dict[str, Any]:
         if not short_text.strip():
-            raise InvalidState("轻插播探针必须有短文案")
+            raise InvalidState("频道探针必须有短文案")
         if not detail_text.strip():
-            raise InvalidState("轻插播探针必须有详情文案")
+            raise InvalidState("频道探针必须有详情文案")
         if not target_url.strip():
-            raise InvalidState("轻插播探针必须有目标链接")
+            raise InvalidState("频道探针必须有目标链接")
         with self.db.transaction() as conn:
             self.channels.get_channel(conn, channel_id)
             probe_id = new_id("lp")
@@ -1075,7 +1076,6 @@ class PricingService:
         "general": 180,
     }
     FORMAT_FACTORS_BPS = {
-        "light_tail": 3000,
         "button_tail": 5000,
         "standard_card": 10000,
         "strong_post": 18000,

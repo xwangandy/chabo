@@ -43,13 +43,11 @@ class MaterialService:
 
     Stable boundary for Bot, CLI, Admin and future AI tool calls. All
     public methods validate ownership through advertiser_telegram_user_id.
-    Format codes are internal: light_tail (文字插播), standard_card (标准插播),
+    Format codes are internal: button_tail (按钮插播), standard_card (标准插播),
     strong_post (定制插播); display layers translate to Chinese product names.
     """
 
-    SUPPORTED_FORMATS = ("light_tail", "button_tail", "standard_card", "strong_post")
-    LIGHT_SHORT_TEXT_MIN = 2
-    LIGHT_SHORT_TEXT_MAX = 15
+    SUPPORTED_FORMATS = ("button_tail", "standard_card", "strong_post")
     LIBRARY_CAMPAIGN_NAME = "插播素材库"
 
     def __init__(self, db: Database, settings: Settings):
@@ -89,19 +87,7 @@ class MaterialService:
             text, target_url, button_text, category = self._normalize_text_fields(
                 text, target_url, button_text, category
             )
-            if format_type == "light_tail":
-                short = (light_short_text or "").strip()
-                if len(short) < self.LIGHT_SHORT_TEXT_MIN:
-                    raise InvalidState(
-                        f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
-                    )
-                if len(short) > self.LIGHT_SHORT_TEXT_MAX:
-                    raise InvalidState(
-                        f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
-                    )
-                light_short_text = short
-            else:
-                light_short_text = None
+            light_short_text = None
 
             with self.db.transaction() as conn:
                 advertiser = self.accounts.get_or_create_by_telegram(
@@ -169,6 +155,10 @@ class MaterialService:
             if format_type is not None:
                 sql += " AND cr.format_type = ?"
                 params.append(self._normalize_format(format_type))
+            else:
+                placeholders = ",".join("?" for _ in self.SUPPORTED_FORMATS)
+                sql += f" AND cr.format_type IN ({placeholders})"
+                params.extend(self.SUPPORTED_FORMATS)
             if not include_archived:
                 sql += " AND cr.archived_at IS NULL"
             sql += " ORDER BY cr.created_at DESC LIMIT ?"
@@ -252,7 +242,7 @@ class MaterialService:
         )
         return material
 
-    EDITABLE_FIELDS = ("text", "target_url", "button_text", "light_short_text")
+    EDITABLE_FIELDS = ("text", "target_url", "button_text")
 
     def update_material(
         self,
@@ -284,6 +274,8 @@ class MaterialService:
             "updated_fields": [k for k, v in provided.items() if v is not None],
         }
         try:
+            if light_short_text is not None:
+                raise InvalidState("短入口字段已停用，请改用按钮插播素材")
             if not any(v is not None for v in provided.values()):
                 raise InvalidState("没有可更新的字段")
             with self.db.transaction() as conn:
@@ -301,6 +293,8 @@ class MaterialService:
                     raise NotFound(f"广告素材不存在：{material_id}")
                 if row["archived_at"]:
                     raise InvalidState("已归档的素材无法编辑，请新建一条素材。")
+                if row["format_type"] not in self.SUPPORTED_FORMATS:
+                    raise InvalidState("该素材形态已停用，请新建按钮插播、标准插播或定制插播素材")
 
                 new_text = row["text"] if text is None else (text or "").strip()
                 new_target_url = (
@@ -312,11 +306,10 @@ class MaterialService:
                     new_button_text = (button_text or "").strip() or "查看详情"
 
                 # Mirror create-time validation so Bot, CLI, and AI tool calls
-                # agree on the rules. light_tail's text is the detail-page body
-                # (longer ceiling), others are the main copy.
+                # agree on the rules.
                 if not new_text:
                     raise InvalidState("广告素材文案不能为空")
-                text_max = 1000 if row["format_type"] == "light_tail" else 800
+                text_max = 800
                 if text is not None and (len(new_text) < 4 or len(new_text) > text_max):
                     raise InvalidState(f"广告文案需要 4-{text_max} 个字")
                 if not new_target_url:
@@ -327,22 +320,7 @@ class MaterialService:
                 ):
                     raise InvalidState("链接必须以 http:// 或 https:// 开头")
 
-                if row["format_type"] == "light_tail":
-                    if light_short_text is None:
-                        new_short = row["light_short_text"]
-                    else:
-                        short = (light_short_text or "").strip()
-                        if len(short) < self.LIGHT_SHORT_TEXT_MIN:
-                            raise InvalidState(
-                                f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
-                            )
-                        if len(short) > self.LIGHT_SHORT_TEXT_MAX:
-                            raise InvalidState(
-                                f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
-                            )
-                        new_short = short
-                else:
-                    new_short = None
+                new_short = None
 
                 content_hash = hashlib.sha256(
                     f"{row['format_type']}|{new_short or ''}|{new_text}|{new_target_url}|{new_button_text}".encode(
@@ -408,10 +386,7 @@ class MaterialService:
         text, target_url, button_text, category = self._normalize_text_fields(
             text, target_url, button_text, category
         )
-        if format_type == "light_tail" and light_short_text:
-            light_short_text = light_short_text.strip() or None
-        else:
-            light_short_text = None
+        light_short_text = None
         return self._insert_material(
             conn,
             advertiser_account_id=advertiser_account_id,
@@ -446,6 +421,10 @@ class MaterialService:
         if format_type is not None:
             sql += " AND cr.format_type = ?"
             params.append(self._normalize_format(format_type))
+        else:
+            placeholders = ",".join("?" for _ in self.SUPPORTED_FORMATS)
+            sql += f" AND cr.format_type IN ({placeholders})"
+            params.extend(self.SUPPORTED_FORMATS)
         if not include_archived:
             sql += " AND cr.archived_at IS NULL"
         sql += " ORDER BY cr.updated_at DESC, cr.created_at DESC LIMIT ?"
@@ -554,7 +533,7 @@ class MaterialService:
         if format_type not in self.SUPPORTED_FORMATS:
             raise InvalidState(
                 "不支持的素材形态："
-                f"{format_type}（仅支持 light_tail / button_tail / standard_card / strong_post）"
+                f"{format_type}（仅支持 button_tail / standard_card / strong_post）"
             )
         return format_type
 
@@ -941,6 +920,8 @@ class OrderService:
                     )
                 if material["archived_at"]:
                     raise InvalidState("广告素材已归档，请先恢复或选择其他素材")
+                if material["format_type"] not in MaterialService.SUPPORTED_FORMATS:
+                    raise InvalidState("该素材形态已停用，请新建按钮插播、标准插播或定制插播素材")
                 creative_id = material["id"]
                 creative_snapshot = {
                     "text": material["text"],

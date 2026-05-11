@@ -1116,13 +1116,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("set-rate", help="设置频道广告位刊例价")
     p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
-    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--amount", required=True)
     p.set_defaults(func=cmd_set_rate)
 
     p = sub.add_parser("set-format-policy", help="设置频道主接受的插播广告形态")
     p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
-    p.add_argument("--format-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--format-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--owner-price-band", default="medium", choices=["low", "medium", "high", "custom"])
     p.add_argument("--platform-promo-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -1143,7 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("quote-channel", help="按最新评估给频道广告形态报价")
     p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
-    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--owner-price-band", choices=["low", "medium", "high", "custom"])
     p.set_defaults(func=cmd_quote_channel)
 
@@ -1154,7 +1154,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("make-offer", help="广告主对频道发起砍价报价")
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
-    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--amount", required=True)
     p.add_argument("--text", required=True)
     p.add_argument("--target-url", required=True)
@@ -1226,7 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("intent", help="intent_id 或 invoice payload")
     p.set_defaults(func=cmd_show_stars_payment_intent)
 
-    p = sub.add_parser("create-probe", help="创建频道轻插播探针")
+    p = sub.add_parser("create-probe", help="创建频道探针按钮")
     p.add_argument("--channel", required=True, help="channel_id/ref_token/chat_id/username")
     p.add_argument("--short-text", required=True, help="短文案，用于运营识别")
     p.add_argument("--detail-text", required=True, help="用户点击后在 Bot 内看到的详情")
@@ -1236,11 +1236,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--end-at", help="ISO 时间")
     p.set_defaults(func=cmd_create_probe)
 
-    p = sub.add_parser("pause-probe", help="暂停轻插播探针")
+    p = sub.add_parser("pause-probe", help="暂停频道探针按钮")
     p.add_argument("--probe-id", required=True)
     p.set_defaults(func=cmd_pause_probe)
 
-    p = sub.add_parser("probe-stats", help="查看轻插播探针点击统计")
+    p = sub.add_parser("probe-stats", help="查看频道探针按钮点击统计")
     p.add_argument("--channel", help="channel_id/ref_token/chat_id/username")
     p.add_argument("--probe-id")
     p.set_defaults(func=cmd_probe_stats)
@@ -1251,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int, default=0)
     p.add_argument("--max-risk-level", default="watch", choices=["normal", "watch", "high", "blocked"])
     p.add_argument("--max-price")
-    p.add_argument("--slot-type", default="standard_card", choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", default="standard_card", choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_discover_channels)
 
@@ -1271,7 +1271,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int, default=70)
     p.add_argument("--max-risk-level", default="normal", choices=["normal", "watch", "high", "blocked"])
     p.add_argument("--max-price")
-    p.add_argument("--slot-type", default="standard_card", choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", default="standard_card", choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.set_defaults(func=cmd_create_alert_rule)
 
     p = sub.add_parser("scan-alerts", help="扫描并生成广告主频道提醒事件")
@@ -1290,7 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("batch-orders", help="批量创建插播订单")
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-tokens", required=True, help="多个 ref_token，用逗号分隔")
-    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
     p.add_argument("--text", help="提供 --material-id 时无需传入")
     p.add_argument("--target-url", help="提供 --material-id 时无需传入")
@@ -1309,14 +1309,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create-order", help="创建插播订单并冻结预算")
     p.add_argument("--advertiser-telegram-user-id", required=True)
     p.add_argument("--channel-token", required=True)
-    p.add_argument("--slot-type", required=True, choices=["light_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
+    p.add_argument("--slot-type", required=True, choices=["button_tail", "standard", "standard_card", "strong_post", "pin24h", "loop_daily"])
     p.add_argument("--material-id", help="复用广告库已有素材；与 --text/--target-url 二选一")
     p.add_argument("--text", help="标准/定制插播文案；提供 --material-id 时无需传入")
     p.add_argument("--target-url", help="提供 --material-id 时无需传入")
     p.add_argument("--budget", required=True)
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
-    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字），仅 light_tail 形态需要")
+    p.add_argument("--light-short-text", help=argparse.SUPPRESS)
     p.add_argument("--scheduled-at", help="ISO 时间，默认立即")
     p.add_argument("--end-at", help="ISO 时间，循环插播可用")
     p.add_argument("--frequency-per-day", type=int, default=1)
@@ -1328,20 +1328,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--format-type",
         required=True,
-        choices=["light_tail", "standard_card", "strong_post"],
-        help="文字插播=light_tail / 标准插播=standard_card / 定制插播=strong_post",
+        choices=["button_tail", "standard_card", "strong_post"],
+        help="按钮插播=button_tail / 标准插播=standard_card / 定制插播=strong_post",
     )
-    p.add_argument("--text", required=True, help="完整广告文案；文字插播时为详情页内容")
+    p.add_argument("--text", required=True, help="完整广告文案")
     p.add_argument("--target-url", required=True)
     p.add_argument("--button-text", default="查看详情")
     p.add_argument("--category", default="general")
-    p.add_argument("--light-short-text", help="文字插播短入口（2-15 字）")
+    p.add_argument("--light-short-text", help=argparse.SUPPRESS)
     p.add_argument("--display-name", help="第一次出现广告主时使用的展示名")
     p.set_defaults(func=cmd_create_material)
 
     p = sub.add_parser("list-materials", help="列出广告主广告库里的素材")
     p.add_argument("--advertiser-telegram-user-id", required=True)
-    p.add_argument("--format-type", choices=["light_tail", "standard_card", "strong_post"])
+    p.add_argument("--format-type", choices=["button_tail", "standard_card", "strong_post"])
     p.add_argument("--include-archived", action="store_true")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=cmd_list_materials)

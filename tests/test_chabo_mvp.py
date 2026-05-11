@@ -76,7 +76,6 @@ class ChaboMvpTest(unittest.TestCase):
             {"message_id": 8103, "text": "这是通过引导流程创建的完整广告详情，适合定制插播和详情页展示。"},
             {"message_id": 8104, "text": target_url},
             {"message_id": 8105, "text": "立即了解"},
-            {"message_id": 8106, "text": "限时福利"},
             {
                 "message_id": 8107,
                 "text": "这是标准插播文案\\n最多五行\\n用于频道里克制展示",
@@ -274,7 +273,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(pinned["type"], "callback_placement_pin")
         self.assertEqual(weekly["type"], "callback_placement_period")
         self.assertIn("第 2/4 步：选择插播位置", display_message["text"])
-        self.assertEqual(display_buttons[:4], ["🔘 按钮插播", "✍️ 文字插播", "🧾 标准插播", "🎨 定制插播"])
+        self.assertEqual(display_buttons[:3], ["🔘 按钮插播", "🧾 标准插播", "🎨 定制插播"])
         self.assertFalse(any("置顶" in button for button in display_buttons))
         self.assertIn("第 3/4 步：配置发布节奏", schedule_message["text"])
         self.assertIn("📌 是否置顶：否", [button["text"] for row in schedule_message["inline_keyboard"] for button in row])
@@ -317,7 +316,7 @@ class ChaboMvpTest(unittest.TestCase):
         asset_prompt = self.gateway.private_messages[-1]
         self.assertIn("创建广告资产", asset_prompt["text"])
         self.assertIn("👉 当前填写：广告名称", asset_prompt["text"])
-        self.assertIn("完成度：0/7", asset_prompt["text"])
+        self.assertIn("完成度：0/6", asset_prompt["text"])
         self.assertIn("广告名称", asset_prompt["text"])
         self.app.update_handler.handle(
             {
@@ -330,7 +329,7 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
         media_prompt = self.gateway.private_messages[-1]
-        self.assertIn("第 2/7 步", media_prompt["text"])
+        self.assertIn("第 2/6 步", media_prompt["text"])
         self.assertIn("👉 当前填写：媒体文件", media_prompt["text"])
         self.assertIn("✅ 广告名称：引导式广告资产", media_prompt["text"])
         self.app.update_handler.handle(
@@ -344,7 +343,7 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
         detail_prompt = self.gateway.private_messages[-1]
-        self.assertIn("第 3/7 步", detail_prompt["text"])
+        self.assertIn("第 3/6 步", detail_prompt["text"])
         self.assertIn("👉 当前填写：详细介绍", detail_prompt["text"])
         self.assertIn("✅ 媒体文件：图片已收到", detail_prompt["text"])
         self.app.update_handler.handle(
@@ -368,7 +367,7 @@ class ChaboMvpTest(unittest.TestCase):
             }
         )
         button_prompt = self.gateway.private_messages[-1]
-        self.assertIn("第 5/7 步", button_prompt["text"])
+        self.assertIn("第 5/6 步", button_prompt["text"])
         self.assertIn("👉 当前填写：按钮名称", button_prompt["text"])
         self.assertIn("按钮上显示的文字", button_prompt["text"])
         self.assertIn("✅ 跳转链接：https://guid...", button_prompt["text"])
@@ -402,7 +401,6 @@ class ChaboMvpTest(unittest.TestCase):
         )
         for message in [
             {"message_id": 65, "text": "查看"},
-            {"message_id": 66, "text": "限时福利"},
             {"message_id": 67, "text": "这是标准插播文案\\n最多五行\\n用于频道里克制展示"},
         ]:
             self.app.update_handler.handle(
@@ -418,7 +416,7 @@ class ChaboMvpTest(unittest.TestCase):
         position_buttons = [button["text"] for row in position_page["inline_keyboard"] for button in row]
 
         self.assertIn("第 2/4 步：选择插播位置", position_page["text"])
-        self.assertEqual(position_buttons[:4], ["🔘 按钮插播", "✍️ 文字插播", "🧾 标准插播", "🎨 定制插播"])
+        self.assertEqual(position_buttons[:3], ["🔘 按钮插播", "🧾 标准插播", "🎨 定制插播"])
         self.assertFalse(any("置顶" in button for button in position_buttons))
 
         self.app.update_handler.handle(
@@ -508,7 +506,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(order["budget_cents"], 1000)
         self.assertEqual(order["unit_price_cents"], 1000)
         self.assertEqual(creative_row["target_url"], "https://placement.example")
-        self.assertEqual(creative_row["short_text"], "限时福利")
+        self.assertEqual(creative_row["short_text"], "立即了解")
         self.assertEqual(creative_row["button_text"], "立即了解")
         self.assertEqual(creative_row["media_file_id"], "photo_large")
         self.assertIsNone(state)
@@ -1494,7 +1492,7 @@ class ChaboMvpTest(unittest.TestCase):
                 (source["id"],),
             )
             conn.execute(
-                "UPDATE ad_slots SET enabled = 0, min_days = 3 WHERE channel_id = ? AND slot_type = 'light_tail'",
+                "UPDATE ad_slots SET enabled = 0, min_days = 3 WHERE channel_id = ? AND slot_type = 'button_tail'",
                 (source["id"],),
             )
 
@@ -1537,8 +1535,8 @@ class ChaboMvpTest(unittest.TestCase):
                 """,
                 (target["id"],),
             ).fetchone()
-            light_slot = conn.execute(
-                "SELECT * FROM ad_slots WHERE channel_id = ? AND slot_type = 'light_tail'",
+            button_slot = conn.execute(
+                "SELECT * FROM ad_slots WHERE channel_id = ? AND slot_type = 'button_tail'",
                 (target["id"],),
             ).fetchone()
 
@@ -1556,8 +1554,8 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(target_config["holdback_days"], 5)
         self.assertEqual(strong_policy["enabled"], 0)
         self.assertEqual(standard_rate["unit_price_cents"], 4200)
-        self.assertEqual(light_slot["enabled"], 0)
-        self.assertEqual(light_slot["min_days"], 3)
+        self.assertEqual(button_slot["enabled"], 0)
+        self.assertEqual(button_slot["min_days"], 3)
 
     def test_bot_self_serve_order_form_creates_pending_order(self) -> None:
         channel = self.bind_channel()
@@ -1679,7 +1677,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(picked["type"], "callback_order_creative_selected")
         self.assertIn("第三步：设置本次预算", self.gateway.private_messages[-1]["text"])
 
-    def test_light_tail_order_collects_short_entry_and_full_detail(self) -> None:
+    def test_button_tail_order_appends_button_without_body_text(self) -> None:
         channel = self.bind_channel()
         self.topup_advertiser("5")
 
@@ -1699,17 +1697,7 @@ class ChaboMvpTest(unittest.TestCase):
                     "id": "cb_light_2",
                     "from": {"id": 10001, "first_name": "广告主"},
                     "message": {"chat": {"id": 10001}},
-                    "data": f"order:slot:{channel['id']}:light_tail",
-                }
-            }
-        )
-        short_text = self.app.update_handler.handle(
-            {
-                "message": {
-                    "message_id": 30,
-                    "from": {"id": 10001, "first_name": "广告主"},
-                    "chat": {"id": 10001},
-                    "text": "领资料",
+                    "data": f"order:slot:{channel['id']}:button_tail",
                 }
             }
         )
@@ -1719,7 +1707,7 @@ class ChaboMvpTest(unittest.TestCase):
                     "message_id": 31,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "这里是轻插播点击后展示的完整广告详情。",
+                    "text": "这里是按钮插播点击后展示的完整广告详情。",
                 }
             }
         )
@@ -1729,7 +1717,7 @@ class ChaboMvpTest(unittest.TestCase):
                     "message_id": 32,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "https://light.example",
+                    "text": "https://button.example",
                 }
             }
         )
@@ -1739,7 +1727,7 @@ class ChaboMvpTest(unittest.TestCase):
                     "message_id": 33,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "3",
+                    "text": "5",
                 }
             }
         )
@@ -1749,14 +1737,13 @@ class ChaboMvpTest(unittest.TestCase):
             creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (order["creative_id"],)).fetchone()
 
         self.assertEqual(slot["type"], "callback_order_slot_selected")
-        self.assertTrue(any("15 个字以内" in message["text"] for message in self.gateway.private_messages))
-        self.assertEqual(short_text["type"], "order_form_light_short_text_saved")
-        self.assertEqual(detail["type"], "order_form_light_detail_saved")
+        self.assertTrue(any("新建按钮插播广告" in message["text"] for message in self.gateway.private_messages))
+        self.assertEqual(detail["type"], "order_form_creative_saved")
         self.assertEqual(url["type"], "order_form_url_saved")
         self.assertEqual(order["status"], "approved")
-        self.assertEqual(order["unit_price_cents"], 300)
-        self.assertEqual(creative["button_text"], "领资料")
-        self.assertEqual(creative["text"], "这里是轻插播点击后展示的完整广告详情。")
+        self.assertEqual(order["unit_price_cents"], 500)
+        self.assertEqual(creative["button_text"], "查看详情")
+        self.assertEqual(creative["text"], "这里是按钮插播点击后展示的完整广告详情。")
 
         self.app.update_handler.handle(
             {
@@ -1770,8 +1757,8 @@ class ChaboMvpTest(unittest.TestCase):
         dispatched = self.app.fulfillment.dispatch_due()
         self.assertEqual(dispatched[0]["status"], "sent")
         self.assertEqual(dispatched[0]["message_id"], "88")
-        self.assertEqual(self.gateway.channel_text_edits[-1]["text"], "频道最新帖子\n\n🔖 领资料")
-        self.assertEqual(self.gateway.channel_text_edits[-1]["inline_keyboard"][-1][0]["text"], "查看完整广告")
+        self.assertEqual(self.gateway.channel_text_edits[-1]["text"], "频道最新帖子")
+        self.assertEqual(self.gateway.channel_text_edits[-1]["inline_keyboard"][-1][0]["text"], "查看详情")
         self.assertEqual(self.gateway.sent_ads, [])
 
         with self.app.db.transaction() as conn:
@@ -1790,7 +1777,7 @@ class ChaboMvpTest(unittest.TestCase):
         last_message = self.gateway.private_messages[-1]
         self.assertIn("完整广告详情", last_message["text"])
         keyboard_urls = [b.get("url") for row in last_message["inline_keyboard"] for b in row]
-        self.assertIn("https://light.example", keyboard_urls)
+        self.assertIn("https://button.example", keyboard_urls)
 
     def test_account_becomes_mixed_when_same_user_is_advertiser_and_publisher(self) -> None:
         with self.app.db.transaction() as conn:
@@ -2390,7 +2377,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertGreater(strong_quote["list_price_cents"], standard_quote["list_price_cents"])
 
         applied = self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
-        self.assertTrue(any(quote["slot_type"] == "light_tail" for quote in applied))
+        self.assertTrue(any(quote["slot_type"] == "button_tail" for quote in applied))
         with self.app.db.transaction() as conn:
             rate = self.app.channels.get_rate(conn, channel["id"], "standard")
         self.assertEqual(rate["unit_price_cents"], standard_quote["list_price_cents"])
@@ -2995,12 +2982,12 @@ class ChaboMvpTest(unittest.TestCase):
     # --------- Ad library / MaterialService ---------
 
     def test_material_library_creates_three_formats_with_ownership(self) -> None:
-        light = self.app.materials.create_material(
+        button = self.app.materials.create_material(
             advertiser_telegram_user_id=10001,
-            format_type="light_tail",
-            text="完整文字插播详情文案",
+            format_type="button_tail",
+            text="按钮插播详情文案",
             target_url="https://example.com/detail",
-            light_short_text="想投这里？",
+            button_text="查看详情",
             display_name="广告主",
         )
         std = self.app.materials.create_material(
@@ -3016,17 +3003,17 @@ class ChaboMvpTest(unittest.TestCase):
             target_url="https://example.com/strong",
             button_text="立即下载",
         )
-        self.assertEqual(light["format_type"], "light_tail")
-        self.assertEqual(light["light_short_text"], "想投这里？")
+        self.assertEqual(button["format_type"], "button_tail")
+        self.assertIsNone(button["light_short_text"])
         self.assertIsNone(std["light_short_text"])
         self.assertEqual(custom["button_text"], "立即下载")
 
         listed = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
         self.assertEqual(len(listed), 3)
-        light_only = self.app.materials.list_materials(
-            advertiser_telegram_user_id=10001, format_type="light_tail"
+        button_only = self.app.materials.list_materials(
+            advertiser_telegram_user_id=10001, format_type="button_tail"
         )
-        self.assertEqual([item["id"] for item in light_only], [light["id"]])
+        self.assertEqual([item["id"] for item in button_only], [button["id"]])
 
         # Foreign user cannot read another advertiser's material
         with self.assertRaises(NotFound):
@@ -3034,7 +3021,7 @@ class ChaboMvpTest(unittest.TestCase):
                 std["id"], advertiser_telegram_user_id=99999
             )
 
-    def test_material_library_validates_format_and_short_text(self) -> None:
+    def test_material_library_rejects_retired_and_unknown_formats(self) -> None:
         with self.assertRaises(InvalidState):
             self.app.materials.create_material(
                 advertiser_telegram_user_id=10001,
@@ -3046,17 +3033,17 @@ class ChaboMvpTest(unittest.TestCase):
             self.app.materials.create_material(
                 advertiser_telegram_user_id=10001,
                 format_type="light_tail",
-                text="缺少短入口",
+                text="旧版素材",
                 target_url="https://example.com",
             )
-        with self.assertRaises(InvalidState):
-            self.app.materials.create_material(
-                advertiser_telegram_user_id=10001,
-                format_type="light_tail",
-                text="详情",
-                target_url="https://example.com",
-                light_short_text="超过十五个字的短入口测试一二三四五",
-            )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="button_tail",
+            text="按钮插播详情",
+            target_url="https://example.com",
+            light_short_text="会被忽略",
+        )
+        self.assertIsNone(material["light_short_text"])
 
     def test_create_order_reuses_library_material_and_blocks_archived(self) -> None:
         channel = self.bind_channel()
@@ -4419,11 +4406,11 @@ class ChaboMvpTest(unittest.TestCase):
             ).fetchone()
         self.assertTrue(state_row is None or state_row["flow"] != "material_create")
 
-    def test_library_create_light_tail_collects_short_then_detail_then_url(self) -> None:
+    def test_library_create_button_tail_collects_text_then_url(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         for cb_id, data in [
-            ("cb_lt_picker", "advertiser:material:new"),
-            ("cb_lt_format", "advertiser:material:new:light_tail"),
+            ("cb_button_picker", "advertiser:material:new"),
+            ("cb_button_format", "advertiser:material:new:button_tail"),
         ]:
             self.app.update_handler.handle(
                 {
@@ -4436,38 +4423,26 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             )
 
-        # Short entry too long → rejection, conversation stays at light_short_text
+        # Text too short -> rejection, conversation stays at creative_text
         self.app.update_handler.handle(
             {
                 "message": {
                     "message_id": 21,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "一" * 16,
+                    "text": "短",
                 }
             }
         )
-        # Errors go through send_private_message — assert directly against that channel
-        self.assertIn("2-15 个字", self.gateway.private_messages[-1]["text"])
+        self.assertIn("4-800 个字", self.gateway.private_messages[-1]["text"])
 
-        # Within bounds
         self.app.update_handler.handle(
             {
                 "message": {
                     "message_id": 22,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "想看广告？",
-                }
-            }
-        )
-        self.app.update_handler.handle(
-            {
-                "message": {
-                    "message_id": 23,
-                    "from": {"id": 10001, "first_name": "广告主"},
-                    "chat": {"id": 10001},
-                    "text": "完整文字插播详情文案，应该够长。",
+                    "text": "按钮插播详情文案，应该够长。",
                 }
             }
         )
@@ -4477,16 +4452,16 @@ class ChaboMvpTest(unittest.TestCase):
                     "message_id": 24,
                     "from": {"id": 10001, "first_name": "广告主"},
                     "chat": {"id": 10001},
-                    "text": "https://example.com/light",
+                    "text": "https://example.com/button",
                 }
             }
         )
         self.assertEqual(result["type"], "material_create_saved")
 
         items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
-        self.assertEqual(items[0]["format_type"], "light_tail")
-        self.assertEqual(items[0]["light_short_text"], "想看广告？")
-        self.assertEqual(items[0]["button_text"], "想看广告？")
+        self.assertEqual(items[0]["format_type"], "button_tail")
+        self.assertIsNone(items[0]["light_short_text"])
+        self.assertEqual(items[0]["button_text"], "查看详情")
 
     def test_library_create_url_must_be_http(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
@@ -4689,7 +4664,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(unchanged["target_url"], "https://example.com")
 
     def test_material_edit_rejects_text_outside_length_bounds(self) -> None:
-        """merged_bug_001: update_material must enforce the 4-800 (light_tail: 4-1000) bounds."""
+        """merged_bug_001: update_material must enforce the 4-800 bounds."""
         std = self.app.materials.create_material(
             advertiser_telegram_user_id=10001,
             format_type="standard_card",
@@ -4709,29 +4684,23 @@ class ChaboMvpTest(unittest.TestCase):
             std["id"], advertiser_telegram_user_id=10001, text="一" * 50
         )
 
-        light = self.app.materials.create_material(
+        button = self.app.materials.create_material(
             advertiser_telegram_user_id=10001,
-            format_type="light_tail",
-            text="原始文字插播详情",
+            format_type="button_tail",
+            text="原始按钮插播详情",
             target_url="https://example.com",
-            light_short_text="想看广告？",
-        )
-        # light_tail allows up to 1000
-        self.app.materials.update_material(
-            light["id"], advertiser_telegram_user_id=10001, text="一" * 1000
         )
         with self.assertRaises(InvalidState):
             self.app.materials.update_material(
-                light["id"], advertiser_telegram_user_id=10001, text="一" * 1001
+                button["id"], advertiser_telegram_user_id=10001, text="一" * 801
             )
 
-    def test_material_edit_light_short_text_validates_length(self) -> None:
+    def test_material_edit_light_short_text_is_retired(self) -> None:
         material = self.app.materials.create_material(
             advertiser_telegram_user_id=10001,
-            format_type="light_tail",
-            text="文字插播完整文案",
+            format_type="button_tail",
+            text="按钮插播完整文案",
             target_url="https://example.com",
-            light_short_text="想投广告？",
         )
         with self.assertRaises(InvalidState):
             self.app.materials.update_material(
@@ -4739,20 +4708,8 @@ class ChaboMvpTest(unittest.TestCase):
                 advertiser_telegram_user_id=10001,
                 light_short_text="x",
             )
-        with self.assertRaises(InvalidState):
-            self.app.materials.update_material(
-                material["id"],
-                advertiser_telegram_user_id=10001,
-                light_short_text="一" * 16,
-            )
-        # within bounds OK
-        self.app.materials.update_material(
-            material["id"],
-            advertiser_telegram_user_id=10001,
-            light_short_text="新短入口文案",
-        )
         refreshed = self.app.materials.get_material(material["id"])
-        self.assertEqual(refreshed["light_short_text"], "新短入口文案")
+        self.assertIsNone(refreshed["light_short_text"])
 
     def test_advertiser_dispute_button_appears_after_a_delivery_ships(self) -> None:
         _, order = self.create_approved_order()
@@ -5176,8 +5133,8 @@ class ChaboMvpTest(unittest.TestCase):
             )
         self.assertEqual(payload_after_pick["material_id"], std["id"])
 
-        # Switch to 文字插播 — selection must clear so the user can configure the new slot fresh
-        self.app.update_handler.handle(
+        # Retired slot callbacks are ignored and keep the current supported slot intact.
+        retired = self.app.update_handler.handle(
             {
                 "callback_query": {
                     "id": "cb_swap_to_light",
@@ -5193,9 +5150,9 @@ class ChaboMvpTest(unittest.TestCase):
                     "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
                 ).fetchone()["payload_json"]
             )
-        self.assertEqual(payload_on_light["slot_type"], "light_tail")
-        self.assertNotIn("material_id", payload_on_light)
-        self.assertNotIn("creative_text", payload_on_light)
+        self.assertEqual(retired["type"], "callback_placement_invalid_slot")
+        self.assertEqual(payload_on_light["slot_type"], "standard_card")
+        self.assertEqual(payload_on_light["material_id"], std["id"])
 
         # Flip back to 标准插播 — the previous draft should be restored
         self.app.update_handler.handle(
@@ -6270,13 +6227,13 @@ class ChaboMvpTest(unittest.TestCase):
             button_text="去看看",
             display_name="频道主",
         )
-        # light_tail materials are filtered out
-        self.app.materials.create_material(
+        # button_tail materials are filtered out from self-promo publishable list
+        button_material = self.app.materials.create_material(
             advertiser_telegram_user_id=20001,
-            format_type="light_tail",
-            text="文字插播详情",
-            target_url="https://owner.example/light",
-            light_short_text="去看看",
+            format_type="button_tail",
+            text="按钮插播详情",
+            target_url="https://owner.example/button",
+            button_text="去看看",
         )
 
         result = self._publisher_callback(f"pub:self:{channel['ref_token']}", cb_id="cb_self_open")
@@ -6285,10 +6242,8 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertIn("自用发布", message["text"])
         button_callbacks = [b.get("callback_data") for row in message["inline_keyboard"] for b in row]
         self.assertIn(f"pub:self:pick:{channel['ref_token']}:{material['id']}", button_callbacks)
-        # light_tail material should not appear
-        self.assertNotIn(
-            any(material["id"] in (b.get("callback_data") or "") for row in message["inline_keyboard"] for b in row if "light" in (b.get("text") or "")),
-            [True],
+        self.assertFalse(
+            any(button_material["id"] in (b.get("callback_data") or "") for row in message["inline_keyboard"] for b in row)
         )
 
     def test_publisher_self_promo_publishes_and_records_row(self) -> None:

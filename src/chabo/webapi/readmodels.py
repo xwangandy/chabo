@@ -100,7 +100,7 @@ def channel_market(app: ChaboApp, *, limit: int = 50, offset: int = 0, q: str | 
                 c.id, c.title, c.username, c.ref_token, c.status,
                 pa.category, pa.score, pa.risk_level,
                 MAX(CASE WHEN s.slot_type = 'standard_card' AND rc.active = 1 THEN rc.unit_price_cents END) AS standard_price_cents,
-                MAX(CASE WHEN fp.format_type = 'light_tail' THEN fp.enabled ELSE 0 END) AS light_enabled,
+                MAX(CASE WHEN fp.format_type = 'button_tail' THEN fp.enabled ELSE 0 END) AS button_enabled,
                 MAX(CASE WHEN fp.format_type = 'standard_card' THEN fp.enabled ELSE 0 END) AS standard_enabled,
                 MAX(CASE WHEN fp.format_type = 'strong_post' THEN fp.enabled ELSE 0 END) AS strong_enabled
             FROM channels c
@@ -124,7 +124,7 @@ def channel_market(app: ChaboApp, *, limit: int = 50, offset: int = 0, q: str | 
     items = []
     for row in rows:
         item = dict(row)
-        item["light_enabled"] = bool(item["light_enabled"])
+        item["button_enabled"] = bool(item["button_enabled"])
         item["standard_enabled"] = bool(item["standard_enabled"])
         item["strong_enabled"] = bool(item["strong_enabled"])
         items.append(item)

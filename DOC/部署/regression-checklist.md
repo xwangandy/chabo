@@ -161,6 +161,26 @@ chabo confirm-earnings --observation-hours 0
 3. 用运营 B 账号 approve（用同一账号 approve 必须被服务层拒绝）。
 4. 收款方余额正确增加；`chabo list-tool-calls --tool-name topup_approve` 看到一条 success。
 
+### 10. 广告主自助投放路径
+
+这条路径对应 #5 的广告主 Bot 体验基线。上线前至少用测试广告主账号跑一遍；完整 staging 操作顺序见 `DOC/部署/staging-uat-checklist.md`。
+
+准备：
+
+```bash
+chabo topup --telegram-user-id <advertiser user id> --amount 1000 --display-name "验收广告主"
+chabo purchase-advertiser-plan --advertiser-telegram-user-id <advertiser user id> --plan pro
+```
+
+1. 「🔍 找频道」能看到两个已评估测试频道。
+2. 收藏其中一个频道，进入「⭐ 我的收藏」能看到它。
+3. 「🗂 广告库」里新建标准插播素材，并能编辑文案。
+4. 对该素材执行「📡 批量投放」，勾选两个频道，提交后显示 2 成功 / 0 失败。
+5. 进入「📋 投放订单」打开订单详情，能看到状态、预算、冻结金额和投放记录。
+6. 在详情页执行「⏸ 停止投放」，二次确认后订单变为已暂停，冻结预算归零。
+7. 对另一条已发布订单执行「🚩 申诉」，提交原因后出现 open dispute，delivery 变为 disputed。
+8. 进入「📦 我的套餐」，从 Pro 触发 Enterprise Stars 发票；默认只验证发票发送，不支付。
+
 ## C. 上线后 30 分钟巡检
 
 - `/health` 持续返回 `db: ok`

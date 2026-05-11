@@ -1,16 +1,53 @@
 # 插播网页端生产发布 Runbook
 
-更新时间：2026-05-02
+更新时间：2026-05-11
 
 适用范围：React SPA + FastAPI API + SQLite MVP 生产环境。
 
-上线交付清单与 PR 模板见 `DOC/部署/m9-delivery-checklist.md`。
+上线交付清单与 PR 模板见 `DOC/部署/m9-delivery-checklist.md`。真实 staging UAT 见 `DOC/部署/staging-uat-checklist.md`。
+
+## 0. 生产前 staging gate
+
+正式生产发布前，先在 staging 域名 + 测试 Telegram Bot + 测试频道上跑一次完整 UAT。staging 不是“随便点点”的演示环境，而是生产发布的最后一道真实 HTTP / webhook 验收门。
+
+必须满足：
+
+1. staging 运行将要发布的同一个 commit SHA。
+2. staging 使用 HTTPS、强 token、测试 Bot token、测试频道和非生产 SQLite。
+3. `CHABO_DEV_AUTH_BYPASS=0`、`CHABO_DEV_SESSION_ENABLED=0`、`CHABO_SESSION_COOKIE_SECURE=1`。
+4. 同时启动 `chabo-api.service` 与 `chabo.service`：前者服务 `/api/*`，后者服务 `/telegram/webhook/<secret>` 和 `/health`。
+5. nginx 需要同时包含网页端 `/api/*` 反代和 Telegram `/telegram/webhook/<secret>` 反代；只配置网页端会导致 API health 正常但 Bot 不收 update。
+6. 执行：
+
+```bash
+STAGING_HOST=staging.chabo.example
+chabo verify-web --profile production \
+  --host "$STAGING_HOST" \
+  --health-url "https://${STAGING_HOST}/api/health" \
+  --audit-chain
+```
+
+7. 设置测试 Bot webhook：
+
+```bash
+. /etc/chabo/env
+STAGING_HOST=staging.chabo.example
+chabo set-webhook \
+  --url "https://${STAGING_HOST}/telegram/webhook/${CHABO_WEBHOOK_SECRET}" \
+  --secret "${CHABO_WEBHOOK_SECRET}" \
+  --drop-pending-updates
+```
+
+8. 按 `DOC/部署/staging-uat-checklist.md` 完成真实 Bot 路径：找频道 → 收藏 → 广告库新建/编辑 → 批量投放 → 订单详情 → 停止投放 → 申诉 → 套餐升级发票。
+
+任一项失败都不进入生产发布；修复后重新从 staging gate 开始。
 
 ## 1. 发布前
 
 1. 确认 `/etc/chabo/env` 只包含生产域名、强随机 token 和正式 Bot 配置。
 2. 确认 `CHABO_DEV_AUTH_BYPASS=0`、`CHABO_DEV_SESSION_ENABLED=0`、`CHABO_SESSION_COOKIE_SECURE=1`。
-3. 执行生产 gate：
+3. 确认 staging gate 已完成并记录 commit SHA、GitHub Actions run URL、测试 Bot username、测试频道和 Go 结论。
+4. 执行生产 gate：
 
 ```bash
 cd /opt/chabo
@@ -20,13 +57,13 @@ chabo verify-web --profile production \
   --audit-chain
 ```
 
-4. 生成审计链留档：
+5. 生成审计链留档：
 
 ```bash
 ./scripts/export-audit-integrity-report.sh --created-from "2026-05-02 00:00:00" --strict
 ```
 
-5. 生成 SQLite 备份，并在临时副本上演练恢复：
+6. 生成 SQLite 备份，并在临时副本上演练恢复：
 
 ```bash
 chabo backup-db --target /var/backups/chabo/pre-release.sqlite3

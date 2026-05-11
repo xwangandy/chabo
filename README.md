@@ -143,7 +143,7 @@ chabo verify-audit-chain --created-from "2026-05-02 00:00:00" --strict
 ./scripts/export-audit-integrity-report.sh --created-from "2026-05-02 00:00:00" --strict
 ```
 
-完整生产 Runbook 见 [DOC/部署/production-runbook.md](DOC/部署/production-runbook.md)，上线交付清单见 [DOC/部署/m9-delivery-checklist.md](DOC/部署/m9-delivery-checklist.md)。回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`。
+完整生产 Runbook 见 [DOC/部署/production-runbook.md](DOC/部署/production-runbook.md)，真实 staging UAT 清单见 [DOC/部署/staging-uat-checklist.md](DOC/部署/staging-uat-checklist.md)，上线交付清单见 [DOC/部署/m9-delivery-checklist.md](DOC/部署/m9-delivery-checklist.md)。回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`，广告主 Bot 验收见 `tests.test_chabo_mvp.ChaboMvpTest.test_bot_acceptance_advertiser_real_path_from_discover_to_plan_invoice`。
 
 定期备份（推荐 cron）：
 

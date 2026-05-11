@@ -696,6 +696,8 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(
             main_buttons,
             [
+                "🔍 找频道",
+                "⭐ 我的收藏",
                 "➕ 广告投放",
                 "🗂 广告库",
                 "📋 投放订单",
@@ -703,6 +705,7 @@ class ChaboMvpTest(unittest.TestCase):
                 "⭐ 频道收藏夹",
                 "🌐 打开网页端",
                 "💰 广告钱包",
+                "📦 我的套餐",
                 "⚙️ 设置",
             ],
         )
@@ -2880,6 +2883,64 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(len(free_results), 5)
         self.assertEqual(len(paid_results), 7)
 
+    def test_create_batch_orders_with_material_id_reuses_creative(self) -> None:
+        channel_a = self.bind_channel()
+        channel_b = self.app.channels.bind_channel(
+            telegram_chat_id=-100124,
+            title="测试频道B",
+            username="test_channel_b",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主B",
+        )
+        self.topup_advertiser("50")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="共享素材",
+            target_url="https://example.com/share",
+        )
+
+        batch = self.app.advertisers.create_batch_orders(
+            advertiser_telegram_user_id=10001,
+            channel_tokens=[channel_a["ref_token"], channel_b["ref_token"]],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=money_to_cents("10"),
+        )
+        self.assertEqual(batch["created_count"], 2)
+        with self.app.db.transaction() as conn:
+            creative_ids = [
+                row["creative_id"]
+                for row in conn.execute(
+                    "SELECT creative_id FROM ad_orders WHERE id IN (?, ?)",
+                    (batch["results"][0]["order_id"], batch["results"][1]["order_id"]),
+                ).fetchall()
+            ]
+        self.assertEqual(set(creative_ids), {material["id"]})
+
+        # Library should still be a single material (no inline duplicates)
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual([m["id"] for m in items], [material["id"]])
+
+    def test_create_batch_orders_requires_material_or_inline(self) -> None:
+        channel = self.bind_channel()
+        self.topup_advertiser("50")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.advertisers.create_batch_orders(
+                advertiser_telegram_user_id=10001,
+                channel_tokens=[channel["ref_token"]],
+                slot_type="standard_card",
+                budget_cents=money_to_cents("5"),
+            )
+
     def test_advertiser_report_and_batch_orders(self) -> None:
         channel_a = self.bind_channel()
         channel_b = self.app.channels.bind_channel(
@@ -3244,6 +3305,1906 @@ class ChaboMvpTest(unittest.TestCase):
         payload_after = json.loads(state_after["payload_json"])
         self.assertNotIn("material_id", payload_after)
         self.assertEqual(payload_after["creative_ids"], [keep_id])
+
+    def _last_user_facing_text(self) -> str:
+        """Return the most recent text shown to the user (edits beat new sends)."""
+        edits = list(self.gateway.text_edits)
+        privs = list(self.gateway.private_messages)
+        if not edits and not privs:
+            raise AssertionError("no user-facing message recorded")
+        if edits and not privs:
+            return edits[-1]["text"]
+        if privs and not edits:
+            return privs[-1]["text"]
+        return edits[-1]["text"]  # callback flows always end on an edit
+
+    def _last_user_facing_keyboard(self) -> list[list[dict[str, str]]]:
+        edits = list(self.gateway.text_edits)
+        privs = list(self.gateway.private_messages)
+        if edits:
+            return edits[-1]["inline_keyboard"] or []
+        if privs:
+            return privs[-1]["inline_keyboard"] or []
+        raise AssertionError("no user-facing keyboard recorded")
+
+    def test_advertiser_orders_list_shows_detail_buttons_and_renders_per_order(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        list_result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_orders_list",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:orders",
+                }
+            }
+        )
+        self.assertTrue(list_result["handled"])
+        list_text = self._last_user_facing_text()
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        detail_buttons = [b for b in all_buttons if b["callback_data"].startswith("advertiser:order:")]
+        self.assertEqual(len(detail_buttons), 1)
+        self.assertEqual(detail_buttons[0]["callback_data"], f"advertiser:order:{order['id']}")
+        self.assertIn("①", list_text)
+
+        detail_result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_detail",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        self.assertEqual(detail_result["type"], "callback_advertiser_order_detail")
+        self.assertEqual(detail_result["order_id"], order["id"])
+        detail_text = self._last_user_facing_text()
+        self.assertIn(order["id"], detail_text)
+        self.assertIn("测试频道", detail_text)
+        self.assertIn("已审", detail_text)
+        self.assertIn("发布记录", detail_text)
+
+    def test_advertiser_order_detail_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(99999, display_name="他人")
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_steal",
+                    "from": {"id": 99999, "first_name": "他人"},
+                    "message": {"chat": {"id": 99999}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_detail")
+        self.assertIn("不存在或不属于你", self._last_user_facing_text())
+
+    def test_advertiser_order_detail_surfaces_failed_delivery_reason(self) -> None:
+        self.gateway.fail_send = True
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_order_failed_detail",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        detail_text = self._last_user_facing_text()
+        self.assertIn("❌", detail_text)
+        self.assertIn("原因", detail_text)
+
+    def _seed_two_assessed_channels(self) -> tuple[dict, dict]:
+        channel_a = self.bind_channel()
+        channel_b = self.app.channels.bind_channel(
+            telegram_chat_id=-100124,
+            title="测试频道B",
+            username="test_channel_b",
+            owner_telegram_user_id=20002,
+            owner_display_name="频道主B",
+        )
+        for ch in (channel_a, channel_b):
+            self.app.pricing.assess_channel(
+                channel_id=ch["id"],
+                category="software",
+                median_24h_views=20_000,
+                subscribers=50_000,
+                light_clicks_30d=180,
+                light_unique_clickers_30d=120,
+                repeat_purchase_count=2,
+                dispute_count=0,
+                risk_level="normal",
+            )
+            self.app.pricing.apply_quotes_to_rate_cards(ch["id"])
+        return channel_a, channel_b
+
+    def test_bot_acceptance_advertiser_real_path_from_discover_to_plan_invoice(self) -> None:
+        def callback(cb_id: str, data: str) -> dict:
+            return self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+
+        def message(message_id: int, text: str) -> dict:
+            return self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": message_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("1000")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+
+        discover = callback("cb_accept_find_channels", "advertiser:discover")
+        self.assertEqual(discover["type"], "callback_advertiser_discover")
+        discover_text = self._last_user_facing_text()
+        self.assertIn("找频道", discover_text)
+        self.assertIn(channel_a["title"], discover_text)
+        self.assertIn(channel_b["title"], discover_text)
+        discover_callbacks = [
+            b["callback_data"] for row in self._last_user_facing_keyboard() for b in row
+        ]
+        self.assertIn(f"advertiser:save:disc:{channel_a['id']}", discover_callbacks)
+
+        save = callback("cb_accept_save_channel", f"advertiser:save:disc:{channel_a['id']}")
+        self.assertEqual(save["type"], "callback_advertiser_save_toggle")
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel_a["id"],
+        ))
+        saved = callback("cb_accept_saved_channels", "advertiser:saved")
+        self.assertEqual(saved["type"], "callback_advertiser_saved")
+        self.assertIn(channel_a["title"], self._last_user_facing_text())
+
+        library = callback("cb_accept_library", "advertiser:library")
+        self.assertEqual(library["type"], "callback_advertiser_library")
+        picker = callback("cb_accept_material_new", "advertiser:material:new")
+        self.assertEqual(picker["type"], "callback_material_new_picker")
+        create = callback("cb_accept_material_standard", "advertiser:material:new:standard_card")
+        self.assertEqual(create["type"], "callback_material_new_started")
+        self.assertIn("新建标准插播素材", self._last_user_facing_text())
+
+        text_saved = message(101, "验收标准素材文案，用于真实 Bot 路径自动化验收。")
+        self.assertEqual(text_saved["type"], "material_create_text_saved")
+        material_saved = message(102, "https://example.com/bot-acceptance")
+        self.assertEqual(material_saved["type"], "material_create_saved")
+        material = self.app.materials.get_material(material_saved["material_id"])
+        self.assertEqual(material["format_type"], "standard_card")
+        self.assertEqual(material["target_url"], "https://example.com/bot-acceptance")
+
+        edit_panel = callback("cb_accept_material_edit", f"advertiser:material:edit:{material['id']}")
+        self.assertEqual(edit_panel["type"], "callback_material_edit_panel")
+        edit_text = callback(
+            "cb_accept_material_edit_text",
+            f"advertiser:material:field:{material['id']}:text",
+        )
+        self.assertEqual(edit_text["type"], "callback_material_edit_field")
+        edit_saved = message(103, "验收编辑后的标准素材文案，确认广告库编辑链路生效。")
+        self.assertEqual(edit_saved["type"], "material_edit_saved")
+        refreshed_material = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed_material["text"], "验收编辑后的标准素材文案，确认广告库编辑链路生效。")
+
+        batch_start = callback("cb_accept_batch_start", f"advertiser:batch:start:{material['id']}")
+        self.assertEqual(batch_start["type"], "callback_batch_start")
+        batch_text = self._last_user_facing_text()
+        self.assertIn("批量投放", batch_text)
+        self.assertIn(channel_a["title"], batch_text)
+        self.assertIn(channel_b["title"], batch_text)
+        budget_prompt = callback("cb_accept_batch_budget", "advertiser:batch:budget")
+        self.assertEqual(budget_prompt["type"], "callback_batch_budget_prompt")
+        budget_saved = message(104, "150")
+        self.assertEqual(budget_saved["type"], "batch_budget_saved")
+        for index, channel in enumerate((channel_a, channel_b), start=1):
+            toggle = callback(
+                f"cb_accept_batch_toggle_{index}",
+                f"advertiser:batch:toggle:{channel['id']}",
+            )
+            self.assertEqual(toggle["type"], "callback_batch_toggle")
+        self.assertIn("已选：2", self._last_user_facing_text())
+        submitted = callback("cb_accept_batch_submit", "advertiser:batch:submit")
+        self.assertEqual(submitted["type"], "callback_batch_submitted")
+        self.assertEqual(submitted["created_count"], 2)
+        self.assertEqual(submitted["failed_count"], 0)
+
+        with self.app.db.transaction() as conn:
+            batch_orders = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT *
+                    FROM ad_orders
+                    WHERE creative_id = ?
+                    ORDER BY created_at, id
+                    """,
+                    (material["id"],),
+                ).fetchall()
+            ]
+        self.assertEqual(len(batch_orders), 2)
+        order_id = batch_orders[0]["id"]
+
+        detail = callback("cb_accept_order_detail", f"advertiser:order:{order_id}")
+        self.assertEqual(detail["type"], "callback_advertiser_order_detail")
+        detail_text = self._last_user_facing_text()
+        self.assertIn("订单详情", detail_text)
+        self.assertIn(order_id, detail_text)
+
+        stop_confirm = callback("cb_accept_order_stop", f"advertiser:order:{order_id}:stop")
+        self.assertEqual(stop_confirm["type"], "callback_advertiser_order_stop_confirm")
+        self.assertIn("停止投放", self._last_user_facing_text())
+        stopped = callback("cb_accept_order_stop_yes", f"advertiser:order:{order_id}:stop_yes")
+        self.assertEqual(stopped["type"], "callback_advertiser_order_stopped")
+        with self.app.db.transaction() as conn:
+            stopped_order = conn.execute(
+                "SELECT status, reserved_cents FROM ad_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+        self.assertEqual(stopped_order["status"], "paused")
+        self.assertEqual(stopped_order["reserved_cents"], 0)
+
+        dispute_channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100125,
+            title="验收申诉频道",
+            username="appeal_channel",
+            owner_telegram_user_id=20003,
+            owner_display_name="频道主C",
+        )
+        dispute_order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=dispute_channel["ref_token"],
+            slot_type="standard_card",
+            text="这是一条用于申诉验收的插播广告",
+            target_url="https://example.com/dispute",
+            budget_cents=money_to_cents("50"),
+        )
+        dispute_order = self.app.orders.approve_order(dispute_order["id"])
+        self.app.fulfillment.dispatch_due()
+        dispute_detail = callback(
+            "cb_accept_dispute_order_detail",
+            f"advertiser:order:{dispute_order['id']}",
+        )
+        self.assertEqual(dispute_detail["type"], "callback_advertiser_order_detail")
+        dispute_callbacks = [
+            b["callback_data"] for row in self._last_user_facing_keyboard() for b in row
+        ]
+        self.assertIn(f"advertiser:order:{dispute_order['id']}:dispute", dispute_callbacks)
+        dispute_start = callback(
+            "cb_accept_dispute_start",
+            f"advertiser:order:{dispute_order['id']}:dispute",
+        )
+        self.assertEqual(dispute_start["type"], "callback_advertiser_dispute_start")
+        self.assertIn("申诉原因", self._last_user_facing_text())
+        dispute_opened = message(105, "广告已投放但频道主提前删除，需要运营复核证据。")
+        self.assertEqual(dispute_opened["type"], "dispute_opened")
+        self.assertEqual(dispute_opened["order_id"], dispute_order["id"])
+        with self.app.db.transaction() as conn:
+            dispute = conn.execute(
+                "SELECT status FROM disputes WHERE id = ?",
+                (dispute_opened["dispute_id"],),
+            ).fetchone()
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ? ORDER BY scheduled_at DESC LIMIT 1",
+                (dispute_order["id"],),
+            ).fetchone()
+        self.assertEqual(dispute["status"], "open")
+        self.assertEqual(delivery["status"], "disputed")
+
+        plan_panel = callback("cb_accept_plan_panel", "advertiser:plan")
+        self.assertEqual(plan_panel["type"], "callback_advertiser_plan")
+        self.assertIn("Pro", self._last_user_facing_text())
+        invoices_before = len(self.gateway.invoices)
+        invoice_result = callback("cb_accept_enterprise_invoice", "advertiser:plan:buy:enterprise")
+        self.assertEqual(invoice_result["type"], "callback_advertiser_plan_invoice_sent")
+        self.assertEqual(invoice_result["plan"], "enterprise")
+        self.assertEqual(len(self.gateway.invoices), invoices_before + 1)
+        invoice = self.gateway.invoices[-1]
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertIn("插播广告主高级服务", invoice["title"])
+        self.assertEqual(invoice["prices"][0]["amount"], int(invoice_result["stars_amount"]))
+
+    def test_library_exposes_batch_button_per_material(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量待投素材",
+            target_url="https://example.com",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        batch_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:batch:start:")
+        ]
+        self.assertEqual(len(batch_buttons), 1)
+        self.assertEqual(batch_buttons[0]["callback_data"], f"advertiser:batch:start:{material['id']}")
+
+    def test_batch_flow_toggle_select_and_submit_creates_orders(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        # Standard_card list prices in our seed are ~USD 118; top up enough for two
+        self.topup_advertiser("500")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量素材文案",
+            target_url="https://example.com/batch",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+
+        # Start batch
+        start = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        self.assertEqual(start["type"], "callback_batch_start")
+        body = self._last_user_facing_text()
+        self.assertIn("批量投放", body)
+        self.assertIn(channel_a["title"], body)
+        self.assertIn(channel_b["title"], body)
+
+        # Bump per-channel budget above the standard_card list price by sending a budget message
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_budget_prompt",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:budget",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "150",
+                }
+            }
+        )
+
+        # Toggle both channels
+        for cb_id, ch in (("cb_t_a", channel_a), ("cb_t_b", channel_b)):
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": f"advertiser:batch:toggle:{ch['id']}",
+                    }
+                }
+            )
+
+        # Confirm 2 selected & submit
+        body_after = self._last_user_facing_text()
+        self.assertIn("已选：2", body_after)
+        submit = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:submit",
+                }
+            }
+        )
+        self.assertEqual(submit["type"], "callback_batch_submitted")
+        self.assertEqual(submit["created_count"], 2)
+        self.assertEqual(submit["failed_count"], 0)
+
+        # Both new orders use the same creative_id (the library material)
+        with self.app.db.transaction() as conn:
+            creative_ids = [
+                row["creative_id"]
+                for row in conn.execute(
+                    "SELECT creative_id FROM ad_orders WHERE advertiser_account_id IN (SELECT id FROM accounts WHERE telegram_user_id = '10001')"
+                ).fetchall()
+            ]
+        self.assertEqual(set(creative_ids), {material["id"]})
+
+        # Conversation cleaned
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state is None or state["flow"] != "batch_orders")
+
+    def test_batch_flow_acknowledges_stray_text_in_select_channels_step(self) -> None:
+        """bug_004: typed text in select_channels must get a friendly hint, not silence."""
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="批量素材",
+            target_url="https://example.com",
+        )
+        channel_a, _ = self._seed_two_assessed_channels()
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_hint",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 50,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "怎么全选所有频道?",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "batch_orders_text_hint")
+        self.assertIn("按钮", self.gateway.private_messages[-1]["text"])
+        # Conversation state must remain on select_channels
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT step FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertEqual(state["step"], "select_channels")
+
+    def test_batch_flow_blocks_archived_material(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="即将归档",
+            target_url="https://example.com",
+        )
+        self.app.materials.archive_material(material["id"], advertiser_telegram_user_id=10001)
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_batch_arch",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        self.assertIn("已归档", self._last_user_facing_text())
+
+    def test_batch_flow_for_free_user_fails_with_friendly_message(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="想批量但没买套餐",
+            target_url="https://example.com",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+        # Start
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:start:{material['id']}",
+                }
+            }
+        )
+        # Toggle
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_toggle",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:batch:toggle:{channel_a['id']}",
+                }
+            }
+        )
+        # Submit — service should reject for missing batch_orders feature
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_free_submit",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:batch:submit",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_batch_failed")
+
+    def test_advertiser_menu_exposes_plan_entry(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu_plan",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        plan = [b for b in all_buttons if b["callback_data"] == "advertiser:plan"]
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["text"], "📦 我的套餐")
+
+    def test_advertiser_plan_panel_for_free_user_shows_both_upgrade_paths(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_free",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("Free", body)
+        self.assertIn("Pro", body)
+        self.assertIn("Enterprise", body)
+        self.assertIn("当前", body)
+        keyboard = self._last_user_facing_keyboard()
+        upgrades = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:plan:buy:")
+        ]
+        self.assertEqual(
+            sorted(b["callback_data"].removeprefix("advertiser:plan:buy:") for b in upgrades),
+            ["enterprise", "pro"],
+        )
+
+    def test_advertiser_plan_panel_for_pro_user_hides_pro_upgrade_button(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_pro",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        upgrade_callbacks = [
+            b["callback_data"] for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:plan:buy:")
+        ]
+        self.assertEqual(upgrade_callbacks, ["advertiser:plan:buy:enterprise"])
+
+    def test_advertiser_plan_buy_sends_stars_invoice_and_fulfills_on_payment(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        # Tap buy:pro → invoice sent to gateway
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_plan_buy",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:plan:buy:pro",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_plan_invoice_sent")
+        self.assertEqual(result["plan"], "pro")
+        self.assertEqual(len(self.gateway.invoices), 1)
+        invoice = self.gateway.invoices[0]
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertEqual(int(result["stars_amount"]), invoice["prices"][0]["amount"])
+
+        # Simulate the user paying — fulfill_successful_payment should activate Pro
+        payment = {
+            "currency": "XTR",
+            "total_amount": result["stars_amount"],
+            "invoice_payload": invoice["payload"],
+            "telegram_payment_charge_id": "charge_pro_test",
+        }
+        self.app.stars_payments.fulfill_successful_payment(
+            payment, telegram_user_id=10001
+        )
+        status = self.app.advertiser_subscriptions.status(10001)
+        self.assertEqual(status["entitlements"]["plan"], "pro")
+
+    def test_advertiser_alerts_for_free_user_explains_pro_requirement(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_free",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("Pro", body)
+        # bug_003: must NOT advertise the CLI fallback, since chabo create-alert-rule
+        # is also Pro-gated and would just throw the same InvalidState back at them.
+        self.assertNotIn("create-alert-rule", body)
+        # Should route to the in-Bot upgrade page instead.
+        keyboard = self._last_user_facing_keyboard()
+        callbacks = [b["callback_data"] for row in keyboard for b in row]
+        self.assertIn("advertiser:plan", callbacks)
+
+    def test_advertiser_alerts_empty_for_pro_user_with_no_rules(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_pro_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("暂无新提醒", body)
+
+    def test_advertiser_alerts_lists_triggered_events_with_play_buttons(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("100")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        channel = self.bind_channel()
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+        self.app.advertisers.create_alert_rule(
+            advertiser_telegram_user_id=10001,
+            category="software",
+            min_score=0,
+            max_risk_level="normal",
+        )
+        self.app.advertisers.scan_alerts(advertiser_telegram_user_id=10001)
+
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_alerts_pro",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:alerts",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn(channel["title"], body)
+        self.assertIn("🆕", body)
+        keyboard = self._last_user_facing_keyboard()
+        play_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("channel:order:")
+        ]
+        self.assertEqual(len(play_buttons), 1)
+        self.assertEqual(play_buttons[0]["callback_data"], f"channel:order:{channel['id']}")
+
+    def test_remove_saved_channel_returns_true_only_when_row_existed(self) -> None:
+        channel = self.bind_channel()
+        self.app.advertisers.save_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+            note="先收藏",
+        )
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        first = self.app.advertisers.remove_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        )
+        second = self.app.advertisers.remove_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertFalse(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+
+    def test_advertiser_menu_exposes_saved_entry_point(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu_saved",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        saved = [b for b in all_buttons if b["callback_data"] == "advertiser:saved"]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["text"], "⭐ 我的收藏")
+
+    def test_saved_empty_state_guides_to_discover(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_saved_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:saved",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("还没有收藏", body)
+        keyboard = self._last_user_facing_keyboard()
+        callbacks = [b["callback_data"] for row in keyboard for b in row]
+        self.assertIn("advertiser:discover", callbacks)
+
+    def test_save_then_unsave_cycle_via_discover_and_saved_list(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        # Discover page exposes ⭐ buttons
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_for_save",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        save_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:save:disc:")
+        ]
+        self.assertEqual(len(save_buttons), 1)
+        self.assertTrue(save_buttons[0]["text"].startswith("⭐"))
+
+        # Tap save → channel becomes saved
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_save",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:save:disc:{channel['id']}",
+                }
+            }
+        )
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        # Discover refresh shows the 🌟 marker
+        keyboard_after = self._last_user_facing_keyboard()
+        save_after = [
+            b for row in keyboard_after for b in row
+            if b["callback_data"].startswith("advertiser:save:disc:")
+        ]
+        self.assertTrue(save_after[0]["text"].startswith("🌟"))
+
+        # Saved list page lists the channel
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_saved_list",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:saved",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn(channel["title"], body)
+
+        # Tap ❌ from saved list → unsave
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_unsave",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:save:saved:{channel['id']}",
+                }
+            }
+        )
+        self.assertFalse(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel["id"],
+        ))
+        body_after = self._last_user_facing_text()
+        self.assertIn("还没有收藏", body_after)
+
+    def test_advertiser_menu_exposes_discover_entry_point(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_menu",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "role:advertiser",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        discover = [b for b in all_buttons if b["callback_data"] == "advertiser:discover"]
+        self.assertEqual(len(discover), 1)
+        self.assertEqual(discover[0]["text"], "🔍 找频道")
+
+    def test_advertiser_discover_lists_assessed_channels_with_play_buttons(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_discover",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_discover")
+        body = self._last_user_facing_text()
+        self.assertIn("找频道", body)
+        self.assertIn(channel["title"], body)
+        self.assertIn("软件", body)
+        self.assertIn("订阅", body)
+
+        keyboard = self._last_user_facing_keyboard()
+        play_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("channel:order:")
+        ]
+        self.assertEqual(len(play_buttons), 1)
+        self.assertEqual(play_buttons[0]["callback_data"], f"channel:order:{channel['id']}")
+
+    def test_advertiser_discover_empty_state_guides_user(self) -> None:
+        # No channels assessed yet
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_discover_empty",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        body = self._last_user_facing_text()
+        self.assertIn("暂无", body)
+        self.assertIn("频道招商", body)  # nudge to alternate entry point
+
+    def test_advertiser_discover_play_button_starts_placement_flow(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.pricing.assess_channel(
+            channel_id=channel["id"],
+            category="software",
+            median_24h_views=20_000,
+            subscribers=50_000,
+            light_clicks_30d=180,
+            light_unique_clickers_30d=120,
+            repeat_purchase_count=2,
+            dispute_count=0,
+            risk_level="normal",
+        )
+        self.app.pricing.apply_quotes_to_rate_cards(channel["id"])
+
+        # Tap discover → tap ▶
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:discover",
+                }
+            }
+        )
+        play = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disc_play",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"channel:order:{channel['id']}",
+                }
+            }
+        )
+        self.assertEqual(play["type"], "callback_order_flow_started")
+        # placement_config conversation should be set up for this channel
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        self.assertEqual(state["flow"], "placement_config")
+        payload = json.loads(state["payload_json"])
+        self.assertEqual(payload["channel_id"], channel["id"])
+
+    def test_library_create_button_walks_standard_format_end_to_end(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Library page exposes ➕ 新建素材
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib_open_new",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        all_buttons = [b for row in keyboard for b in row]
+        self.assertTrue(
+            any(b["callback_data"] == "advertiser:material:new" for b in all_buttons),
+            "Library should expose ➕ 新建素材",
+        )
+
+        # Pick format → standard_card
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_format",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:material:new",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pick_standard",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:material:new:standard_card",
+                }
+            }
+        )
+        self.assertIn("请发送广告文案", self._last_user_facing_text())
+
+        # Walk text → url
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 11,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "全新独立创建的标准插播文案",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 12,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://example.com/standalone",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_saved")
+
+        # Material is in the library
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["text"], "全新独立创建的标准插播文案")
+        self.assertEqual(items[0]["target_url"], "https://example.com/standalone")
+        self.assertEqual(items[0]["format_type"], "standard_card")
+
+        # Conversation state cleaned up
+        with self.app.db.transaction() as conn:
+            state_row = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state_row is None or state_row["flow"] != "material_create")
+
+    def test_library_create_light_tail_collects_short_then_detail_then_url(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        for cb_id, data in [
+            ("cb_lt_picker", "advertiser:material:new"),
+            ("cb_lt_format", "advertiser:material:new:light_tail"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+
+        # Short entry too long → rejection, conversation stays at light_short_text
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 21,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "一" * 16,
+                }
+            }
+        )
+        # Errors go through send_private_message — assert directly against that channel
+        self.assertIn("2-15 个字", self.gateway.private_messages[-1]["text"])
+
+        # Within bounds
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 22,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "想看广告？",
+                }
+            }
+        )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 23,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "完整文字插播详情文案，应该够长。",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 24,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "https://example.com/light",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_saved")
+
+        items = self.app.materials.list_materials(advertiser_telegram_user_id=10001)
+        self.assertEqual(items[0]["format_type"], "light_tail")
+        self.assertEqual(items[0]["light_short_text"], "想看广告？")
+        self.assertEqual(items[0]["button_text"], "想看广告？")
+
+    def test_library_create_url_must_be_http(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        for cb_id, data in [
+            ("cb_url_picker", "advertiser:material:new"),
+            ("cb_url_std", "advertiser:material:new:standard_card"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 31,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "标准卡片正文文案",
+                }
+            }
+        )
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 32,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "ftp://example.com/wrong",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "material_create_invalid_url")
+        self.assertEqual(self.app.materials.list_materials(advertiser_telegram_user_id=10001), [])
+
+    def test_material_edit_text_via_bot_updates_creative_and_renders_panel(self) -> None:
+        self.confirm_timezone(10001, display_name="广告主")
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始文案",
+            target_url="https://example.com/orig",
+        )
+
+        # Library page → tap ✏️
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_lib_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": "advertiser:library",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        edit_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].startswith("advertiser:material:edit:")
+        ]
+        self.assertEqual(len(edit_buttons), 1)
+        self.assertEqual(edit_buttons[0]["callback_data"], f"advertiser:material:edit:{material['id']}")
+
+        # Edit panel
+        panel = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_edit_panel",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:material:edit:{material['id']}",
+                }
+            }
+        )
+        self.assertEqual(panel["type"], "callback_material_edit_panel")
+        panel_text = self._last_user_facing_text()
+        self.assertIn("编辑素材", panel_text)
+        self.assertIn("原始文案", panel_text)
+
+        # Tap 文案
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_edit_field_text",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:material:field:{material['id']}:text",
+                }
+            }
+        )
+        self.assertIn("请发送新的广告文案", self._last_user_facing_text())
+
+        # Send replacement text
+        send_result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "全新升级文案",
+                }
+            }
+        )
+        self.assertEqual(send_result["type"], "material_edit_saved")
+
+        refreshed = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed["text"], "全新升级文案")
+        self.assertEqual(refreshed["target_url"], "https://example.com/orig")
+        self.assertNotEqual(refreshed["content_hash"], material["content_hash"])
+
+    def test_material_edit_does_not_alter_existing_order_snapshot(self) -> None:
+        channel, order = self.create_approved_order()
+        # The order's creative came from inline create_order; locate it
+        with self.app.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT creative_id FROM ad_orders WHERE id = ?", (order["id"],)
+            ).fetchone()
+            material_id = row["creative_id"]
+            snapshot_before = conn.execute(
+                "SELECT payload_json FROM evidence_snapshots WHERE order_id = ? AND snapshot_type = 'creative'",
+                (order["id"],),
+            ).fetchone()["payload_json"]
+
+        self.app.materials.update_material(
+            material_id,
+            advertiser_telegram_user_id=10001,
+            text="修改后的文案",
+        )
+
+        with self.app.db.transaction() as conn:
+            snapshot_after = conn.execute(
+                "SELECT payload_json FROM evidence_snapshots WHERE order_id = ? AND snapshot_type = 'creative'",
+                (order["id"],),
+            ).fetchone()["payload_json"]
+        self.assertEqual(snapshot_before, snapshot_after)
+        refreshed = self.app.materials.get_material(material_id)
+        self.assertEqual(refreshed["text"], "修改后的文案")
+
+    def test_material_edit_blocks_archived_material(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="将被归档",
+            target_url="https://example.com/x",
+        )
+        self.app.materials.archive_material(material["id"], advertiser_telegram_user_id=10001)
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                text="不能改",
+            )
+
+    def test_material_edit_rejects_other_users_material(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="A 的素材",
+            target_url="https://example.com/a",
+        )
+        with self.assertRaises(NotFound):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=99999,
+                text="B 想偷改",
+            )
+        unchanged = self.app.materials.get_material(material["id"])
+        self.assertEqual(unchanged["text"], "A 的素材")
+
+    def test_material_edit_rejects_non_http_url(self) -> None:
+        """merged_bug_001: update_material must enforce the http(s):// scheme like create_material."""
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始文案",
+            target_url="https://example.com",
+        )
+        for bad_url in ("ftp://example.com", "javascript:alert(1)", "example.com"):
+            with self.assertRaises(InvalidState):
+                self.app.materials.update_material(
+                    material["id"],
+                    advertiser_telegram_user_id=10001,
+                    target_url=bad_url,
+                )
+        # The original URL must be intact
+        unchanged = self.app.materials.get_material(material["id"])
+        self.assertEqual(unchanged["target_url"], "https://example.com")
+
+    def test_material_edit_rejects_text_outside_length_bounds(self) -> None:
+        """merged_bug_001: update_material must enforce the 4-800 (light_tail: 4-1000) bounds."""
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="原始标准插播文案",
+            target_url="https://example.com",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                std["id"], advertiser_telegram_user_id=10001, text="x"
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                std["id"], advertiser_telegram_user_id=10001, text="一" * 801
+            )
+        # within bounds OK
+        self.app.materials.update_material(
+            std["id"], advertiser_telegram_user_id=10001, text="一" * 50
+        )
+
+        light = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="原始文字插播详情",
+            target_url="https://example.com",
+            light_short_text="想看广告？",
+        )
+        # light_tail allows up to 1000
+        self.app.materials.update_material(
+            light["id"], advertiser_telegram_user_id=10001, text="一" * 1000
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                light["id"], advertiser_telegram_user_id=10001, text="一" * 1001
+            )
+
+    def test_material_edit_light_short_text_validates_length(self) -> None:
+        material = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="light_tail",
+            text="文字插播完整文案",
+            target_url="https://example.com",
+            light_short_text="想投广告？",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                light_short_text="x",
+            )
+        with self.assertRaises(InvalidState):
+            self.app.materials.update_material(
+                material["id"],
+                advertiser_telegram_user_id=10001,
+                light_short_text="一" * 16,
+            )
+        # within bounds OK
+        self.app.materials.update_material(
+            material["id"],
+            advertiser_telegram_user_id=10001,
+            light_short_text="新短入口文案",
+        )
+        refreshed = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed["light_short_text"], "新短入口文案")
+
+    def test_advertiser_dispute_button_appears_after_a_delivery_ships(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Before dispatch: no sent delivery → no 🚩 button
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_pre",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+        # Dispatch → delivery becomes sent → button appears
+        self.app.fulfillment.dispatch_due()
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard_after = self._last_user_facing_keyboard()
+        dispute_buttons_after = [
+            b for row in keyboard_after for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(len(dispute_buttons_after), 1)
+        self.assertEqual(dispute_buttons_after[0]["callback_data"], f"advertiser:order:{order['id']}:dispute")
+
+    def test_advertiser_dispute_full_flow_marks_delivery_disputed(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+
+        # Tap 🚩 → prompt
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_dispute_start",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute",
+                }
+            }
+        )
+        self.assertIn("申诉原因", self._last_user_facing_text())
+
+        # Send reason
+        result = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 99,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "频道主提前删除了广告，没有完成承诺的曝光时长。",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "dispute_opened")
+        self.assertEqual(result["order_id"], order["id"])
+        dispute_id = result["dispute_id"]
+
+        with self.app.db.transaction() as conn:
+            dispute = conn.execute(
+                "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+            ).fetchone()
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ? ORDER BY scheduled_at DESC LIMIT 1",
+                (order["id"],),
+            ).fetchone()
+        self.assertEqual(dispute["status"], "open")
+        self.assertEqual(delivery["status"], "disputed")
+
+        # Conversation cleaned up
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state is None or state["flow"] != "dispute_open")
+
+    def test_advertiser_dispute_blocks_when_already_open(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.fulfillment.dispatch_due()
+        self.app.disputes.advertiser_open_dispute(
+            advertiser_telegram_user_id=10001,
+            order_id=order["id"],
+            reason="第一次申诉",
+        )
+        # Detail page no longer offers the 🚩 button
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post_disp",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+        # Direct service call also rejects
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="想再开一次",
+            )
+
+    def test_advertiser_dispute_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.assertRaises(NotFound):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=99999,
+                order_id=order["id"],
+                reason="他人想偷开案",
+            )
+
+    def test_advertiser_dispute_cancel_clears_conversation_state(self) -> None:
+        """bug_007: tapping cancel must wipe dispute_open so the next message is not eaten."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Open dispute prompt → conversation row written
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disp_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            state = conn.execute(
+                "SELECT flow FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertEqual(state["flow"], "dispute_open")
+
+        # Tap cancel — must use the dispute_cancel suffix and clear state
+        cancel = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_disp_cancel",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:dispute_cancel",
+                }
+            }
+        )
+        self.assertEqual(cancel["type"], "callback_advertiser_dispute_cancel")
+        with self.app.db.transaction() as conn:
+            state_after = conn.execute(
+                "SELECT * FROM bot_conversation_states WHERE chat_id = '10001'"
+            ).fetchone()
+        self.assertTrue(state_after is None or state_after["flow"] != "dispute_open")
+
+        # A stray plain-text message must NOT file a dispute now
+        before_disputes = self.app.disputes.list_disputes()
+        self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 200,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "thanks 👋",
+                }
+            }
+        )
+        after_disputes = self.app.disputes.list_disputes()
+        self.assertEqual(len(after_disputes), len(before_disputes))
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+        self.assertEqual(delivery["status"], "sent")  # not 'disputed'
+
+    def test_advertiser_dispute_blocks_after_full_refund(self) -> None:
+        """bug_008: refunded deliveries must not be re-disputable."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        with self.app.db.transaction() as conn:
+            delivery = conn.execute(
+                "SELECT * FROM deliveries WHERE order_id = ?", (order["id"],)
+            ).fetchone()
+        # Operator refunds in full → status='refunded'
+        self.app.orders.refund_delivery(
+            delivery_id=delivery["id"],
+            reason="频道主提前删除",
+        )
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="想再发一次申诉",
+            )
+        # Detail page must NOT offer the 🚩 button either
+        self.confirm_timezone(10001, display_name="广告主")
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_post_refund",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard = self._last_user_facing_keyboard()
+        dispute_buttons = [
+            b for row in keyboard for b in row
+            if b["callback_data"].endswith(":dispute")
+        ]
+        self.assertEqual(dispute_buttons, [])
+
+    def test_advertiser_dispute_blocks_after_earnings_confirmed(self) -> None:
+        """bug_008: confirmed deliveries must not be flipped to disputed."""
+        _, order = self.create_approved_order()
+        self.app.fulfillment.dispatch_due()
+        # Manually confirm earnings (skips the 24h wait)
+        with self.app.db.transaction() as conn:
+            conn.execute(
+                "UPDATE deliveries SET status = 'confirmed' WHERE order_id = ?",
+                (order["id"],),
+            )
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="结算后才发现问题",
+            )
+
+    def test_advertiser_dispute_requires_at_least_one_sent_delivery(self) -> None:
+        _, order = self.create_approved_order()
+        # No dispatch → no sent delivery
+        with self.assertRaises(InvalidState):
+            self.app.disputes.advertiser_open_dispute(
+                advertiser_telegram_user_id=10001,
+                order_id=order["id"],
+                reason="还没发就想申诉",
+            )
+
+    def test_advertiser_can_stop_running_order_and_get_budget_back(self) -> None:
+        _, order = self.create_approved_order(budget="10")
+        self.confirm_timezone(10001, display_name="广告主")
+
+        # Detail view should expose the stop button while order is approvable
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_detail_1",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}",
+                }
+            }
+        )
+        keyboard_before = self._last_user_facing_keyboard()
+        stop_buttons = [
+            b for row in keyboard_before for b in row if b["callback_data"].endswith(":stop")
+        ]
+        self.assertEqual(len(stop_buttons), 1)
+
+        # Tap stop → second confirmation page mentions refund amount
+        confirm = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_confirm",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop",
+                }
+            }
+        )
+        self.assertEqual(confirm["type"], "callback_advertiser_order_stop_confirm")
+        self.assertIn("USD 10.00", self._last_user_facing_text())
+
+        # Confirm stop → status becomes paused, budget refunded, paused notification fires
+        self.gateway.private_messages.clear()
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_yes",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stopped")
+
+        with self.app.db.transaction() as conn:
+            saved = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (order["id"],)).fetchone()
+            advertiser = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["reserved_cents"], 0)
+        self.assertEqual(advertiser["available_balance_cents"], 1000)
+
+        # Pause notification should have been sent
+        pause_notifs = [m for m in self.gateway.private_messages if "投放已暂停" in m["text"]]
+        self.assertEqual(len(pause_notifs), 1)
+        self.assertIn("广告主主动停止投放", pause_notifs[0]["text"])
+
+        # Detail page no longer shows stop button (terminal state)
+        keyboard_after = self._last_user_facing_keyboard()
+        stop_buttons_after = [
+            b for row in keyboard_after for b in row if b["callback_data"].endswith(":stop")
+        ]
+        self.assertEqual(stop_buttons_after, [])
+
+        # Audit row recorded
+        with self.app.db.transaction() as conn:
+            audit = conn.execute(
+                "SELECT * FROM audit_logs WHERE entity_id = ? AND action = 'order_paused_by_advertiser'",
+                (order["id"],),
+            ).fetchone()
+        self.assertIsNotNone(audit)
+
+    def test_advertiser_stop_rejects_other_users_orders(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(99999, display_name="他人")
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_steal",
+                    "from": {"id": 99999, "first_name": "他人"},
+                    "message": {"chat": {"id": 99999}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stop_not_found")
+
+        # Original order should be untouched
+        with self.app.db.transaction() as conn:
+            saved = conn.execute("SELECT status FROM ad_orders WHERE id = ?", (order["id"],)).fetchone()
+        self.assertEqual(saved["status"], "approved")
+
+    def test_advertiser_stop_blocks_already_paused_order(self) -> None:
+        _, order = self.create_approved_order()
+        self.confirm_timezone(10001, display_name="广告主")
+        # First stop succeeds
+        self.app.orders.advertiser_pause_order(
+            order_id=order["id"],
+            advertiser_telegram_user_id=10001,
+        )
+
+        # Trying again must be rejected with a friendly message
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_stop_again",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}, "message_id": 1},
+                    "data": f"advertiser:order:{order['id']}:stop_yes",
+                }
+            }
+        )
+        self.assertEqual(result["type"], "callback_advertiser_order_stop_invalid")
+        self.assertIn("无法停止", self._last_user_facing_text())
+
+    def test_placement_slot_switch_preserves_per_slot_creative_draft(self) -> None:
+        channel = self.bind_channel()
+        self.confirm_timezone(10001, display_name="广告主")
+        std = self.app.materials.create_material(
+            advertiser_telegram_user_id=10001,
+            format_type="standard_card",
+            text="标准插播草稿",
+            target_url="https://example.com/std",
+        )
+
+        for cb_id, data in [
+            ("cb_swap_1", f"channel:order:{channel['id']}"),
+            ("cb_swap_2", "place:slot:standard_card"),
+            ("cb_swap_3", "place:creative"),
+            ("cb_swap_4", "place:pick:0"),
+        ]:
+            self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}},
+                        "data": data,
+                    }
+                }
+            )
+
+        with self.app.db.transaction() as conn:
+            payload_after_pick = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_after_pick["material_id"], std["id"])
+
+        # Switch to 文字插播 — selection must clear so the user can configure the new slot fresh
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_swap_to_light",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:light_tail",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            payload_on_light = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_on_light["slot_type"], "light_tail")
+        self.assertNotIn("material_id", payload_on_light)
+        self.assertNotIn("creative_text", payload_on_light)
+
+        # Flip back to 标准插播 — the previous draft should be restored
+        self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_swap_back",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "place:slot:standard_card",
+                }
+            }
+        )
+        with self.app.db.transaction() as conn:
+            payload_restored = json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM bot_conversation_states WHERE chat_id = '10001'"
+                ).fetchone()["payload_json"]
+            )
+        self.assertEqual(payload_restored["slot_type"], "standard_card")
+        self.assertEqual(payload_restored["material_id"], std["id"])
+        self.assertEqual(payload_restored["creative_text"], "标准插播草稿")
+        self.assertEqual(payload_restored["target_url"], "https://example.com/std")
 
     def _grant_publisher_access(self, channel: dict, telegram_user_id: int = 20001) -> None:
         """Wire FakeGateway so the publisher passes the get_chat_member check."""

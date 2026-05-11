@@ -252,6 +252,140 @@ class MaterialService:
         )
         return material
 
+    EDITABLE_FIELDS = ("text", "target_url", "button_text", "light_short_text")
+
+    def update_material(
+        self,
+        material_id: str,
+        *,
+        advertiser_telegram_user_id: str | int,
+        text: str | None = None,
+        target_url: str | None = None,
+        button_text: str | None = None,
+        light_short_text: str | None = None,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update editable fields of an active (non-archived) material.
+
+        Pass None to leave a field untouched; the format_type is immutable
+        (different formats = different products). Existing orders carry
+        creative snapshots written at create-time, so this only affects
+        future placements that pick the material.
+        """
+        provided = {
+            "text": text,
+            "target_url": target_url,
+            "button_text": button_text,
+            "light_short_text": light_short_text,
+        }
+        audit_args = {
+            "material_id": material_id,
+            "updated_fields": [k for k, v in provided.items() if v is not None],
+        }
+        try:
+            if not any(v is not None for v in provided.values()):
+                raise InvalidState("没有可更新的字段")
+            with self.db.transaction() as conn:
+                advertiser = conn.execute(
+                    "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                    (str(advertiser_telegram_user_id),),
+                ).fetchone()
+                if not advertiser:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                row = conn.execute(
+                    "SELECT * FROM creatives WHERE id = ? AND advertiser_account_id = ?",
+                    (material_id, advertiser["id"]),
+                ).fetchone()
+                if not row:
+                    raise NotFound(f"广告素材不存在：{material_id}")
+                if row["archived_at"]:
+                    raise InvalidState("已归档的素材无法编辑，请新建一条素材。")
+
+                new_text = row["text"] if text is None else (text or "").strip()
+                new_target_url = (
+                    row["target_url"] if target_url is None else (target_url or "").strip()
+                )
+                if button_text is None:
+                    new_button_text = row["button_text"]
+                else:
+                    new_button_text = (button_text or "").strip() or "查看详情"
+
+                # Mirror create-time validation so Bot, CLI, and AI tool calls
+                # agree on the rules. light_tail's text is the detail-page body
+                # (longer ceiling), others are the main copy.
+                if not new_text:
+                    raise InvalidState("广告素材文案不能为空")
+                text_max = 1000 if row["format_type"] == "light_tail" else 800
+                if text is not None and (len(new_text) < 4 or len(new_text) > text_max):
+                    raise InvalidState(f"广告文案需要 4-{text_max} 个字")
+                if not new_target_url:
+                    raise InvalidState("广告素材必须包含目标链接")
+                if target_url is not None and not (
+                    new_target_url.startswith("http://")
+                    or new_target_url.startswith("https://")
+                ):
+                    raise InvalidState("链接必须以 http:// 或 https:// 开头")
+
+                if row["format_type"] == "light_tail":
+                    if light_short_text is None:
+                        new_short = row["light_short_text"]
+                    else:
+                        short = (light_short_text or "").strip()
+                        if len(short) < self.LIGHT_SHORT_TEXT_MIN:
+                            raise InvalidState(
+                                f"文字插播短入口至少 {self.LIGHT_SHORT_TEXT_MIN} 个字"
+                            )
+                        if len(short) > self.LIGHT_SHORT_TEXT_MAX:
+                            raise InvalidState(
+                                f"文字插播短入口最多 {self.LIGHT_SHORT_TEXT_MAX} 个字"
+                            )
+                        new_short = short
+                else:
+                    new_short = None
+
+                content_hash = hashlib.sha256(
+                    f"{row['format_type']}|{new_short or ''}|{new_text}|{new_target_url}|{new_button_text}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+                conn.execute(
+                    """
+                    UPDATE creatives
+                    SET text = ?, target_url = ?, button_text = ?, light_short_text = ?,
+                        content_hash = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        new_text,
+                        new_target_url,
+                        new_button_text,
+                        new_short,
+                        content_hash,
+                        material_id,
+                    ),
+                )
+                material = self._fetch_material(conn, material_id)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="update_material",
+                actor_telegram_user_id=advertiser_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="update_material",
+            actor_telegram_user_id=advertiser_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"updated {material_id}",
+        )
+        return material
+
     # ------ helpers reusable from OrderService inside an open transaction ------
 
     def insert_material_in_conn(
@@ -474,6 +608,100 @@ class DisputeService:
                     delivery["order_id"],
                     delivery_id,
                     json.dumps({"reason": reason, "opened_by": opener["id"]}, ensure_ascii=False),
+                ),
+            )
+            return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
+
+    def advertiser_open_dispute(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        order_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Advertiser-initiated dispute against the latest sent delivery on an order.
+
+        Ownership-checked: caller must be the order's advertiser. Only orders
+        with at least one delivered (sent / confirmed / refunded / disputed)
+        delivery are disputable — no point opening a case on a never-sent
+        order. The resulting dispute carries delivery_id of the most recent
+        delivery so the operator review queue can locate the evidence.
+        """
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            raise InvalidState("申诉原因不能为空")
+        if len(clean_reason) > 500:
+            raise InvalidState("申诉原因最多 500 个字")
+        with self.db.transaction() as conn:
+            advertiser = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not advertiser:
+                raise NotFound(f"order not found: {order_id}")
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ? AND advertiser_account_id = ?",
+                (order_id, advertiser["id"]),
+            ).fetchone()
+            if not order:
+                raise NotFound(f"order not found: {order_id}")
+            # Only pre-settlement deliveries are disputable. Including
+            # 'confirmed' / 'refunded' here was wrong: rewriting status to
+            # 'disputed' and later resolving via resolve_dispute() flips the
+            # row back to 'sent', and confirm_due_earnings then double-confirms
+            # publisher pending_earnings, corrupting the ledger.
+            delivery = conn.execute(
+                """
+                SELECT * FROM deliveries
+                WHERE order_id = ? AND status = 'sent'
+                ORDER BY COALESCE(sent_at, scheduled_at) DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+            if not delivery:
+                raise InvalidState("还没有可申诉的投放（已退款 / 已结算 / 还没发出）")
+            existing = conn.execute(
+                """
+                SELECT id FROM disputes
+                WHERE delivery_id = ? AND status = 'open'
+                LIMIT 1
+                """,
+                (delivery["id"],),
+            ).fetchone()
+            if existing:
+                raise InvalidState("该投放已有进行中的申诉")
+            dispute_id = new_id("disp")
+            conn.execute(
+                """
+                INSERT INTO disputes (id, order_id, delivery_id, opened_by_account_id, reason)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (dispute_id, delivery["order_id"], delivery["id"], advertiser["id"], clean_reason),
+            )
+            # Race-safety: only flip the row when it is still 'sent'. If a
+            # parallel confirm_due_earnings just won the row, the dispute
+            # insert above will roll back via the unique-id constraint or be
+            # cleaned up out-of-band — the delivery state stays consistent.
+            updated = conn.execute(
+                "UPDATE deliveries SET status = 'disputed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'sent'",
+                (delivery["id"],),
+            )
+            if updated.rowcount == 0:
+                raise InvalidState("该投放状态已变化，无法申诉，请刷新订单详情")
+            conn.execute(
+                """
+                INSERT INTO evidence_snapshots (id, order_id, delivery_id, snapshot_type, payload_json)
+                VALUES (?, ?, ?, 'dispute_opened', ?)
+                """,
+                (
+                    new_id("ev"),
+                    delivery["order_id"],
+                    delivery["id"],
+                    json.dumps(
+                        {"reason": clean_reason, "opened_by": advertiser["id"], "source": "advertiser_self"},
+                        ensure_ascii=False,
+                    ),
                 ),
             )
             return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
@@ -1232,6 +1460,51 @@ class OrderService:
             publisher_net_cents = remaining_net
             platform_fee_cents = amount_cents - publisher_net_cents
         return publisher_net_cents, platform_fee_cents
+
+    ADVERTISER_PAUSABLE_STATUSES = ("pending_review", "approved", "running")
+
+    def advertiser_pause_order(
+        self,
+        *,
+        order_id: str,
+        advertiser_telegram_user_id: str | int,
+    ) -> dict[str, Any]:
+        """Advertiser-initiated pause: refunds reserved budget on a live order.
+
+        Reuses ``pause_and_release`` so the existing ledger release + paused
+        notification fire identically. Ownership is enforced by joining on
+        the requester's account_id; terminal-status orders are rejected
+        (paused/done/refunded/budget_exhausted/rejected).
+        """
+        with self.db.transaction() as conn:
+            account_row = conn.execute(
+                "SELECT id FROM accounts WHERE telegram_user_id = ?",
+                (str(advertiser_telegram_user_id),),
+            ).fetchone()
+            if not account_row:
+                raise NotFound(f"account not found: {advertiser_telegram_user_id}")
+            order = conn.execute(
+                "SELECT * FROM ad_orders WHERE id = ? AND advertiser_account_id = ?",
+                (order_id, account_row["id"]),
+            ).fetchone()
+            if not order:
+                raise NotFound(f"order not found: {order_id}")
+            previous_status = order["status"]
+            if previous_status not in self.ADVERTISER_PAUSABLE_STATUSES:
+                raise InvalidState(
+                    f"订单当前状态「{previous_status}」无法停止"
+                )
+            reason = "广告主主动停止投放"
+            self.pause_and_release(conn, order_id, reason)
+            self._audit(
+                conn,
+                account_row["id"],
+                "order_paused_by_advertiser",
+                "ad_order",
+                order_id,
+                {"reason": reason, "previous_status": previous_status},
+            )
+            return self.get_order(conn, order_id)
 
     def pause_and_release(self, conn: sqlite3.Connection, order_id: str, reason: str) -> None:
         order = self.get_order(conn, order_id)

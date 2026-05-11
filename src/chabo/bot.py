@@ -376,8 +376,10 @@ class UpdateHandler:
             material_id = data.removeprefix("advertiser:material:edit:")
             self._send_material_edit_panel(chat_id, user, material_id, message)
             return {"handled": True, "type": "callback_material_edit_panel", "material_id": material_id}
-        if data.startswith("advertiser:material:field:"):
-            tail = data.removeprefix("advertiser:material:field:")
+        # Compact aliases keep callback_data under Telegram's 64-byte limit;
+        # the legacy long form stays accepted for already-sent messages.
+        if data.startswith("amf:") or data.startswith("advertiser:material:field:"):
+            tail = data.removeprefix("amf:") if data.startswith("amf:") else data.removeprefix("advertiser:material:field:")
             material_id, _, field = tail.partition(":")
             self._begin_material_field_edit(chat_id, user, material_id, field, message)
             return {"handled": True, "type": "callback_material_edit_field", "material_id": material_id, "field": field}
@@ -410,6 +412,11 @@ class UpdateHandler:
             return {"handled": True, "type": "callback_role_switch_prompt"}
         if data == "web:open":
             return self._send_web_magic_link(chat_id, user, message)
+        if data.startswith("adodc:"):
+            order_id = data.removeprefix("adodc:")
+            self._clear_dispute_open_state(chat_id)
+            self._send_advertiser_order_detail(chat_id, user, order_id, message)
+            return {"handled": True, "type": "callback_advertiser_dispute_cancel", "order_id": order_id}
         if data.startswith("advertiser:order:"):
             tail = data.removeprefix("advertiser:order:")
             order_id, _, action = tail.partition(":")
@@ -3623,6 +3630,14 @@ class UpdateHandler:
         },
     }
 
+    @staticmethod
+    def _material_field_callback(material_id: str, field: str) -> str:
+        return f"amf:{material_id}:{field}"
+
+    @staticmethod
+    def _dispute_cancel_callback(order_id: str) -> str:
+        return f"adodc:{order_id}"
+
     def _send_material_edit_panel(
         self,
         chat_id: str | int,
@@ -3685,7 +3700,7 @@ class UpdateHandler:
         field_buttons = [
             {
                 "text": self.MATERIAL_EDIT_FIELDS[key]["label"],
-                "callback_data": f"advertiser:material:field:{material_id}:{key}",
+                "callback_data": self._material_field_callback(material_id, key),
             }
             for key in field_keys
         ]
@@ -5577,7 +5592,7 @@ class UpdateHandler:
                 "举例：频道主提前删除广告 / 修改素材 / 没有发布。"
             ),
             inline_keyboard=[
-                [{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}:dispute_cancel"}],
+                [{"text": "↩️ 取消", "callback_data": self._dispute_cancel_callback(order_id)}],
             ],
         )
 
@@ -5602,7 +5617,7 @@ class UpdateHandler:
             self.gateway.send_private_message(
                 chat_id=chat_id,
                 text="申诉原因不能为空，请重新发送。",
-                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": f"advertiser:order:{order_id}:dispute_cancel"}]],
+                inline_keyboard=[[{"text": "↩️ 取消", "callback_data": self._dispute_cancel_callback(order_id)}]],
             )
             return {"handled": True, "type": "dispute_empty"}
         user_id = user.get("id") or chat_id

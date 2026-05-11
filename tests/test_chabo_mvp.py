@@ -3501,9 +3501,11 @@ class ChaboMvpTest(unittest.TestCase):
 
         edit_panel = callback("cb_accept_material_edit", f"advertiser:material:edit:{material['id']}")
         self.assertEqual(edit_panel["type"], "callback_material_edit_panel")
+        material_field_callback = f"amf:{material['id']}:text"
+        self.assertLessEqual(len(material_field_callback.encode("utf-8")), 64)
         edit_text = callback(
             "cb_accept_material_edit_text",
-            f"advertiser:material:field:{material['id']}:text",
+            material_field_callback,
         )
         self.assertEqual(edit_text["type"], "callback_material_edit_field")
         edit_saved = message(103, "验收编辑后的标准素材文案，确认广告库编辑链路生效。")
@@ -4568,6 +4570,14 @@ class ChaboMvpTest(unittest.TestCase):
         panel_text = self._last_user_facing_text()
         self.assertIn("编辑素材", panel_text)
         self.assertIn("原始文案", panel_text)
+        field_callbacks = [
+            b["callback_data"]
+            for row in self._last_user_facing_keyboard()
+            for b in row
+            if b["callback_data"].startswith("amf:")
+        ]
+        self.assertTrue(field_callbacks)
+        self.assertTrue(all(len(callback.encode("utf-8")) <= 64 for callback in field_callbacks))
 
         # Tap 文案
         self.app.update_handler.handle(
@@ -4576,7 +4586,7 @@ class ChaboMvpTest(unittest.TestCase):
                     "id": "cb_edit_field_text",
                     "from": {"id": 10001, "first_name": "广告主"},
                     "message": {"chat": {"id": 10001}, "message_id": 1},
-                    "data": f"advertiser:material:field:{material['id']}:text",
+                    "data": f"amf:{material['id']}:text",
                 }
             }
         )
@@ -4905,14 +4915,17 @@ class ChaboMvpTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(state["flow"], "dispute_open")
 
-        # Tap cancel — must use the dispute_cancel suffix and clear state
+        cancel_callback = f"adodc:{order['id']}"
+        self.assertLessEqual(len(cancel_callback.encode("utf-8")), 64)
+
+        # Tap cancel — must use the compact callback and clear state
         cancel = self.app.update_handler.handle(
             {
                 "callback_query": {
                     "id": "cb_disp_cancel",
                     "from": {"id": 10001, "first_name": "广告主"},
                     "message": {"chat": {"id": 10001}, "message_id": 1},
-                    "data": f"advertiser:order:{order['id']}:dispute_cancel",
+                    "data": cancel_callback,
                 }
             }
         )

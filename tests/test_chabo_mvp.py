@@ -3429,6 +3429,205 @@ class ChaboMvpTest(unittest.TestCase):
             self.app.pricing.apply_quotes_to_rate_cards(ch["id"])
         return channel_a, channel_b
 
+    def test_bot_acceptance_advertiser_real_path_from_discover_to_plan_invoice(self) -> None:
+        def callback(cb_id: str, data: str) -> dict:
+            return self.app.update_handler.handle(
+                {
+                    "callback_query": {
+                        "id": cb_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "message": {"chat": {"id": 10001}, "message_id": 1},
+                        "data": data,
+                    }
+                }
+            )
+
+        def message(message_id: int, text: str) -> dict:
+            return self.app.update_handler.handle(
+                {
+                    "message": {
+                        "message_id": message_id,
+                        "from": {"id": 10001, "first_name": "广告主"},
+                        "chat": {"id": 10001},
+                        "text": text,
+                    }
+                }
+            )
+
+        self.confirm_timezone(10001, display_name="广告主")
+        self.topup_advertiser("1000")
+        self.app.advertiser_subscriptions.purchase(
+            advertiser_telegram_user_id=10001,
+            plan="pro",
+        )
+        channel_a, channel_b = self._seed_two_assessed_channels()
+
+        discover = callback("cb_accept_find_channels", "advertiser:discover")
+        self.assertEqual(discover["type"], "callback_advertiser_discover")
+        discover_text = self._last_user_facing_text()
+        self.assertIn("找频道", discover_text)
+        self.assertIn(channel_a["title"], discover_text)
+        self.assertIn(channel_b["title"], discover_text)
+        discover_callbacks = [
+            b["callback_data"] for row in self._last_user_facing_keyboard() for b in row
+        ]
+        self.assertIn(f"advertiser:save:disc:{channel_a['id']}", discover_callbacks)
+
+        save = callback("cb_accept_save_channel", f"advertiser:save:disc:{channel_a['id']}")
+        self.assertEqual(save["type"], "callback_advertiser_save_toggle")
+        self.assertTrue(self.app.advertisers.is_saved_channel(
+            advertiser_telegram_user_id=10001,
+            channel_id=channel_a["id"],
+        ))
+        saved = callback("cb_accept_saved_channels", "advertiser:saved")
+        self.assertEqual(saved["type"], "callback_advertiser_saved")
+        self.assertIn(channel_a["title"], self._last_user_facing_text())
+
+        library = callback("cb_accept_library", "advertiser:library")
+        self.assertEqual(library["type"], "callback_advertiser_library")
+        picker = callback("cb_accept_material_new", "advertiser:material:new")
+        self.assertEqual(picker["type"], "callback_material_new_picker")
+        create = callback("cb_accept_material_standard", "advertiser:material:new:standard_card")
+        self.assertEqual(create["type"], "callback_material_new_started")
+        self.assertIn("新建标准插播素材", self._last_user_facing_text())
+
+        text_saved = message(101, "验收标准素材文案，用于真实 Bot 路径自动化验收。")
+        self.assertEqual(text_saved["type"], "material_create_text_saved")
+        material_saved = message(102, "https://example.com/bot-acceptance")
+        self.assertEqual(material_saved["type"], "material_create_saved")
+        material = self.app.materials.get_material(material_saved["material_id"])
+        self.assertEqual(material["format_type"], "standard_card")
+        self.assertEqual(material["target_url"], "https://example.com/bot-acceptance")
+
+        edit_panel = callback("cb_accept_material_edit", f"advertiser:material:edit:{material['id']}")
+        self.assertEqual(edit_panel["type"], "callback_material_edit_panel")
+        edit_text = callback(
+            "cb_accept_material_edit_text",
+            f"advertiser:material:field:{material['id']}:text",
+        )
+        self.assertEqual(edit_text["type"], "callback_material_edit_field")
+        edit_saved = message(103, "验收编辑后的标准素材文案，确认广告库编辑链路生效。")
+        self.assertEqual(edit_saved["type"], "material_edit_saved")
+        refreshed_material = self.app.materials.get_material(material["id"])
+        self.assertEqual(refreshed_material["text"], "验收编辑后的标准素材文案，确认广告库编辑链路生效。")
+
+        batch_start = callback("cb_accept_batch_start", f"advertiser:batch:start:{material['id']}")
+        self.assertEqual(batch_start["type"], "callback_batch_start")
+        batch_text = self._last_user_facing_text()
+        self.assertIn("批量投放", batch_text)
+        self.assertIn(channel_a["title"], batch_text)
+        self.assertIn(channel_b["title"], batch_text)
+        budget_prompt = callback("cb_accept_batch_budget", "advertiser:batch:budget")
+        self.assertEqual(budget_prompt["type"], "callback_batch_budget_prompt")
+        budget_saved = message(104, "150")
+        self.assertEqual(budget_saved["type"], "batch_budget_saved")
+        for index, channel in enumerate((channel_a, channel_b), start=1):
+            toggle = callback(
+                f"cb_accept_batch_toggle_{index}",
+                f"advertiser:batch:toggle:{channel['id']}",
+            )
+            self.assertEqual(toggle["type"], "callback_batch_toggle")
+        self.assertIn("已选：2", self._last_user_facing_text())
+        submitted = callback("cb_accept_batch_submit", "advertiser:batch:submit")
+        self.assertEqual(submitted["type"], "callback_batch_submitted")
+        self.assertEqual(submitted["created_count"], 2)
+        self.assertEqual(submitted["failed_count"], 0)
+
+        with self.app.db.transaction() as conn:
+            batch_orders = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT *
+                    FROM ad_orders
+                    WHERE creative_id = ?
+                    ORDER BY created_at, id
+                    """,
+                    (material["id"],),
+                ).fetchall()
+            ]
+        self.assertEqual(len(batch_orders), 2)
+        order_id = batch_orders[0]["id"]
+
+        detail = callback("cb_accept_order_detail", f"advertiser:order:{order_id}")
+        self.assertEqual(detail["type"], "callback_advertiser_order_detail")
+        detail_text = self._last_user_facing_text()
+        self.assertIn("订单详情", detail_text)
+        self.assertIn(order_id, detail_text)
+
+        stop_confirm = callback("cb_accept_order_stop", f"advertiser:order:{order_id}:stop")
+        self.assertEqual(stop_confirm["type"], "callback_advertiser_order_stop_confirm")
+        self.assertIn("停止投放", self._last_user_facing_text())
+        stopped = callback("cb_accept_order_stop_yes", f"advertiser:order:{order_id}:stop_yes")
+        self.assertEqual(stopped["type"], "callback_advertiser_order_stopped")
+        with self.app.db.transaction() as conn:
+            stopped_order = conn.execute(
+                "SELECT status, reserved_cents FROM ad_orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+        self.assertEqual(stopped_order["status"], "paused")
+        self.assertEqual(stopped_order["reserved_cents"], 0)
+
+        dispute_channel = self.app.channels.bind_channel(
+            telegram_chat_id=-100125,
+            title="验收申诉频道",
+            username="appeal_channel",
+            owner_telegram_user_id=20003,
+            owner_display_name="频道主C",
+        )
+        dispute_order = self.app.orders.create_order(
+            advertiser_telegram_user_id=10001,
+            channel_token=dispute_channel["ref_token"],
+            slot_type="standard_card",
+            text="这是一条用于申诉验收的插播广告",
+            target_url="https://example.com/dispute",
+            budget_cents=money_to_cents("50"),
+        )
+        dispute_order = self.app.orders.approve_order(dispute_order["id"])
+        self.app.fulfillment.dispatch_due()
+        dispute_detail = callback(
+            "cb_accept_dispute_order_detail",
+            f"advertiser:order:{dispute_order['id']}",
+        )
+        self.assertEqual(dispute_detail["type"], "callback_advertiser_order_detail")
+        dispute_callbacks = [
+            b["callback_data"] for row in self._last_user_facing_keyboard() for b in row
+        ]
+        self.assertIn(f"advertiser:order:{dispute_order['id']}:dispute", dispute_callbacks)
+        dispute_start = callback(
+            "cb_accept_dispute_start",
+            f"advertiser:order:{dispute_order['id']}:dispute",
+        )
+        self.assertEqual(dispute_start["type"], "callback_advertiser_dispute_start")
+        self.assertIn("申诉原因", self._last_user_facing_text())
+        dispute_opened = message(105, "广告已投放但频道主提前删除，需要运营复核证据。")
+        self.assertEqual(dispute_opened["type"], "dispute_opened")
+        self.assertEqual(dispute_opened["order_id"], dispute_order["id"])
+        with self.app.db.transaction() as conn:
+            dispute = conn.execute(
+                "SELECT status FROM disputes WHERE id = ?",
+                (dispute_opened["dispute_id"],),
+            ).fetchone()
+            delivery = conn.execute(
+                "SELECT status FROM deliveries WHERE order_id = ? ORDER BY scheduled_at DESC LIMIT 1",
+                (dispute_order["id"],),
+            ).fetchone()
+        self.assertEqual(dispute["status"], "open")
+        self.assertEqual(delivery["status"], "disputed")
+
+        plan_panel = callback("cb_accept_plan_panel", "advertiser:plan")
+        self.assertEqual(plan_panel["type"], "callback_advertiser_plan")
+        self.assertIn("Pro", self._last_user_facing_text())
+        invoices_before = len(self.gateway.invoices)
+        invoice_result = callback("cb_accept_enterprise_invoice", "advertiser:plan:buy:enterprise")
+        self.assertEqual(invoice_result["type"], "callback_advertiser_plan_invoice_sent")
+        self.assertEqual(invoice_result["plan"], "enterprise")
+        self.assertEqual(len(self.gateway.invoices), invoices_before + 1)
+        invoice = self.gateway.invoices[-1]
+        self.assertEqual(invoice["currency"], "XTR")
+        self.assertIn("插播广告主高级服务", invoice["title"])
+        self.assertEqual(invoice["prices"][0]["amount"], int(invoice_result["stars_amount"]))
+
     def test_library_exposes_batch_button_per_material(self) -> None:
         self.confirm_timezone(10001, display_name="广告主")
         material = self.app.materials.create_material(

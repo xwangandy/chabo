@@ -6,6 +6,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .audit import insert_audit_log
 from .config import Settings
 from .db import Database
 from .ids import new_id
@@ -13,6 +14,7 @@ from .money import cents_to_money, money_to_cents
 from .services import AccountService, AdvertiserService, ChaboError, ChannelService, InsufficientBalance, InvalidState, LedgerService, LightProbeService, MaterialService, NotFound, OrderService, SelfPromoService, StarsPaymentService
 from .telegram import MessageGateway, TelegramError
 from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_now, resolve_timezone
+from .webapi.auth import build_magic_link_url, issue_login_token_conn, sync_portal_access_from_activity
 
 
 STALE_CHANNEL_POST_SECONDS = 10 * 60
@@ -209,6 +211,10 @@ class UpdateHandler:
             if not account["timezone_confirmed_at"]:
                 self._prompt_timezone(chat.get("id", user_id), account["id"], payload, None, conn=conn)
                 return {"handled": True, "type": "timezone_prompt", "pending_start_payload": payload}
+            if payload in {"role", "switch", "settings"}:
+                self._prompt_role(chat.get("id", user_id), account["id"], "", None, conn=conn, switch=True)
+                return {"handled": True, "type": "role_prompt"}
+            active_role = self._account_active_role(account)
             channel = None
             for channel_token in self._channel_tokens_from_start_payload(payload):
                 channel = self.channels.get_by_token(conn, channel_token)
@@ -216,22 +222,40 @@ class UpdateHandler:
                     break
             if channel:
                 channel = self._sync_channel_profile_conn(conn, channel)
-            session_id = new_id("sess")
-            conn.execute(
-                """
-                INSERT INTO advertiser_sessions (id, advertiser_account_id, ref_channel_id, start_payload)
-                VALUES (?, ?, ?, ?)
-                """,
-                (session_id, account["id"], channel["id"] if channel else None, payload or "organic"),
-            )
-            if channel:
-                channel_for_landing = dict(channel)
-                channel_start_result = {"handled": True, "type": "channel_start", "channel_id": channel["id"], "session_id": session_id}
+                skip_advertiser_session = False
+            elif not active_role:
+                self._prompt_role(chat.get("id", user_id), account["id"], payload, None, conn=conn)
+                return {"handled": True, "type": "role_prompt", "pending_start_payload": payload}
+            elif active_role == "publisher":
+                publisher_start_result = {"handled": True, "type": "organic_start", "active_role": active_role}
+                if payload:
+                    publisher_start_result["ignored_payload"] = payload
+                channel_for_landing = None
+                channel_start_result = None
+                organic_session_id = None
+                skip_advertiser_session = True
             else:
-                organic_session_id = session_id
+                skip_advertiser_session = False
+            if not skip_advertiser_session:
+                session_id = new_id("sess")
+                conn.execute(
+                    """
+                    INSERT INTO advertiser_sessions (id, advertiser_account_id, ref_channel_id, start_payload)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (session_id, account["id"], channel["id"] if channel else None, payload or "organic"),
+                )
+                if channel:
+                    channel_for_landing = dict(channel)
+                    channel_start_result = {"handled": True, "type": "channel_start", "channel_id": channel["id"], "session_id": session_id}
+                else:
+                    organic_session_id = session_id
         if channel_for_landing and channel_start_result:
             self._send_channel_sales_landing(chat.get("id", user_id), channel_for_landing, [])
             return channel_start_result
+        if "publisher_start_result" in locals():
+            self._send_main_menu(chat.get("id", user_id), user=user)
+            return publisher_start_result
         self._send_main_menu(chat.get("id", user_id), user=user)
         return {"handled": True, "type": "organic_start", "session_id": organic_session_id}
 
@@ -270,10 +294,10 @@ class UpdateHandler:
             )
             return {"handled": True, "type": "callback_timezone_input_requested"}
         if data == "role:advertiser":
-            self._send_advertiser_menu(chat_id, user, message)
+            self._set_active_role(chat_id, user, "advertiser", message)
             return {"handled": True, "type": "callback_advertiser_menu"}
         if data == "role:publisher":
-            self._send_publisher_menu(chat_id, user, message)
+            self._set_active_role(chat_id, user, "publisher", message)
             return {"handled": True, "type": "callback_publisher_menu"}
         if data == "publisher:channels":
             self._send_publisher_menu(chat_id, user, message)
@@ -322,6 +346,12 @@ class UpdateHandler:
         if data == "settings:home":
             self._send_settings_menu(chat_id, user, message)
             return {"handled": True, "type": "callback_settings_menu"}
+        if data == "settings:role":
+            account = self._ensure_mixed_account(user, chat_id)
+            self._prompt_role(chat_id, account["id"], "", message, switch=True)
+            return {"handled": True, "type": "callback_role_switch_prompt"}
+        if data == "web:open":
+            return self._send_web_magic_link(chat_id, user, message)
         if data == "advertiser:order_help":
             self._send_global_placement(chat_id, user, message, payload=self._default_global_placement_payload(), panel="creative")
             return {"handled": True, "type": "callback_global_placement_started"}
@@ -544,12 +574,13 @@ class UpdateHandler:
                     inline_keyboard=keyboard,
                 )
             except TelegramError as exc:
-                conn.execute(
-                    """
-                    INSERT INTO audit_logs (id, action, entity_type, entity_id, payload_json)
-                    VALUES (?, 'append_button_failed', 'channel', ?, ?)
-                    """,
-                    (new_id("aud"), channel["id"], json.dumps({"error": str(exc), "message_id": message_id}, ensure_ascii=False)),
+                insert_audit_log(
+                    conn,
+                    actor_account_id=None,
+                    action="append_button_failed",
+                    entity_type="channel",
+                    entity_id=channel["id"],
+                    payload={"error": str(exc), "message_id": message_id},
                 )
                 return {"handled": False, "reason": "append_button_failed", "error": str(exc)}
             post_text = post.get("text") or post.get("caption")
@@ -592,23 +623,43 @@ class UpdateHandler:
         source_message: dict[str, Any] | None = None,
         user: dict[str, Any] | None = None,
     ) -> None:
+        user = user or {}
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            active_role = self._account_active_role(account)
+            if not active_role:
+                self._prompt_role(chat_id, account["id"], "", source_message, conn=conn)
+                return
+        if active_role == "publisher":
+            self._send_publisher_home(chat_id, user, source_message)
+            return
+        self._send_advertiser_menu(chat_id, user, source_message)
+
+    def _send_publisher_home(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
+        user_id = user.get("id") or chat_id
+        channels = self._publisher_channels_for_user(user_id, self._display_name(user))
+        channel_line = f"已接入频道：{len(channels)} 个" if channels else "还没有接入频道"
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "<b>📌 插播广告工作台</b>\n\n"
-                "<blockquote>插播是一套 Telegram 频道广告协作工具。\n"
-                "我们的理念：让好频道获得透明收益，让广告主用清楚的价格买到真实发布。</blockquote>\n\n"
-                "频道主：添加频道、<b>设置价格、查看收益</b>。\n"
-                "广告主：创建素材、<b>选择频道、确认预算后投放</b>。\n"
-                "<code>发布成功才扣费</code>"
+                "<b>📺 频道主工作台</b>\n\n"
+                "<blockquote>接频道，设规则，看收益。\n"
+                "这里专注频道变现，不展示广告主投放工具。</blockquote>\n\n"
+                f"{self._h(channel_line)}"
             ),
             inline_keyboard=[
-                [{"text": "➕ 添加频道", "url": self._add_channel_url()}, {"text": "➕ 广告投放", "callback_data": "advertiser:order_help"}],
-                [{"text": "📺 频道管理", "callback_data": "publisher:channels"}, {"text": "🔎 频道广场", "callback_data": "market:home"}],
-                [{"text": "📋 我的广告", "callback_data": "advertiser:orders"}, {"text": "🗂 广告素材", "callback_data": "advertiser:library"}],
-                [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "⭐ 频道收藏夹", "callback_data": "market:folders"}],
-                [{"text": "💰 我的钱包", "callback_data": "advertiser:balance"}, {"text": "⚙️ 设置", "callback_data": "settings:home"}],
+                [{"text": "➕ 添加频道", "url": self._add_channel_url()}],
+                [{"text": "📺 频道管理", "callback_data": "publisher:channels"}],
+                [{"text": "💸 我的收益", "callback_data": "publisher:earnings"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
+                [{"text": "🌐 打开网页端", "callback_data": "web:open"}],
+                [{"text": "⚙️ 设置", "callback_data": "settings:home"}],
             ],
             parse_mode="HTML",
         )
@@ -618,6 +669,8 @@ class UpdateHandler:
         with self.db.transaction() as conn:
             account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
         timezone_name = account["timezone"] or DEFAULT_USER_TIMEZONE
+        active_role = self._account_active_role(account)
+        role_label = {"publisher": "频道主", "advertiser": "广告主"}.get(active_role or "", "未选择")
         income_notifications_enabled = bool(account["publisher_income_notifications_enabled"])
         notification_label = "已开启" if income_notifications_enabled else "已关闭"
         notification_button = (
@@ -625,20 +678,24 @@ class UpdateHandler:
             if income_notifications_enabled
             else {"text": "🔔 开启收入通知", "callback_data": "publisher:enable_income_notifications"}
         )
+        keyboard = [
+            [{"text": "🌐 修改时区", "callback_data": "timezone:change"}],
+            [{"text": "🔁 切换身份", "callback_data": "settings:role"}],
+            [{"text": "🌐 打开网页端", "callback_data": "web:open"}],
+        ]
+        keyboard.append([notification_button])
+        keyboard.append([{"text": "🏠 返回工作台", "callback_data": "menu:home"}])
         self._reply_or_edit(
             chat_id=chat_id,
             source_message=source_message,
             text=(
                 "⚙️ 设置\n\n"
                 f"当前时区：{timezone_name}\n"
+                f"当前身份：{role_label}\n"
                 f"收入通知：{notification_label}\n"
-                "语言等设置后续放在这里。"
+                + "如果要换到另一套工作台，请在这里手动切换身份。"
             ),
-            inline_keyboard=[
-                [{"text": "🌐 修改时区", "callback_data": "timezone:change"}],
-                [notification_button],
-                [{"text": "🏠 返回主菜单", "callback_data": "menu:home"}],
-            ],
+            inline_keyboard=keyboard,
         )
 
     def _set_publisher_income_notifications(
@@ -1085,15 +1142,17 @@ class UpdateHandler:
             chat_id=chat_id,
             source_message=source_message,
             text=(
-                "📣 我的广告\n\n"
+                "📣 广告主工作台\n\n"
                 f"💰 可用：USD {balance:.2f}\n"
-                f"🔒 冻结：USD {reserved:.2f}"
+                f"🔒 冻结：USD {reserved:.2f}\n\n"
+                "这里专注素材、频道挑选和投放预算。"
             ),
             inline_keyboard=[
-                [{"text": "🧾 创建广告", "callback_data": "advertiser:order_help"}],
+                [{"text": "➕ 广告投放", "callback_data": "advertiser:order_help"}],
                 [{"text": "🗂 广告库", "callback_data": "advertiser:library"}, {"text": "📋 投放订单", "callback_data": "advertiser:orders"}],
-                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "💵 定价规则", "callback_data": "publisher:pricing"}],
-                [{"text": "🏠 主菜单", "callback_data": "menu:home"}],
+                [{"text": "🔎 频道广场", "callback_data": "market:home"}, {"text": "⭐ 频道收藏夹", "callback_data": "market:folders"}],
+                [{"text": "🌐 打开网页端", "callback_data": "web:open"}],
+                [{"text": "💰 广告钱包", "callback_data": "advertiser:balance"}, {"text": "⚙️ 设置", "callback_data": "settings:home"}],
             ],
         )
 
@@ -3291,23 +3350,17 @@ class UpdateHandler:
                 ),
             )
 
-        conn.execute(
-            """
-            INSERT INTO audit_logs (id, action, entity_type, entity_id, payload_json)
-            VALUES (?, 'channel_template_applied', 'channel', ?, ?)
-            """,
-            (
-                new_id("aud"),
-                target_channel_id,
-                json.dumps(
-                    {
-                        "source_channel_id": source_channel_id,
-                        "target_channel_id": target_channel_id,
-                        "actor_telegram_user_id": actor_user_id,
-                    },
-                    ensure_ascii=False,
-                ),
-            ),
+        insert_audit_log(
+            conn,
+            actor_account_id=None,
+            action="channel_template_applied",
+            entity_type="channel",
+            entity_id=target_channel_id,
+            payload={
+                "source_channel_id": source_channel_id,
+                "target_channel_id": target_channel_id,
+                "actor_telegram_user_id": actor_user_id,
+            },
         )
     def _channel_dashboard_stats(self, conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
         config = conn.execute(
@@ -4068,6 +4121,82 @@ class UpdateHandler:
         with self.db.transaction() as conn:
             return self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
 
+    def _account_active_role(self, account: dict[str, Any]) -> str | None:
+        role = account.get("active_role")
+        return role if role in {"publisher", "advertiser"} else None
+
+    def _prompt_role(
+        self,
+        chat_id: str | int,
+        account_id: str,
+        pending_start_payload: str,
+        source_message: dict[str, Any] | None,
+        *,
+        conn: Any | None = None,
+        switch: bool = False,
+    ) -> None:
+        payload = {"pending_start_payload": pending_start_payload}
+        if conn is not None:
+            self._set_conversation_conn(conn, chat_id, account_id, "role_setup", "choose", payload)
+        else:
+            self._set_conversation(chat_id, account_id, "role_setup", "choose", payload)
+        title = "🔁 切换身份" if switch else "👋 先选择身份"
+        hint = (
+            "切换后，首页只展示对应身份的工作台。"
+            if switch
+            else "之后首页会默认进入你选择的工作台；需要更换时，可在设置里切换。"
+        )
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                f"{title}\n\n"
+                "你现在主要想做哪件事？\n\n"
+                "📺 频道主：接入频道、设置广告位、查看收益。\n"
+                "📣 广告主：创建素材、挑选频道、投放广告。\n\n"
+                f"{hint}"
+            ),
+            inline_keyboard=[
+                [{"text": "📺 我是频道主", "callback_data": "role:publisher"}],
+                [{"text": "📣 我是广告主", "callback_data": "role:advertiser"}],
+            ],
+        )
+
+    def _set_active_role(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        active_role: str,
+        source_message: dict[str, Any] | None,
+    ) -> None:
+        if active_role not in {"publisher", "advertiser"}:
+            raise NotFound(f"unsupported role: {active_role}")
+        account = self._ensure_mixed_account(user, chat_id)
+        state = self._get_conversation(chat_id)
+        payload = json.loads(state["payload_json"] or "{}") if state and state["flow"] == "role_setup" else {}
+        pending_start_payload = payload.get("pending_start_payload") or ""
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET active_role = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (active_role, account["id"]),
+            )
+            conn.execute("DELETE FROM bot_conversation_states WHERE chat_id = ?", (str(chat_id),))
+        if active_role == "advertiser" and pending_start_payload and pending_start_payload not in {"role", "switch", "settings"}:
+            self._handle_start(
+                {
+                    "from": user,
+                    "chat": {"id": chat_id},
+                    "text": f"/start {pending_start_payload}",
+                },
+                pending_start_payload,
+            )
+            return
+        self._send_main_menu(chat_id, source_message, user)
+
     def _prompt_timezone(
         self,
         chat_id: str | int,
@@ -4142,7 +4271,7 @@ class UpdateHandler:
         pending_start_payload: str,
         source_message: dict[str, Any] | None,
     ) -> None:
-        if pending_start_payload:
+        if pending_start_payload and pending_start_payload not in {"role", "switch", "settings"}:
             self._handle_start(
                 {
                     "from": user,
@@ -4151,6 +4280,14 @@ class UpdateHandler:
                 },
                 pending_start_payload,
             )
+            return
+        account = self._ensure_mixed_account(user, chat_id)
+        active_role = self._account_active_role(account)
+        if not active_role:
+            self._prompt_role(chat_id, account["id"], pending_start_payload, source_message)
+            return
+        if pending_start_payload in {"role", "switch", "settings"}:
+            self._prompt_role(chat_id, account["id"], "", source_message, switch=True)
             return
         self._send_main_menu(chat_id, source_message, user)
 
@@ -4162,6 +4299,54 @@ class UpdateHandler:
 
     def _add_channel_url(self) -> str:
         return f"https://t.me/{self.settings.bot_username}?startchannel&admin=post_messages+edit_messages+pin_messages"
+
+    def _send_web_magic_link(
+        self,
+        chat_id: str | int,
+        user: dict[str, Any],
+        source_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.settings.public_base_url:
+            self._reply_or_edit(
+                chat_id=chat_id,
+                source_message=source_message,
+                text=(
+                    "🌐 网页端入口还没配置\n\n"
+                    "请先在服务端设置 CHABO_PUBLIC_BASE_URL，例如 https://chabo.example。"
+                ),
+                inline_keyboard=[[{"text": "🏠 返回工作台", "callback_data": "menu:home"}]],
+            )
+            return {"handled": True, "type": "callback_web_link_unconfigured"}
+        user_id = user.get("id") or chat_id
+        with self.db.transaction() as conn:
+            account = self.accounts.get_or_create_by_telegram(conn, user_id, "mixed", self._display_name(user))
+            activation = sync_portal_access_from_activity(conn, account["id"], ensure_login_candidates=True)
+            token, row = issue_login_token_conn(
+                conn,
+                account_id=account["id"],
+                ttl_seconds=self.settings.magic_link_ttl_seconds,
+            )
+        url = build_magic_link_url(self.settings, token)
+        self._reply_or_edit(
+            chat_id=chat_id,
+            source_message=source_message,
+            text=(
+                "🌐 网页端已准备好\n\n"
+                "这个链接只能使用一次，过期后请回到 Bot 重新生成。\n"
+                "如果你的广告主端或频道主端还在待开通，网页端会显示对应状态。"
+            ),
+            inline_keyboard=[
+                [{"text": "打开网页端", "url": url}],
+                [{"text": "🏠 返回工作台", "callback_data": "menu:home"}],
+            ],
+        )
+        return {
+            "handled": True,
+            "type": "callback_web_magic_link",
+            "account_id": account["id"],
+            "expires_at": row["expires_at"],
+            "activation": activation,
+        }
 
     def _sync_channel_profile(self, channel: dict[str, Any]) -> dict[str, Any]:
         with self.db.transaction() as conn:
@@ -4270,12 +4455,13 @@ class UpdateHandler:
             members = self.gateway.get_chat_administrators(chat_id=telegram_chat_id)
         except TelegramError as exc:
             with self.db.transaction() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO audit_logs (id, action, entity_type, entity_id, payload_json)
-                    VALUES (?, 'sync_channel_admins_failed', 'channel', ?, ?)
-                    """,
-                    (new_id("aud"), channel_id, json.dumps({"error": str(exc)}, ensure_ascii=False)),
+                insert_audit_log(
+                    conn,
+                    actor_account_id=None,
+                    action="sync_channel_admins_failed",
+                    entity_type="channel",
+                    entity_id=channel_id,
+                    payload={"error": str(exc)},
                 )
                 return self.channels.list_channel_admins(conn, channel_id)
         with self.db.transaction() as conn:

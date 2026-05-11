@@ -4,8 +4,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+node_modules/
 
 .env
+.env.local
+.env.production
+web/.env.local
+web/.env.production
 .runtime/
 logs/
 *.sqlite3

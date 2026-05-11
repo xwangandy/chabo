@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..audit import insert_audit_log
 from ..config import Settings
 from ..db import Database
 from ..ids import new_id, new_ref_token
@@ -528,12 +529,13 @@ class DisputeService:
                     (dispute["delivery_id"],),
                 )
             payload = _audit_payload_with_note({"resolution": resolution}, note)
-            conn.execute(
-                """
-                INSERT INTO audit_logs (id, actor_account_id, action, entity_type, entity_id, payload_json)
-                VALUES (?, ?, 'dispute_resolved', 'dispute', ?, ?)
-                """,
-                (new_id("aud"), actor_account_id, dispute_id, json.dumps(payload, ensure_ascii=False)),
+            insert_audit_log(
+                conn,
+                actor_account_id=actor_account_id,
+                action="dispute_resolved",
+                entity_type="dispute",
+                entity_id=dispute_id,
+                payload=payload,
             )
             return dict(conn.execute("SELECT * FROM disputes WHERE id = ?", (dispute_id,)).fetchone())
 
@@ -1483,12 +1485,13 @@ class OrderService:
         entity_id: str,
         payload: dict[str, Any],
     ) -> None:
-        conn.execute(
-            """
-            INSERT INTO audit_logs (id, actor_account_id, action, entity_type, entity_id, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("aud"), actor_account_id, action, entity_type, entity_id, json.dumps(payload, ensure_ascii=False)),
+        insert_audit_log(
+            conn,
+            actor_account_id=actor_account_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=payload,
         )
 
 

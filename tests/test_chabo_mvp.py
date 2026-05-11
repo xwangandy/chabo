@@ -32,6 +32,7 @@ class ChaboMvpTest(unittest.TestCase):
         self.settings = Settings(
             db_path=str(Path(self.tmp.name) / "test.sqlite3"),
             bot_username="ChaBoTestBot",
+            public_base_url="https://chabo.example",
         )
         self.app = create_app(self.settings, self.gateway)
 
@@ -56,10 +57,15 @@ class ChaboMvpTest(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE accounts
-                SET timezone = 'Asia/Shanghai', timezone_confirmed_at = CURRENT_TIMESTAMP
+                SET timezone = 'Asia/Shanghai',
+                    timezone_confirmed_at = CURRENT_TIMESTAMP,
+                    active_role = CASE
+                        WHEN ? IN ('publisher', 'advertiser') THEN ?
+                        ELSE active_role
+                    END
                 WHERE id = ?
                 """,
-                (account["id"],),
+                (role, role, account["id"]),
             )
 
     def complete_placement_ad_asset(self, *, name: str = "测试广告资产", target_url: str = "https://asset.example") -> dict:
@@ -621,16 +627,7 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
-        start = self.app.update_handler.handle(
-            {
-                "message": {
-                    "message_id": 2,
-                    "from": {"id": 10001, "first_name": "广告主"},
-                    "chat": {"id": 10001},
-                    "text": "/menu",
-                }
-            }
-        )
+        role_prompt_page = self.gateway.text_edits[-1]
         advertiser_menu = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -641,6 +638,18 @@ class ChaboMvpTest(unittest.TestCase):
                 }
             }
         )
+        advertiser_home_after_role = self.gateway.private_messages[-1]
+        start = self.app.update_handler.handle(
+            {
+                "message": {
+                    "message_id": 2,
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "chat": {"id": 10001},
+                    "text": "/menu",
+                }
+            }
+        )
+        main_page = self.gateway.private_messages[-1]
         balance = self.app.update_handler.handle(
             {
                 "callback_query": {
@@ -676,39 +685,64 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(first_start["type"], "timezone_prompt")
         self.assertIn("时区确认", self.gateway.private_messages[0]["text"])
         self.assertEqual(timezone_ok["type"], "callback_timezone_confirmed")
+        self.assertIn("先选择身份", role_prompt_page["text"])
+        self.assertIn("📺 我是频道主", [button["text"] for row in role_prompt_page["inline_keyboard"] for button in row])
+        self.assertIn("📣 我是广告主", [button["text"] for row in role_prompt_page["inline_keyboard"] for button in row])
+        self.assertEqual(advertiser_menu["type"], "callback_advertiser_menu")
+        self.assertIn("广告主工作台", advertiser_home_after_role["text"])
         self.assertEqual(start["type"], "main_menu")
-        main_keyboard = self.gateway.text_edits[-1]["inline_keyboard"]
+        main_keyboard = main_page["inline_keyboard"]
         main_buttons = [button["text"] for row in main_keyboard for button in row]
         self.assertEqual(
             main_buttons,
             [
-                "➕ 添加频道",
                 "➕ 广告投放",
-                "📺 频道管理",
+                "🗂 广告库",
+                "📋 投放订单",
                 "🔎 频道广场",
-                "📋 我的广告",
-                "🗂 广告素材",
-                "💸 我的收益",
                 "⭐ 频道收藏夹",
-                "💰 我的钱包",
+                "🌐 打开网页端",
+                "💰 广告钱包",
                 "⚙️ 设置",
             ],
         )
-        self.assertIn("Telegram 频道广告协作工具", self.gateway.text_edits[-1]["text"])
-        self.assertIn("让好频道获得透明收益", self.gateway.text_edits[-1]["text"])
-        self.assertIn("频道主：添加频道", self.gateway.text_edits[-1]["text"])
-        self.assertIn("广告主：创建素材", self.gateway.text_edits[-1]["text"])
-        self.assertIn("发布成功才扣费", self.gateway.text_edits[-1]["text"])
-        self.assertNotIn("我是广告主", self.gateway.text_edits[-1]["text"])
-        self.assertNotIn("我是频道主", self.gateway.text_edits[-1]["text"])
-        self.assertTrue(all(len(row) == 2 for row in main_keyboard))
-        self.assertTrue(any(message["inline_keyboard"] and message["inline_keyboard"][0][0]["text"] == "➕ 添加频道" for message in self.gateway.private_messages))
-        self.assertEqual(advertiser_menu["type"], "callback_advertiser_menu")
+        self.assertIn("广告主工作台", main_page["text"])
+        self.assertIn("这里专注素材、频道挑选和投放预算", main_page["text"])
+        self.assertNotIn("频道管理", main_page["text"])
         self.assertEqual(balance["type"], "callback_advertiser_balance")
         self.assertEqual(library["type"], "callback_advertiser_library")
         self.assertEqual(settings["type"], "callback_settings_menu")
         self.assertEqual(len(self.gateway.callback_answers), 5)
         self.assertIn("设置", self.gateway.private_messages[-1]["text"])
+
+    def test_bot_web_button_generates_magic_link(self) -> None:
+        self.confirm_timezone(10001, role="advertiser", display_name="广告主")
+
+        result = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_web_open",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "web:open",
+                }
+            }
+        )
+
+        message = self.gateway.private_messages[-1]
+        button = message["inline_keyboard"][0][0]
+        self.assertEqual(result["type"], "callback_web_magic_link")
+        self.assertEqual(button["text"], "打开网页端")
+        self.assertTrue(button["url"].startswith("https://chabo.example/login/magic?token="))
+        with self.app.db.transaction() as conn:
+            account = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+            login_tokens = conn.execute("SELECT COUNT(*) AS n FROM login_tokens WHERE account_id = ?", (account["id"],)).fetchone()
+            portal = conn.execute(
+                "SELECT * FROM portal_access WHERE account_id = ? AND portal = 'advertiser'",
+                (account["id"],),
+            ).fetchone()
+        self.assertEqual(login_tokens["n"], 1)
+        self.assertEqual(portal["status"], "candidate")
 
     def test_timezone_setup_accepts_city_input(self) -> None:
         self.app.update_handler.handle(
@@ -750,6 +784,57 @@ class ChaboMvpTest(unittest.TestCase):
         self.assertEqual(timezone_set["timezone"], "Asia/Manila")
         self.assertEqual(account["timezone"], "Asia/Manila")
         self.assertIsNotNone(account["timezone_confirmed_at"])
+
+    def test_settings_can_switch_active_role_between_workbenches(self) -> None:
+        self.confirm_timezone(10001, role="advertiser", display_name="广告主")
+
+        settings = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_role_settings",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "settings:home",
+                }
+            }
+        )
+        settings_page = self.gateway.private_messages[-1]
+        switch_prompt = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_role_prompt",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "settings:role",
+                }
+            }
+        )
+        prompt_page = self.gateway.private_messages[-1]
+        switched = self.app.update_handler.handle(
+            {
+                "callback_query": {
+                    "id": "cb_role_pub",
+                    "from": {"id": 10001, "first_name": "广告主"},
+                    "message": {"chat": {"id": 10001}},
+                    "data": "role:publisher",
+                }
+            }
+        )
+        publisher_page = self.gateway.private_messages[-1]
+        with self.app.db.transaction() as conn:
+            account = conn.execute("SELECT * FROM accounts WHERE telegram_user_id = '10001'").fetchone()
+
+        self.assertEqual(settings["type"], "callback_settings_menu")
+        self.assertIn("当前身份：广告主", settings_page["text"])
+        self.assertIn("🔁 切换身份", [button["text"] for row in settings_page["inline_keyboard"] for button in row])
+        self.assertEqual(switch_prompt["type"], "callback_role_switch_prompt")
+        self.assertIn("切换身份", prompt_page["text"])
+        self.assertEqual(switched["type"], "callback_publisher_menu")
+        self.assertEqual(account["active_role"], "publisher")
+        self.assertIn("频道主工作台", publisher_page["text"])
+        publisher_buttons = [button["text"] for row in publisher_page["inline_keyboard"] for button in row]
+        self.assertIn("📺 频道管理", publisher_buttons)
+        self.assertNotIn("➕ 广告投放", publisher_buttons)
 
     def test_home_ad_launch_selects_creative_slot_then_channel(self) -> None:
         low_channel = self.bind_channel()
@@ -1287,8 +1372,11 @@ class ChaboMvpTest(unittest.TestCase):
         )
 
         self.assertEqual(start["type"], "organic_start")
-        self.assertIn("插播广告工作台", self.gateway.private_messages[-1]["text"])
-        self.assertNotIn("频道资产", self.gateway.private_messages[-1]["text"])
+        self.assertIn("频道主工作台", self.gateway.private_messages[-1]["text"])
+        start_buttons = [button["text"] for row in self.gateway.private_messages[-1]["inline_keyboard"] for button in row]
+        self.assertIn("📺 频道管理", start_buttons)
+        self.assertIn("💸 我的收益", start_buttons)
+        self.assertNotIn("➕ 广告投放", start_buttons)
         channels = self.app.update_handler.handle(
             {
                 "callback_query": {

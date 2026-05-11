@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..audit import insert_audit_log
 from ..config import Settings
 from ..db import Database
 from ..ids import new_id, new_ref_token
@@ -560,6 +561,8 @@ class ChannelService:
 
     def update_rate(self, channel_id: str, slot_type: str, unit_price_cents: int) -> dict[str, Any]:
         slot_type = self.normalize_slot_type(slot_type)
+        if unit_price_cents <= 0:
+            raise InvalidState("刊例价必须大于 0")
         with self.db.transaction() as conn:
             self._ensure_default_rate_cards(conn, channel_id)
             slot = conn.execute(
@@ -577,6 +580,52 @@ class ChannelService:
                 (new_id("rate"), slot["id"], unit_price_cents, self.DEFAULT_RATES[slot_type][0]),
             )
             return self.get_channel(conn, channel_id)
+
+    def set_rate_for_publisher(
+        self,
+        *,
+        publisher_telegram_user_id: str | int,
+        channel_id: str,
+        slot_type: str,
+        unit_price_cents: int,
+        actor_kind: str = "human",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        slot_type = self.normalize_slot_type(slot_type)
+        audit_args = {
+            "channel_id": channel_id,
+            "slot_type": slot_type,
+            "unit_price_cents": unit_price_cents,
+        }
+        try:
+            with self.db.transaction() as conn:
+                self._verify_publisher_owns_channel(
+                    conn,
+                    publisher_telegram_user_id=publisher_telegram_user_id,
+                    channel_id=channel_id,
+                )
+            self.update_rate(channel_id, slot_type, unit_price_cents)
+            with self.db.transaction() as conn:
+                rate = self.get_rate(conn, channel_id, slot_type)
+        except ChaboError as exc:
+            self.tool_calls.log_failure(
+                tool_name="set_rate_for_publisher",
+                actor_telegram_user_id=publisher_telegram_user_id,
+                actor_kind=actor_kind,
+                session_id=session_id,
+                arguments=audit_args,
+                error=exc,
+            )
+            raise
+        self.tool_calls.log_success(
+            tool_name="set_rate_for_publisher",
+            actor_telegram_user_id=publisher_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments=audit_args,
+            result_summary=f"{slot_type} → {unit_price_cents}",
+        )
+        return rate
 
     def get_by_token(self, conn: sqlite3.Connection, token: str) -> dict[str, Any] | None:
         row = conn.execute("SELECT * FROM channels WHERE ref_token = ?", (token,)).fetchone()
@@ -707,12 +756,13 @@ class ChannelService:
         entity_id: str,
         payload: dict[str, Any],
     ) -> None:
-        conn.execute(
-            """
-            INSERT INTO audit_logs (id, actor_account_id, action, entity_type, entity_id, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (new_id("aud"), actor_account_id, action, entity_type, entity_id, json.dumps(payload, ensure_ascii=False)),
+        insert_audit_log(
+            conn,
+            actor_account_id=actor_account_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=payload,
         )
 
 

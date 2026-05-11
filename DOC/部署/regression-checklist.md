@@ -6,6 +6,27 @@
 
 ## A. 自动化自检（在生产机上跑）
 
+推荐先跑网页端一键验收，它会串起 Python 回归、前端构建、preflight 和 `/api/health`：
+
+```bash
+cd /opt/chabo
+chabo verify-web --profile production \
+  --host <你的对外 host> \
+  --health-url https://<你的对外 host>/api/health \
+  --audit-chain
+```
+
+如果是在生产机执行发布，可以直接跑部署脚本；它会先备份 SQLite，再做 `verify-web --profile production --audit-chain --skip-health`，重启 `chabo-api` 后再做 `verify-web --profile production --audit-chain --skip-tests --skip-build`：
+
+```bash
+cd /opt/chabo
+./scripts/deploy-web-production.sh <你的对外 host> https://<你的对外 host>/api/health
+```
+
+GitHub Actions 手动触发 `workflow_dispatch` 并填写 `production_host` 时，也会跑同一条 production profile gate，适合在真正发布前做一次远端 health + 构建验证。
+
+如果要分步骤排查，再按下面的拆分项逐个执行。
+
 ### 1. 服务层回归测试
 ```bash
 cd /opt/chabo
@@ -41,6 +62,35 @@ sqlite3 /tmp/preflight-snapshot.sqlite3 ".tables"
 rm /tmp/preflight-snapshot.sqlite3
 ```
 能写 + 能读，至少看到 `accounts / channels / ad_orders / creatives / topup_requests / tool_call_logs` 等核心表。
+
+### 5. 审计链完整性
+```bash
+chabo verify-audit-chain
+```
+必须 `ok=true`，`invalid_hashes=0`，`broken_links=0`。旧库里允许存在 M7 前的未签名审计行；新上线后若要强制所有新行均签名，可按时间窗配合 `--created-from` 检查。
+
+```bash
+chabo verify-audit-chain --created-from "2026-05-02 00:00:00" --strict
+```
+
+管理端审计页也要抽查一次：选择上线时间窗，勾选“严格”，点击“校验链路”，确认报告里的 `Hash 异常` 与 `断链` 均为 0。
+
+### 6. 回滚 dry-run
+```bash
+./scripts/rollback-web-production.sh --dry-run /var/backups/chabo/chabo-YYYYMMDD-HHMMSS.sqlite3 chabo.example https://chabo.example/api/health
+```
+确认输出包含：备份当前 DB、停止服务、恢复指定 SQLite、启动服务、production verify-web gate。dry-run 不应真正覆盖 DB。
+
+### 7. 恢复演练和审计留档
+```bash
+./scripts/rehearse-sqlite-restore.sh /var/backups/chabo/chabo-YYYYMMDD-HHMMSS.sqlite3
+./scripts/export-audit-integrity-report.sh --created-from "2026-05-02 00:00:00" --strict
+```
+恢复演练必须只操作临时 SQLite 副本；审计留档必须同时生成 `.json` 和 `.sha256`。
+
+### 8. 管理端运营入口
+1. `/admin#wallet`：总余额、冻结预算、最近流水、资金账户榜正常展示。
+2. `/admin#settings`：发布准入、审计记录、数据库路径、最近备份正常展示。
 
 ## B. 真实 Bot 金线路径（手工）
 

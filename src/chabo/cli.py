@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 from .app import create_app
 from .config import Settings
@@ -35,6 +38,150 @@ def cmd_init_db(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
     Database(settings.db_path).init()
     print(f"插播数据库已初始化：{settings.db_path}")
+
+
+def cmd_seed_web_demo(args: argparse.Namespace) -> None:
+    from .dev_seed import seed_web_demo
+
+    app = create_app()
+    print_json(
+        seed_web_demo(
+            app,
+            telegram_user_id=args.telegram_user_id,
+            display_name=args.display_name,
+            min_pending_orders=args.pending_orders,
+        )
+    )
+
+
+def cmd_verify_web(args: argparse.Namespace) -> None:
+    if args.profile == "production" and args.seed_demo:
+        raise ValueError("--seed-demo 只能用于 local profile，不能用于 production 验收")
+
+    root = Path(__file__).resolve().parents[2]
+    web_dir = root / "web"
+    steps: list[dict[str, Any]] = []
+    health_url = args.health_url or "http://127.0.0.1:8081/api/health"
+
+    if not args.skip_tests:
+        _verify_command(
+            steps,
+            "python_compile",
+            [sys.executable, "-m", "compileall", "-q", "src", "tests"],
+            cwd=root,
+            dry_run=args.dry_run,
+        )
+        _verify_command(
+            steps,
+            "python_tests",
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+            cwd=root,
+            dry_run=args.dry_run,
+        )
+    if not args.skip_build:
+        _verify_command(
+            steps,
+            "frontend_build",
+            ["npm", "run", "build"],
+            cwd=web_dir,
+            dry_run=args.dry_run,
+        )
+    if args.seed_demo:
+        _verify_command(
+            steps,
+            "seed_web_demo",
+            [
+                sys.executable,
+                "-m",
+                "chabo.cli",
+                "seed-web-demo",
+                "--telegram-user-id",
+                args.seed_telegram_user_id,
+                "--display-name",
+                args.seed_display_name,
+                "--pending-orders",
+                str(args.seed_pending_orders),
+            ],
+            cwd=root,
+            dry_run=args.dry_run,
+        )
+    if not args.skip_preflight:
+        preflight_cmd = [sys.executable, "-m", "chabo.cli", "preflight", "--host", args.host]
+        if args.profile == "local" or args.allow_weak_tokens:
+            preflight_cmd.append("--allow-weak-tokens")
+        if args.profile == "local" or args.allow_dev_auth_bypass:
+            preflight_cmd.append("--allow-dev-auth-bypass")
+        _verify_command(
+            steps,
+            "preflight",
+            preflight_cmd,
+            cwd=root,
+            dry_run=args.dry_run,
+        )
+    if args.audit_chain:
+        audit_cmd = [sys.executable, "-m", "chabo.cli", "verify-audit-chain"]
+        if args.strict_audit_chain:
+            audit_cmd.append("--strict")
+        _verify_command(
+            steps,
+            "audit_chain",
+            audit_cmd,
+            cwd=root,
+            dry_run=args.dry_run,
+        )
+    if not args.skip_health:
+        _verify_action(
+            steps,
+            "api_health",
+            {"url": health_url},
+            lambda: _read_health(health_url),
+            dry_run=args.dry_run,
+        )
+    if args.h5_smoke:
+        smoke_env = os.environ.copy()
+        if args.profile == "local" or args.h5_smoke_auth_bypass:
+            smoke_env["CHABO_H5_SMOKE_AUTH_BYPASS"] = "1"
+        if args.h5_smoke_base_url:
+            smoke_env["CHABO_H5_SMOKE_BASE_URL"] = args.h5_smoke_base_url
+        if args.h5_smoke_api_url:
+            smoke_env["CHABO_H5_SMOKE_API_URL"] = args.h5_smoke_api_url
+        _verify_command(
+            steps,
+            "h5_smoke",
+            ["npm", "run", "smoke:h5"],
+            cwd=web_dir,
+            env=smoke_env,
+            dry_run=args.dry_run,
+        )
+
+    ok = all(step["status"] in {"passed", "planned"} for step in steps)
+    report = {
+        "ok": ok,
+        "profile": args.profile,
+        "dry_run": args.dry_run,
+        "health_url": health_url,
+        "steps": steps,
+    }
+    print_json(report)
+    if not ok:
+        sys.exit(2)
+
+
+def cmd_verify_audit_chain(args: argparse.Namespace) -> None:
+    from .audit import verify_audit_chain
+
+    settings = Settings.from_env()
+    app = create_app(settings)
+    with app.db.transaction() as conn:
+        report = verify_audit_chain(
+            conn,
+            created_from=args.created_from,
+            created_to=args.created_to,
+            strict_unsigned=args.strict,
+        )
+    print_json(report)
+    if not report["ok"]:
+        sys.exit(2)
 
 
 def cmd_preflight(args: argparse.Namespace) -> None:
@@ -101,6 +248,47 @@ def cmd_preflight(args: argparse.Namespace) -> None:
         if not args.allow_weak_tokens:
             report["ok"] = False
 
+    # Web API security
+    dev_auth_bypass_allowed = getattr(args, "allow_dev_auth_bypass", False)
+    public_base_url = (settings.public_base_url or "").strip()
+    web_security_ok = (
+        (not settings.dev_auth_bypass or dev_auth_bypass_allowed)
+        and not (settings.is_production and settings.dev_session_enabled)
+        and not (settings.is_production and (not public_base_url or not public_base_url.startswith("https://")))
+    )
+    report["checks"]["web_security"] = {
+        "ok": web_security_ok,
+        "environment": settings.environment,
+        "public_base_url": public_base_url,
+        "dev_auth_bypass": settings.dev_auth_bypass,
+        "dev_session_enabled": settings.dev_session_enabled,
+        "allow_dev_auth_bypass": dev_auth_bypass_allowed,
+        "allowed_origins": settings.web_allowed_origins,
+        "session_cookie_secure": settings.session_cookie_secure,
+        "session_cookie_samesite": settings.session_cookie_samesite,
+        "audit_retention_days": settings.audit_retention_days,
+        "audit_export_max_rows": settings.audit_export_max_rows,
+    }
+    if settings.dev_auth_bypass:
+        message = "CHABO_DEV_AUTH_BYPASS 已开启；生产部署必须关闭开发期免登录"
+        if dev_auth_bypass_allowed:
+            report["warnings"].append(f"{message}（local 验收已显式放行）")
+        else:
+            report["issues"].append(message)
+            report["ok"] = False
+    if settings.is_production and settings.dev_session_enabled:
+        report["issues"].append("CHABO_DEV_SESSION_ENABLED 已开启；生产部署必须关闭开发授权表单")
+        report["ok"] = False
+    if settings.is_production and (not public_base_url or not public_base_url.startswith("https://")):
+        report["issues"].append("CHABO_PUBLIC_BASE_URL 生产环境必须配置为 HTTPS 地址，用于 Bot 生成网页端登录链接")
+        report["ok"] = False
+    if settings.is_production and settings.audit_retention_days < 365:
+        report["issues"].append("CHABO_AUDIT_RETENTION_DAYS 生产环境建议至少保留 365 天")
+        report["ok"] = False
+    if settings.audit_export_max_rows <= 0:
+        report["issues"].append("CHABO_AUDIT_EXPORT_MAX_ROWS 必须大于 0")
+        report["ok"] = False
+
     # Bot config sanity
     bot_token_set = bool(settings.bot_token)
     bot_username_set = bool(settings.bot_username)
@@ -151,6 +339,90 @@ def cmd_preflight(args: argparse.Namespace) -> None:
     print_json(report)
     if not report["ok"]:
         sys.exit(2)
+
+
+def _verify_command(
+    steps: list[dict[str, Any]],
+    name: str,
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    dry_run: bool = False,
+) -> None:
+    step: dict[str, Any] = {
+        "name": name,
+        "type": "command",
+        "command": command,
+        "cwd": str(cwd),
+    }
+    if dry_run:
+        step["status"] = "planned"
+        steps.append(step)
+        return
+    started = time.monotonic()
+    proc = subprocess.run(
+        command,
+        cwd=str(cwd),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = proc.stdout or ""
+    step.update(
+        {
+            "status": "passed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "output_tail": output.splitlines()[-30:],
+        }
+    )
+    steps.append(step)
+
+
+def _verify_action(
+    steps: list[dict[str, Any]],
+    name: str,
+    target: dict[str, Any],
+    action: Any,
+    *,
+    dry_run: bool = False,
+) -> None:
+    step: dict[str, Any] = {"name": name, "type": "action", **target}
+    if dry_run:
+        step["status"] = "planned"
+        steps.append(step)
+        return
+    started = time.monotonic()
+    try:
+        result = action()
+    except Exception as exc:
+        step.update(
+            {
+                "status": "failed",
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "error": str(exc)[:300],
+            }
+        )
+    else:
+        step.update(
+            {
+                "status": "passed",
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "result": result,
+            }
+        )
+    steps.append(step)
+
+
+def _read_health(url: str) -> dict[str, Any]:
+    request = Request(url, headers={"Accept": "application/json"})
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(f"health returned not ok: {payload}")
+    return {"ok": payload.get("ok"), "ops": payload.get("ops", {})}
 
 
 def cmd_backup_db(args: argparse.Namespace) -> None:
@@ -734,6 +1006,13 @@ def cmd_run_web(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_run_api(args: argparse.Namespace) -> None:
+    from .webapi.main import run_api
+
+    settings = Settings.from_env()
+    run_api(settings=settings, host=args.host, port=args.port)
+
+
 def cmd_set_webhook(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
     if not settings.bot_token:
@@ -786,10 +1065,46 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("preflight", help="生产部署前自检：DB / schema / 备份目录 / token 强度 / Bot 配置 / 运营计数；critical 问题非零退出")
     p.add_argument("--host", help="覆盖 web_host 用于 token 强度判断（loopback 可放过缺 token）")
     p.add_argument("--allow-weak-tokens", action="store_true", help="只在告警里报 token 弱，不影响退出码（仅限 staging 调试用）")
+    p.add_argument("--allow-dev-auth-bypass", action="store_true", help="仅 local/staging 验收使用：允许开发期免登录开关")
     p.set_defaults(func=cmd_preflight)
 
     p = sub.add_parser("init-db", help="初始化 SQLite 数据库")
     p.set_defaults(func=cmd_init_db)
+
+    p = sub.add_parser("verify-web", help="一键验收 React 网页端：Python 测试、前端构建、preflight、health，可选 H5 冒烟")
+    p.add_argument("--profile", choices=["local", "production"], default="local")
+    p.add_argument("--host", default="127.0.0.1", help="传给 preflight 的 host；production 建议填正式域名")
+    p.add_argument("--health-url", help="默认 http://127.0.0.1:8081/api/health")
+    p.add_argument("--skip-tests", action="store_true")
+    p.add_argument("--skip-build", action="store_true")
+    p.add_argument("--skip-preflight", action="store_true")
+    p.add_argument("--skip-health", action="store_true")
+    p.add_argument("--audit-chain", action="store_true", help="额外校验 audit_logs hash 链完整性")
+    p.add_argument("--strict-audit-chain", action="store_true", help="审计链校验时把旧的未签名审计记录也视为失败")
+    p.add_argument("--allow-weak-tokens", action="store_true", help="production profile 下也放行弱 token；仅 staging 调试用")
+    p.add_argument("--allow-dev-auth-bypass", action="store_true", help="production profile 下也放行开发免登录；仅 staging 调试用")
+    p.add_argument("--seed-demo", action="store_true", help="local profile 下先补齐演示数据")
+    p.add_argument("--seed-telegram-user-id", default="10001")
+    p.add_argument("--seed-display-name", default="H5 冒烟用户")
+    p.add_argument("--seed-pending-orders", type=int, default=3)
+    p.add_argument("--h5-smoke", action="store_true", help="额外运行 web/scripts/h5-smoke.mjs")
+    p.add_argument("--h5-smoke-auth-bypass", action="store_true", help="H5 冒烟使用开发免登录")
+    p.add_argument("--h5-smoke-base-url")
+    p.add_argument("--h5-smoke-api-url")
+    p.add_argument("--dry-run", action="store_true", help="只输出将执行的步骤，不真正运行")
+    p.set_defaults(func=cmd_verify_web)
+
+    p = sub.add_parser("verify-audit-chain", help="校验 audit_logs 的链式 hash 完整性；发现篡改或断链时非零退出")
+    p.add_argument("--created-from", help="只校验该时间之后的审计记录，例如 2026-05-01 00:00:00")
+    p.add_argument("--created-to", help="只校验该时间之前的审计记录，例如 2026-05-02 23:59:59")
+    p.add_argument("--strict", action="store_true", help="把旧的未签名审计记录也视为失败")
+    p.set_defaults(func=cmd_verify_audit_chain)
+
+    p = sub.add_parser("seed-web-demo", help="生成 React 网页端本地演示数据：三端权限、频道、素材、待审订单和待审入账")
+    p.add_argument("--telegram-user-id", default="10001", help="默认与 CHABO_DEV_AUTH_TELEGRAM_USER_ID 对齐")
+    p.add_argument("--display-name", default="H5 冒烟用户")
+    p.add_argument("--pending-orders", type=int, default=3, help="至少保留多少个演示待审订单")
+    p.set_defaults(func=cmd_seed_web_demo)
 
     p = sub.add_parser("topup", help="人工入账广告主插播余额")
     p.add_argument("--telegram-user-id", required=True)
@@ -1159,6 +1474,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--admin-token", help="覆盖 CHABO_ADMIN_TOKEN")
     p.add_argument("--webhook-secret", help="覆盖 CHABO_WEBHOOK_SECRET")
     p.set_defaults(func=cmd_run_web)
+
+    p = sub.add_parser("run-api", help="启动 React 网页端使用的 FastAPI JSON API")
+    p.add_argument("--host", default=None, help="默认读取 CHABO_API_HOST")
+    p.add_argument("--port", type=int, default=None, help="默认读取 CHABO_API_PORT")
+    p.set_defaults(func=cmd_run_api)
 
     p = sub.add_parser("set-webhook", help="把 Telegram webhook 指向插播 HTTP 服务公网地址")
     p.add_argument("--url", required=True, help="例如 https://example.com/telegram/webhook/<secret>")

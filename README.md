@@ -50,25 +50,100 @@ chabo init-db
 
 ```bash
 pip install -e ".[web]"
-chabo run-api --host 127.0.0.1 --port 8081
+CHABO_DEV_AUTH_BYPASS=1 chabo run-api --host 127.0.0.1 --port 8081
 
 cd web
 npm install
 npm run dev
 ```
 
-打开 `http://127.0.0.1:5173/login`，用 `.env` 里的 `CHABO_ADMIN_TOKEN` 创建本地开发会话。正式登录会切换为 Telegram Mini App / 一次性链接，开发登录只用于本地和联调。
+开发期打开 `http://127.0.0.1:5173/advertiser`、`/publisher` 或 `/admin` 会自动使用本地开发身份，不需要每次输入账号密码。关闭 `CHABO_DEV_AUTH_BYPASS` 后，普通 `/login` 只保留 Telegram Mini App / 一次性链接登录；隐藏入口 `/login/admin` 可用 `CHABO_ADMIN_TOKEN` 生成一次性登录。
 
-React 网页端生产部署见 [DOC/部署/web-spa-api-deploy.md](DOC/部署/web-spa-api-deploy.md)，包含 SPA 构建产物、`chabo-api.service`、nginx `/api` 反代和 `/api/health` readiness 配置。
+正式开通规则：
+
+- Bot 端“打开网页端”会生成一次性 magic link；生产环境必须设置 `CHABO_PUBLIC_BASE_URL=https://你的域名`。
+- Telegram Mini App 登录会先创建候选门户，不会自动给 active 权限。
+- 广告主端在首次投放审核通过后自动开通。
+- 频道主端在名下频道产生真实投放后自动开通。
+- 管理端只通过隐藏授权入口或后台手工授权开通。
+- 管理员分为 `viewer / operator / finance / super_admin`；只有 `super_admin` 能在账户列表中以广告主/频道主身份代看，页面顶部会显示“管理员代看中”和到期时间，并可主动结束代看返回管理端。
+- `super_admin` 可在 `/admin` 的账户列表中手工开通、设候选或撤销广告主端/频道主端，也可以设置管理员等级；撤销状态会阻止后续自动开通规则重新放权。
+- 管理端审计页支持按“权限调整 / 代看 / 管理员等级”筛选，便于回查谁在什么时候开通、代看或调整了权限等级。
+- 审计页还支持按操作者、目标账号和时间范围筛选、分页、查看链式 Hash 与权限前后 diff，并导出 CSV；手工权限调整必须填写备注并二次确认。
+- 审计导出仅限 `super_admin`，CSV 会带导出摘要和导出前链头，导出动作自身也会写入审计；代看必须填写原因。生产环境建议 `CHABO_AUDIT_RETENTION_DAYS>=365`。
+
+为了让三端页面有稳定演示数据，可在本地库执行：
+
+```bash
+chabo seed-web-demo
+```
+
+该命令会补齐开发账号三端权限、演示频道、广告素材、待审订单和待审入账；重复执行不会无限堆叠演示待审订单。
+
+React 网页端生产部署见 [DOC/部署/web-spa-api-deploy.md](DOC/部署/web-spa-api-deploy.md)，包含 `.env.production.example`、SPA 构建产物、`chabo-api.service`、nginx `/api` 反代、`/api/health` readiness 和 CI / 部署 gate 配置。
+
+网页端本地一键验收：
+
+```bash
+chabo verify-web --profile local --seed-demo
+```
+
+如需把 390px H5 视觉冒烟也纳入同一次验收，确保 API 和 Vite 都已启动后加 `--h5-smoke`。
+
+网页端默认采用暗黑主题。H5 移动端视觉冒烟可在 API 和前端服务启动后执行：
+
+```bash
+cd web
+CHABO_H5_SMOKE_AUTH_BYPASS=1 npm run smoke:h5
+```
+
+如果测试环境未开启开发免登录，也可以在 API 进程设置 `CHABO_DEV_SESSION_ENABLED=1` 后，用 `CHABO_ADMIN_TOKEN=<本地或测试 token> npm run smoke:h5` 走临时开发会话。
+
+权限收口 E2E 可在 API 和 Vite 都已启动后执行：
+
+```bash
+cd web
+npm run e2e:permissions
+```
+
+它会创建临时测试账号，覆盖“开通广告主端 -> 代看 -> 结束代看 -> 撤销权限”，并校验审计页的三类筛选、链式 Hash 详情和审计链报告。
 
 生产部署前自检（CI / 部署脚本可 gate）：
 
 ```bash
 # 任一 critical 项失败时退出码非零
-chabo preflight --host <对外 host>
+chabo verify-web --profile production --host <对外 host> --health-url https://<对外 host>/api/health --audit-chain
 ```
 
-回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`。
+也可以单独检查审计链：
+
+```bash
+chabo verify-audit-chain
+# 上线后可按时间窗做严格检查，把旧未签名行也视为失败
+chabo verify-audit-chain --created-from "2026-05-02 00:00:00" --strict
+```
+
+生产机也可以直接使用发布脚本，它会读取 `/etc/chabo/env`、先备份 SQLite、构建、预检、重启 API，并在重启后再次检查 health 和审计链：
+
+```bash
+./scripts/deploy-web-production.sh <对外 host> https://<对外 host>/api/health
+```
+
+如需回滚到某个 SQLite 备份，先用 dry-run 看完整动作，再正式执行：
+
+```bash
+./scripts/rollback-web-production.sh --dry-run /var/backups/chabo/chabo-20260502-120000.sqlite3 <对外 host> https://<对外 host>/api/health
+./scripts/rollback-web-production.sh /var/backups/chabo/chabo-20260502-120000.sqlite3 <对外 host> https://<对外 host>/api/health
+```
+
+上线前恢复演练和审计留档：
+
+```bash
+./scripts/rehearse-sqlite-restore.sh /var/backups/chabo/chabo-20260502-120000.sqlite3
+./scripts/export-audit-integrity-report.sh --created-from "2026-05-02 00:00:00" --strict
+```
+
+完整生产 Runbook 见 [DOC/部署/production-runbook.md](DOC/部署/production-runbook.md)，上线交付清单见 [DOC/部署/m9-delivery-checklist.md](DOC/部署/m9-delivery-checklist.md)。回归清单（人工 + 自动）见 [DOC/部署/regression-checklist.md](DOC/部署/regression-checklist.md)；端到端自动化测试见 `tests/test_chabo_mvp.py::test_phase_one_golden_path_end_to_end`。
 
 定期备份（推荐 cron）：
 

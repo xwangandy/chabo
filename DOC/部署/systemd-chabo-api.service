@@ -11,6 +11,14 @@
 # - Telegram webhook / 旧 stdlib admin 仍可继续使用 systemd-chabo.service 的 `chabo run-web`。
 # - CHABO_ADMIN_TOKEN / CHABO_BOT_TOKEN / CHABO_API_SECRET_KEY 不要写在 unit 文件里；
 #   放到 /etc/chabo/env，权限建议 0640，owner root:chabo。
+# - CHABO_PUBLIC_HOST 只给 ExecStartPre / 部署脚本使用，建议设置为正式域名。
+# - 走 nginx / HTTPS 反代时，/etc/chabo/env 建议设置：
+#   CHABO_PUBLIC_HOST=chabo.example
+#   CHABO_SESSION_COOKIE_SECURE=1
+#   CHABO_SESSION_COOKIE_SAMESITE=lax
+#   CHABO_WEB_ALLOWED_ORIGINS=https://chabo.example
+#   CHABO_API_PROXY_HEADERS=1
+#   CHABO_API_FORWARDED_ALLOW_IPS=127.0.0.1
 
 [Unit]
 Description=ChaBo Web API (FastAPI)
@@ -23,9 +31,17 @@ User=chabo
 Group=chabo
 WorkingDirectory=/opt/chabo
 EnvironmentFile=/etc/chabo/env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/sh -c '. /etc/chabo/env && test -n "$CHABO_PUBLIC_HOST" && exec /opt/chabo/.venv/bin/chabo preflight --host "$CHABO_PUBLIC_HOST"'
 ExecStart=/opt/chabo/.venv/bin/chabo run-api --host 127.0.0.1 --port 8081
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGINT
+UMask=0027
+StateDirectory=chabo
+LogsDirectory=chabo
 ReadWritePaths=/var/lib/chabo /var/log/chabo
 
 NoNewPrivileges=true
@@ -36,6 +52,8 @@ PrivateDevices=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

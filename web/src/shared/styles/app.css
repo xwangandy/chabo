@@ -1,0 +1,275 @@
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #080b12;
+  color: #e5e7eb;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.brand {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 16px 0 20px;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.brand-name {
+  min-width: 0;
+}
+
+.portal-switch {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid #263244;
+  color: #cbd5e1;
+  font-size: 12px;
+}
+
+.portal-switch .anticon {
+  font-size: 10px;
+}
+
+.workspace-caption {
+  padding: 8px 20px 6px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.topbar {
+  height: 56px;
+  padding: 0 20px;
+  background: #0b1020;
+  border-bottom: 1px solid #1f2937;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.content {
+  padding: 20px;
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.metric-card {
+  min-height: 104px;
+}
+
+.channel-grid {
+  height: 520px;
+  width: 100%;
+}
+
+.mobile-channel-list,
+.mobile-ops-list,
+.mobile-delivery-list {
+  display: none;
+}
+
+.grid-toolbar {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-alert {
+  margin-bottom: 12px;
+}
+
+.channel-settings {
+  padding: 8px 0;
+}
+
+.channel-policy-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 1fr) minmax(230px, 260px) 120px 120px;
+  gap: 10px;
+  align-items: center;
+  max-width: 760px;
+}
+
+.json-pre {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 12px;
+  background: #0b1020;
+  border: 1px solid #263244;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #d1d5db;
+}
+
+.mobile-channel-card,
+.mobile-action-card,
+.mobile-section,
+.mobile-plan-summary {
+  border: 1px solid #263244;
+  border-radius: 6px;
+  background: #111827;
+}
+
+.mobile-channel-card,
+.mobile-action-card,
+.mobile-plan-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.mobile-channel-card.selected {
+  border-color: #3b82f6;
+  background: #0f1e36;
+}
+
+.mobile-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-section {
+  padding: 12px;
+}
+
+.mobile-section h4 {
+  margin-top: 0;
+}
+
+.mobile-plan-summary {
+  display: none;
+  margin-bottom: 12px;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.summary-grid h4 {
+  margin: 2px 0 0;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #080b12;
+  padding: 20px;
+}
+
+.ag-theme-quartz-dark.channel-grid {
+  --ag-background-color: #111827;
+  --ag-header-background-color: #172033;
+  --ag-odd-row-background-color: #0f172a;
+  --ag-row-hover-color: #1f2937;
+  --ag-border-color: #263244;
+  --ag-foreground-color: #e5e7eb;
+  --ag-secondary-foreground-color: #9ca3af;
+  --ag-selected-row-background-color: #0f2a4a;
+}
+
+.login-card {
+  width: min(420px, 100%);
+}
+
+.login-note {
+  display: block;
+  margin-top: 14px;
+}
+
+.magic-login-box {
+  height: 120px;
+}
+
+@media (max-width: 720px) {
+  .content {
+    padding: 52px 12px 12px;
+  }
+
+  .topbar {
+    height: auto;
+    min-height: 56px;
+    padding: 10px 12px;
+    align-items: flex-start;
+  }
+
+  .channel-grid {
+    display: none;
+  }
+
+  .desktop-admin-tabs,
+  .desktop-table {
+    display: none;
+  }
+
+  .mobile-channel-list,
+  .mobile-ops-list,
+  .mobile-delivery-list,
+  .mobile-plan-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .grid-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .grid-toolbar .ant-space,
+  .grid-toolbar .ant-select,
+  .grid-toolbar .ant-btn,
+  .ant-card-extra,
+  .ant-card-extra .ant-space,
+  .ant-card-extra .ant-input-search {
+    width: 100% !important;
+  }
+
+  .channel-policy-row {
+    grid-template-columns: 1fr;
+  }
+
+  .ant-drawer-content-wrapper {
+    width: 100% !important;
+  }
+
+  .ant-layout-sider-zero-width-trigger {
+    top: 66px;
+    border: 1px solid #263244;
+    border-left: 0;
+    background: #172033;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  }
+}

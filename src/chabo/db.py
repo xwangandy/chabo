@@ -23,8 +23,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     publisher_income_notifications_enabled INTEGER NOT NULL DEFAULT 1,
     timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
     timezone_confirmed_at TEXT,
+    active_role TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (active_role IS NULL OR active_role IN ('publisher', 'advertiser')),
     CHECK (available_balance_cents >= 0),
     CHECK (reserved_balance_cents >= 0),
     CHECK (spent_balance_cents >= 0),
@@ -425,6 +427,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     entity_type TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
+    previous_hash TEXT,
+    audit_hash TEXT,
+    hash_version TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -530,6 +535,127 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_advertiser ON advertiser_alert_event
 CREATE INDEX IF NOT EXISTS idx_advertiser_subscriptions_account ON advertiser_subscriptions(advertiser_account_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_stars_payment_intents_buyer ON stars_payment_intents(buyer_account_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_bot_conversations_account ON bot_conversation_states(account_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created ON audit_logs(action, created_at);
+
+CREATE TABLE IF NOT EXISTS portal_access (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    portal TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    grant_reason TEXT NOT NULL DEFAULT 'manual',
+    granted_by_account_id TEXT REFERENCES accounts(id),
+    granted_at TEXT,
+    revoked_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(account_id, portal),
+    CHECK (portal IN ('admin', 'advertiser', 'publisher')),
+    CHECK (status IN ('candidate', 'active', 'suspended', 'revoked'))
+);
+
+CREATE TABLE IF NOT EXISTS portal_access_events (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    portal TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    actor_account_id TEXT REFERENCES accounts(id),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (portal IN ('admin', 'advertiser', 'publisher'))
+);
+
+CREATE TABLE IF NOT EXISTS web_sessions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL DEFAULT 'magic_link',
+    user_agent TEXT,
+    ip_address TEXT,
+    impersonator_account_id TEXT REFERENCES accounts(id),
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS login_tokens (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    purpose TEXT NOT NULL DEFAULT 'magic_link',
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS impersonation_sessions (
+    id TEXT PRIMARY KEY,
+    admin_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    target_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    portal TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT,
+    CHECK (portal IN ('advertiser', 'publisher'))
+);
+
+CREATE TABLE IF NOT EXISTS placement_plans (
+    id TEXT PRIMARY KEY,
+    advertiser_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    creative_id TEXT REFERENCES creatives(id),
+    status TEXT NOT NULL DEFAULT 'draft',
+    title TEXT NOT NULL DEFAULT '未命名投放计划',
+    currency TEXT NOT NULL DEFAULT 'USD',
+    total_budget_cents INTEGER NOT NULL DEFAULT 0,
+    validation_summary_json TEXT NOT NULL DEFAULT '{}',
+    submitted_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (status IN ('draft', 'validating', 'ready', 'submitted', 'cancelled'))
+);
+
+CREATE TABLE IF NOT EXISTS placement_plan_items (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES placement_plans(id) ON DELETE CASCADE,
+    channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    slot_type TEXT NOT NULL,
+    placement_format TEXT NOT NULL,
+    schedule_mode TEXT NOT NULL DEFAULT 'once',
+    starts_at TEXT,
+    ends_at TEXT,
+    frequency_per_day INTEGER NOT NULL DEFAULT 1,
+    pin_enabled INTEGER NOT NULL DEFAULT 0,
+    unit_price_cents INTEGER NOT NULL DEFAULT 0,
+    estimated_total_cents INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'draft',
+    validation_errors_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (schedule_mode IN ('once', 'recurring')),
+    CHECK (status IN ('draft', 'valid', 'invalid', 'converted'))
+);
+
+CREATE TABLE IF NOT EXISTS placement_plan_orders (
+    plan_id TEXT NOT NULL REFERENCES placement_plans(id) ON DELETE CASCADE,
+    plan_item_id TEXT NOT NULL REFERENCES placement_plan_items(id) ON DELETE CASCADE,
+    order_id TEXT NOT NULL REFERENCES ad_orders(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (plan_id, plan_item_id, order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portal_access_account ON portal_access(account_id, portal, status);
+CREATE INDEX IF NOT EXISTS idx_portal_events_account ON portal_access_events(account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_account ON web_sessions(account_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_login_tokens_account ON login_tokens(account_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_placement_plans_advertiser ON placement_plans(advertiser_account_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_placement_plan_items_plan ON placement_plan_items(plan_id, status);
+CREATE INDEX IF NOT EXISTS idx_placement_plan_items_channel ON placement_plan_items(channel_id, status);
 """
 
 
@@ -759,6 +885,151 @@ def _0008_button_tail_defaults(conn: sqlite3.Connection) -> None:
         )
 
 
+def _0009_web_portals_and_plans(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS portal_access (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            portal TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'candidate',
+            grant_reason TEXT NOT NULL DEFAULT 'manual',
+            granted_by_account_id TEXT REFERENCES accounts(id),
+            granted_at TEXT,
+            revoked_at TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(account_id, portal),
+            CHECK (portal IN ('admin', 'advertiser', 'publisher')),
+            CHECK (status IN ('candidate', 'active', 'suspended', 'revoked'))
+        );
+
+        CREATE TABLE IF NOT EXISTS portal_access_events (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            portal TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            actor_account_id TEXT REFERENCES accounts(id),
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (portal IN ('admin', 'advertiser', 'publisher'))
+        );
+
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT 'magic_link',
+            user_agent TEXT,
+            ip_address TEXT,
+            impersonator_account_id TEXT REFERENCES accounts(id),
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS login_tokens (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            purpose TEXT NOT NULL DEFAULT 'magic_link',
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS impersonation_sessions (
+            id TEXT PRIMARY KEY,
+            admin_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            target_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            portal TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            ended_at TEXT,
+            CHECK (portal IN ('advertiser', 'publisher'))
+        );
+
+        CREATE TABLE IF NOT EXISTS placement_plans (
+            id TEXT PRIMARY KEY,
+            advertiser_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            creative_id TEXT REFERENCES creatives(id),
+            status TEXT NOT NULL DEFAULT 'draft',
+            title TEXT NOT NULL DEFAULT '未命名投放计划',
+            currency TEXT NOT NULL DEFAULT 'USD',
+            total_budget_cents INTEGER NOT NULL DEFAULT 0,
+            validation_summary_json TEXT NOT NULL DEFAULT '{}',
+            submitted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (status IN ('draft', 'validating', 'ready', 'submitted', 'cancelled'))
+        );
+
+        CREATE TABLE IF NOT EXISTS placement_plan_items (
+            id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL REFERENCES placement_plans(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            slot_type TEXT NOT NULL,
+            placement_format TEXT NOT NULL,
+            schedule_mode TEXT NOT NULL DEFAULT 'once',
+            starts_at TEXT,
+            ends_at TEXT,
+            frequency_per_day INTEGER NOT NULL DEFAULT 1,
+            pin_enabled INTEGER NOT NULL DEFAULT 0,
+            unit_price_cents INTEGER NOT NULL DEFAULT 0,
+            estimated_total_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'draft',
+            validation_errors_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (schedule_mode IN ('once', 'recurring')),
+            CHECK (status IN ('draft', 'valid', 'invalid', 'converted'))
+        );
+
+        CREATE TABLE IF NOT EXISTS placement_plan_orders (
+            plan_id TEXT NOT NULL REFERENCES placement_plans(id) ON DELETE CASCADE,
+            plan_item_id TEXT NOT NULL REFERENCES placement_plan_items(id) ON DELETE CASCADE,
+            order_id TEXT NOT NULL REFERENCES ad_orders(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (plan_id, plan_item_id, order_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_portal_access_account ON portal_access(account_id, portal, status);
+        CREATE INDEX IF NOT EXISTS idx_portal_events_account ON portal_access_events(account_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_web_sessions_account ON web_sessions(account_id, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_login_tokens_account ON login_tokens(account_id, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_placement_plans_advertiser ON placement_plans(advertiser_account_id, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_placement_plan_items_plan ON placement_plan_items(plan_id, status);
+        CREATE INDEX IF NOT EXISTS idx_placement_plan_items_channel ON placement_plan_items(channel_id, status);
+        """
+    )
+
+
+def _0010_accounts_active_role(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE accounts ADD COLUMN active_role TEXT",
+    ])
+
+
+def _0011_audit_hash_chain(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE audit_logs ADD COLUMN previous_hash TEXT",
+        "ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT",
+        "ALTER TABLE audit_logs ADD COLUMN hash_version TEXT",
+    ])
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_account_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_hash ON audit_logs(audit_hash)")
+
+
+def _0012_audit_query_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created ON audit_logs(action, created_at)")
+
+
 MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0001_price_offers_v2", _0001_price_offers_v2),
     ("0002_orders_price_offer_link", _0002_orders_price_offer_link),
@@ -768,4 +1039,8 @@ MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0006_creative_library_backfill", _0006_creative_library_backfill),
     ("0007_guided_placement_assets", _0007_guided_placement_assets),
     ("0008_button_tail_defaults", _0008_button_tail_defaults),
+    ("0009_web_portals_and_plans", _0009_web_portals_and_plans),
+    ("0010_accounts_active_role", _0010_accounts_active_role),
+    ("0011_audit_hash_chain", _0011_audit_hash_chain),
+    ("0012_audit_query_indexes", _0012_audit_query_indexes),
 ]

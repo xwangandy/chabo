@@ -80,13 +80,28 @@ class ChannelService:
                 (str(telegram_chat_id),),
             ).fetchone()
             if existing:
+                next_owner_id = owner["id"]
+                if existing["owner_account_id"] != owner["id"]:
+                    in_flight = conn.execute(
+                        """
+                        SELECT 1 FROM ad_orders
+                        WHERE channel_id = ? AND status IN ('pending_review', 'approved', 'running')
+                        UNION ALL
+                        SELECT 1 FROM deliveries
+                        WHERE channel_id = ? AND status IN ('scheduled', 'sending', 'sent')
+                        LIMIT 1
+                        """,
+                        (existing["id"], existing["id"]),
+                    ).fetchone()
+                    if in_flight:
+                        next_owner_id = existing["owner_account_id"]
                 conn.execute(
                     """
                     UPDATE channels
                     SET title = ?, username = ?, owner_account_id = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (title, username, owner["id"], existing["id"]),
+                    (title, username, next_owner_id, existing["id"]),
                 )
                 channel_id = existing["id"]
             else:
@@ -306,7 +321,7 @@ class ChannelService:
             channel = self.get_channel(conn, channel_id)
             from .billing import SubscriptionService
             has_premium = SubscriptionService.has_active_subscription(conn, channel_id)
-            wants_advanced = (not platform_promo_enabled) or owner_price_band == "custom" or custom_multiplier_bps is not None
+            wants_advanced = owner_price_band == "custom" or custom_multiplier_bps is not None
             if wants_advanced and not has_premium:
                 raise InvalidState("该配置属于频道高级功能，需要先开通频道高级订阅")
             self._ensure_default_format_policies(conn, channel_id)
@@ -334,6 +349,35 @@ class ChannelService:
                     format_type,
                 ),
             )
+            band_changed = previous is not None and (previous["owner_price_band"] or "") != owner_price_band
+            if band_changed or owner_price_band != "medium":
+                self._ensure_default_rate_cards(conn, channel_id)
+                latest_assessment = conn.execute(
+                    "SELECT base_standard_price_cents FROM channel_pricing_assessments "
+                    "WHERE channel_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (channel_id,),
+                ).fetchone()
+                format_bps = PricingService.FORMAT_FACTORS_BPS.get(format_type, 10000)
+                if latest_assessment:
+                    base_price = int(latest_assessment["base_standard_price_cents"]) * format_bps // 10_000
+                else:
+                    base_price = self.DEFAULT_RATES[format_type][1]
+                band_bps = (
+                    int(custom_multiplier_bps)
+                    if owner_price_band == "custom" and custom_multiplier_bps is not None
+                    else PricingService.BAND_FACTORS_BPS.get(owner_price_band, 10000)
+                )
+                next_unit_price = max(100, base_price * band_bps // 10_000)
+                slot = conn.execute(
+                    "SELECT id FROM ad_slots WHERE channel_id = ? AND slot_type = ?",
+                    (channel_id, format_type),
+                ).fetchone()
+                if slot:
+                    conn.execute("UPDATE rate_cards SET active = 0 WHERE slot_id = ?", (slot["id"],))
+                    conn.execute(
+                        "INSERT INTO rate_cards (id, slot_id, unit_price_cents, pricing_unit) VALUES (?, ?, ?, ?)",
+                        (new_id("rate"), slot["id"], next_unit_price, self.DEFAULT_RATES[format_type][0]),
+                    )
             row = conn.execute(
                 "SELECT * FROM channel_ad_format_policies WHERE channel_id = ? AND format_type = ?",
                 (channel_id, format_type),
@@ -855,6 +899,16 @@ class LightProbeService:
         probe = conn.execute("SELECT * FROM light_probes WHERE id = ?", (probe_id,)).fetchone()
         if not probe:
             raise NotFound(f"light probe not found: {probe_id}")
+        recent_probe_click = conn.execute(
+            """
+            SELECT id FROM light_probe_events
+            WHERE probe_id = ?
+              AND telegram_user_id = ?
+              AND created_at >= datetime('now', '-5 minutes')
+            LIMIT 1
+            """,
+            (probe_id, str(telegram_user_id)),
+        ).fetchone()
         event_id = new_id("lpe")
         conn.execute(
             """
@@ -871,6 +925,26 @@ class LightProbeService:
                 json.dumps(metadata or {}, ensure_ascii=False),
             ),
         )
+        if not recent_probe_click:
+            latest_dlv = conn.execute(
+                """
+                SELECT id FROM deliveries
+                WHERE channel_id = ?
+                  AND status IN ('sent', 'confirmed')
+                ORDER BY sent_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (probe["channel_id"],),
+            ).fetchone()
+            if latest_dlv:
+                conn.execute(
+                    """
+                    UPDATE deliveries
+                    SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (latest_dlv["id"],),
+                )
         return dict(conn.execute("SELECT * FROM light_probe_events WHERE id = ?", (event_id,)).fetchone())
 
     def stats(self, *, channel_id: str | None = None, probe_id: str | None = None) -> dict[str, Any]:
@@ -1127,25 +1201,58 @@ class PricingService:
         else:
             base = max(base, 100)
         score = self._score(interaction_bps, history_bps, risk_bps)
-        breakdown = {
-            "category_cpm_cents": category_cpm,
-            "estimated_reach": estimated_reach,
-            "interaction_bps": interaction_bps,
-            "history_bps": history_bps,
-            "risk_bps": risk_bps,
-            "pricing_note": "浏览量只用于估价，不作为一期结算依据",
-        }
+        smoothed_ctr = (max(0, light_unique_clickers_30d) + 2.0) / (max(estimated_reach, 1) + 1002.0)
         with self.db.transaction() as conn:
             self.channels.get_channel(conn, channel_id)
+            verified_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM ad_orders
+                WHERE channel_id = ?
+                  AND status IN ('running', 'done', 'budget_exhausted')
+                """,
+                (channel_id,),
+            ).fetchone()
+            verified_orders_count = int(verified_row["cnt"] or 0) + max(0, int(repeat_purchase_count))
+            if verified_orders_count >= 10:
+                confidence_level = "high"
+                confidence_badge = "💎 高置信验证"
+            elif verified_orders_count >= 3:
+                confidence_level = "medium"
+                confidence_badge = "🛡️ 实单验证"
+            else:
+                confidence_level = "low"
+                confidence_badge = "🌱 新晋测品"
+            grade = (
+                "S" if score >= 85 else
+                "A" if score >= 70 else
+                "B" if score >= 55 else
+                "C" if score >= 40 else
+                "D"
+            )
+            breakdown = {
+                "category_cpm_cents": category_cpm,
+                "estimated_reach": estimated_reach,
+                "interaction_bps": interaction_bps,
+                "history_bps": history_bps,
+                "risk_bps": risk_bps,
+                "bayesian_smoothed_ctr_bps": int(round(smoothed_ctr * 10_000)),
+                "confidence_level": confidence_level,
+                "confidence_badge": confidence_badge,
+                "grade": grade,
+                "verified_orders_count": verified_orders_count,
+                "pricing_note": "浏览量只用于估价，不作为一期结算依据",
+            }
             assessment_id = new_id("price")
             conn.execute(
                 """
                 INSERT INTO channel_pricing_assessments (
                     id, channel_id, category, median_24h_views, subscribers,
                     light_clicks_30d, light_unique_clickers_30d, repeat_purchase_count,
-                    dispute_count, risk_level, base_standard_price_cents, score, breakdown_json
+                    dispute_count, risk_level, base_standard_price_cents, score,
+                    confidence_level, verified_orders_count, breakdown_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     assessment_id,
@@ -1160,10 +1267,15 @@ class PricingService:
                     risk_level,
                     base,
                     score,
+                    confidence_level,
+                    verified_orders_count,
                     json.dumps(breakdown, ensure_ascii=False),
                 ),
             )
-            return dict(conn.execute("SELECT * FROM channel_pricing_assessments WHERE id = ?", (assessment_id,)).fetchone())
+            result = dict(conn.execute("SELECT * FROM channel_pricing_assessments WHERE id = ?", (assessment_id,)).fetchone())
+            result["grade"] = grade
+            result["confidence_badge"] = confidence_badge
+            return result
 
     def quote_channel(self, channel_id: str, slot_type: str, owner_price_band: str | None = None) -> dict[str, Any]:
         slot_type = self.channels.normalize_slot_type(slot_type)

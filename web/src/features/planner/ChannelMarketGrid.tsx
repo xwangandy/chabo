@@ -11,7 +11,11 @@ interface ChannelRow {
   username: string | null;
   ref_token: string;
   score: number | null;
+  grade?: string | null;
   risk_level: string | null;
+  confidence_level?: "low" | "medium" | "high" | null;
+  confidence_badge?: string | null;
+  verified_orders_count?: number | null;
   standard_price_cents: number | null;
   button_enabled: boolean;
   standard_enabled: boolean;
@@ -85,7 +89,31 @@ export function ChannelMarketGrid() {
         pinned: "left"
       },
       { headerName: "用户名", field: "username", width: 160 },
-      { headerName: "评分", field: "score", width: 90, sortable: true },
+      {
+        headerName: "评分等级",
+        field: "score",
+        width: 110,
+        sortable: true,
+        cellRenderer: ({ value, data }: { value?: number | null; data?: ChannelRow }) => {
+          if (value == null) return "—";
+          const g = data?.grade || (value >= 85 ? "S" : value >= 70 ? "A" : value >= 55 ? "B" : value >= 40 ? "C" : "D");
+          return <Tag color={g === "S" || g === "A" ? "gold" : "blue"}>{`${g}级 (${value})`}</Tag>;
+        }
+      },
+      {
+        headerName: "数据置信度",
+        field: "confidence_level",
+        width: 150,
+        cellRenderer: ({ value, data }: { value?: string | null; data?: ChannelRow }) => {
+          const level = value || "low";
+          const color = level === "high" ? "green" : level === "medium" ? "blue" : "default";
+          const badge =
+            data?.confidence_badge ||
+            (level === "high" ? "💎 高置信验证" : level === "medium" ? "🛡️ 实单验证" : "🌱 新晋测品");
+          const orders = data?.verified_orders_count ?? 0;
+          return <Tag color={color}>{`${badge} (${orders}单)`}</Tag>;
+        }
+      },
       { headerName: "风险", field: "risk_level", width: 100 },
       {
         headerName: "标准价",

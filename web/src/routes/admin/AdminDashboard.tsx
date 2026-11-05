@@ -431,6 +431,20 @@ export function AdminDashboard() {
       await refreshAdmin();
     }
   });
+  const reconcileDelivery = useMutation({
+    mutationFn: (payload: { deliveryId: string; resolution: "confirm_sent" | "confirm_failed" }) =>
+      apiFetch(`/api/admin/deliveries/${payload.deliveryId}/reconcile`, {
+        method: "POST",
+        body: JSON.stringify({
+          resolution: payload.resolution,
+          note: payload.resolution === "confirm_sent" ? "运营人工核实已发帖补记入账" : "运营人工核实未发帖释放冻结预算"
+        })
+      }),
+    onSuccess: async (_res, vars) => {
+      message.success(vars.resolution === "confirm_sent" ? "已补记入账并恢复订单运行" : "已确认未发帖并退回冻结预算");
+      await refreshAdmin();
+    }
+  });
   const resolveDispute = useMutation({
     mutationFn: (disputeId: string) =>
       apiFetch(`/api/admin/disputes/${disputeId}/resolve`, {
@@ -544,14 +558,33 @@ export function AdminDashboard() {
     },
     onError: (error) => message.error(error instanceof Error ? error.message : String(error))
   });
+  const runPeriodicJobs = useMutation({
+    mutationFn: () =>
+      apiFetch<{ dispatched_count?: number; confirmed_count?: number; released_holdbacks_count?: number }>(
+        "/api/admin/run-periodic-jobs",
+        { method: "POST" }
+      ),
+    onSuccess: async (res) => {
+      message.success(
+        `调度完成：派发 ${res.dispatched_count ?? 0} 条，确认收益 ${res.confirmed_count ?? 0} 条，释放质押 ${res.released_holdbacks_count ?? 0} 条`
+      );
+      await refreshAdmin();
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : String(error))
+  });
   const metrics = data?.metrics ?? {};
   const urgentOrders = (orders.data?.items ?? []).filter((item) => ["pending_review", "paused"].includes(item.status)).slice(0, 5);
-  const actionableDeliveries = (deliveries.data?.items ?? []).filter((item) => ["sent", "disputed"].includes(item.status)).slice(0, 5);
+  const actionableDeliveries = (deliveries.data?.items ?? []).filter((item) => ["sent", "disputed", "reconciliation_required"].includes(item.status)).slice(0, 5);
   const openDisputes = (disputes.data?.items ?? []).filter((item) => item.status === "open").slice(0, 5);
 
   return (
     <section className="page-stack">
-      <Typography.Title level={2}>管理端</Typography.Title>
+      <Space style={{ justifyContent: "space-between", width: "100%" }} wrap>
+        <Typography.Title level={2} style={{ margin: 0 }}>管理端</Typography.Title>
+        <Button type="primary" loading={runPeriodicJobs.isPending} onClick={() => runPeriodicJobs.mutate()}>
+          一键执行到期派发与收益结算
+        </Button>
+      </Space>
       <Row gutter={[12, 12]}>
         <Col xs={12} lg={6}>
           <MetricCard title="待审核订单" value={metrics.pending_review_orders ?? 0} />
@@ -836,12 +869,36 @@ export function AdminDashboard() {
                   { title: "已退", dataIndex: "refunded_cents", width: 110, render: cents },
                   {
                     title: "操作",
-                    width: 230,
+                    width: 320,
                     render: (_, record) => (
-                      <Space>
+                      <Space wrap size={4}>
                         <Button size="small" onClick={() => setDetailTarget({ type: "delivery", id: record.id })}>
                           详情
                         </Button>
+                        {record.status === "reconciliation_required" ? (
+                          <>
+                            <Button
+                              size="small"
+                              type="primary"
+                              loading={reconcileDelivery.isPending}
+                              onClick={() =>
+                                reconcileDelivery.mutate({ deliveryId: record.id, resolution: "confirm_sent" })
+                              }
+                            >
+                              确认已发帖入账
+                            </Button>
+                            <Button
+                              size="small"
+                              danger
+                              loading={reconcileDelivery.isPending}
+                              onClick={() =>
+                                reconcileDelivery.mutate({ deliveryId: record.id, resolution: "confirm_failed" })
+                              }
+                            >
+                              确认未发帖退回
+                            </Button>
+                          </>
+                        ) : null}
                         <Button
                           size="small"
                           danger

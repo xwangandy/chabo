@@ -855,42 +855,90 @@ class OrderService:
         unit_price_override_cents: int | None,
         price_offer_id: str | None,
     ) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            return self._create_order_in_conn(
+                conn,
+                advertiser_telegram_user_id=advertiser_telegram_user_id,
+                channel_token=channel_token,
+                slot_type=slot_type,
+                budget_cents=budget_cents,
+                text=text,
+                target_url=target_url,
+                button_text=button_text,
+                category=category,
+                light_short_text=light_short_text,
+                material_id=material_id,
+                scheduled_at=scheduled_at,
+                end_at=end_at,
+                frequency_per_day=frequency_per_day,
+                campaign_name=campaign_name,
+                unit_price_override_cents=unit_price_override_cents,
+                price_offer_id=price_offer_id,
+            )
+
+    def _create_order_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        advertiser_telegram_user_id: str | int,
+        channel_token: str,
+        slot_type: str,
+        budget_cents: int,
+        text: str | None = None,
+        target_url: str | None = None,
+        button_text: str = "查看详情",
+        category: str = "general",
+        light_short_text: str | None = None,
+        material_id: str | None = None,
+        scheduled_at: datetime | None = None,
+        end_at: datetime | None = None,
+        frequency_per_day: int = 1,
+        campaign_name: str = "插播广告",
+        unit_price_override_cents: int | None = None,
+        price_offer_id: str | None = None,
+        campaign_id: str | None = None,
+    ) -> dict[str, Any]:
         scheduled_at = scheduled_at or utcnow()
         slot_type = self.channels.normalize_slot_type(slot_type)
         if material_id is None and not (text and target_url):
             raise InvalidState("创建订单需要提供 material_id 或者 text+target_url")
-        with self.db.transaction() as conn:
-            advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
-            channel = self.channels.get_by_token(conn, channel_token)
-            if not channel:
-                raise NotFound("频道插播入口不存在或已失效")
-            rate = self.channels.get_rate(conn, channel["id"], slot_type)
-            policy = conn.execute(
-                """
-                SELECT * FROM channel_ad_format_policies
-                WHERE channel_id = ? AND format_type = ?
-                """,
-                (channel["id"], slot_type),
-            ).fetchone()
-            if policy and not policy["enabled"]:
-                raise InvalidState("该频道主当前未开启这种插播广告形态")
-            from .billing import SubscriptionService
-            effective_service_fee_bps = 0 if SubscriptionService.has_active_subscription(conn, channel["id"]) else self.settings.default_service_fee_bps
-            if policy and policy["platform_promo_enabled"]:
-                effective_service_fee_bps = 0
-            conn.execute(
-                """
-                UPDATE channel_configs
-                SET service_fee_bps = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE channel_id = ?
-                """,
-                (effective_service_fee_bps, channel["id"]),
-            )
-            unit_price_cents = unit_price_override_cents or rate["unit_price_cents"]
-            if budget_cents < unit_price_cents:
-                raise InvalidState("插播预算低于该广告位单次刊例价")
+        advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
+        channel = self.channels.get_by_token(conn, channel_token)
+        if not channel:
+            raise NotFound("频道插播入口不存在或已失效")
+        rate = self.channels.get_rate(conn, channel["id"], slot_type)
+        policy = conn.execute(
+            """
+            SELECT * FROM channel_ad_format_policies
+            WHERE channel_id = ? AND format_type = ?
+            """,
+            (channel["id"], slot_type),
+        ).fetchone()
+        if policy and not policy["enabled"]:
+            raise InvalidState("该频道主当前未开启这种插播广告形态")
+        config = conn.execute(
+            "SELECT * FROM channel_configs WHERE channel_id = ?",
+            (channel["id"],),
+        ).fetchone()
+        if config and slot_type == "pin24h" and not int(config["allow_pin"]):
+            raise InvalidState("该频道主未开启置顶插播权限")
+        from .billing import SubscriptionService
+        effective_service_fee_bps = 0 if SubscriptionService.has_active_subscription(conn, channel["id"]) else self.settings.default_service_fee_bps
+        if policy and policy["platform_promo_enabled"]:
+            effective_service_fee_bps = 0
+        conn.execute(
+            """
+            UPDATE channel_configs
+            SET service_fee_bps = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE channel_id = ?
+            """,
+            (effective_service_fee_bps, channel["id"]),
+        )
+        unit_price_cents = unit_price_override_cents or rate["unit_price_cents"]
+        if budget_cents < unit_price_cents:
+            raise InvalidState("插播预算低于该广告位单次刊例价")
+        if campaign_id is None:
             campaign_id = new_id("camp")
-            order_id = new_id("ord")
             conn.execute(
                 """
                 INSERT INTO campaigns (id, advertiser_account_id, name)
@@ -898,103 +946,114 @@ class OrderService:
                 """,
                 (campaign_id, advertiser["id"], campaign_name),
             )
-            if material_id is not None:
-                material = conn.execute(
-                    """
-                    SELECT cr.*, ca.advertiser_account_id AS campaign_advertiser_account_id
-                    FROM creatives cr
-                    JOIN campaigns ca ON ca.id = cr.campaign_id
-                    WHERE cr.id = ?
-                    """,
-                    (material_id,),
-                ).fetchone()
-                if not material:
-                    raise NotFound(f"广告素材不存在：{material_id}")
-                material_owner_id = material["advertiser_account_id"] or material["campaign_advertiser_account_id"]
-                if material_owner_id != advertiser["id"]:
-                    raise NotFound(f"广告素材不存在：{material_id}")
-                if material["advertiser_account_id"] is None:
-                    conn.execute(
-                        "UPDATE creatives SET advertiser_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (advertiser["id"], material_id),
-                    )
-                if material["archived_at"]:
-                    raise InvalidState("广告素材已归档，请先恢复或选择其他素材")
-                if material["format_type"] not in MaterialService.SUPPORTED_FORMATS:
-                    raise InvalidState("该素材形态已停用，请新建按钮插播、标准插播或定制插播素材")
-                creative_id = material["id"]
-                creative_snapshot = {
-                    "text": material["text"],
-                    "target_url": material["target_url"],
-                    "button_text": material["button_text"],
-                    "format_type": material["format_type"],
-                    "light_short_text": material["light_short_text"],
-                    "short_text": material["short_text"],
-                    "standard_text": material["standard_text"],
-                    "media_file_id": material["media_file_id"],
-                    "media_type": material["media_type"],
-                    "material_id": material["id"],
-                }
-            else:
-                material_format = (
-                    slot_type
-                    if slot_type in MaterialService.SUPPORTED_FORMATS
-                    else "standard_card"
-                )
-                creative_id = self.materials.insert_material_in_conn(
-                    conn,
-                    advertiser_account_id=advertiser["id"],
-                    format_type=material_format,
-                    text=text or "",
-                    target_url=target_url or "",
-                    button_text=button_text,
-                    category=category,
-                    light_short_text=light_short_text,
-                    campaign_id=campaign_id,
-                )
-                creative_snapshot = {
-                    "text": text,
-                    "target_url": target_url,
-                    "button_text": button_text,
-                    "format_type": material_format,
-                    "light_short_text": light_short_text,
-                    "short_text": light_short_text,
-                    "standard_text": None,
-                    "media_file_id": None,
-                    "media_type": None,
-                    "material_id": creative_id,
-                }
-            conn.execute(
+        order_id = new_id("ord")
+        if material_id is not None:
+            material = conn.execute(
                 """
-                INSERT INTO ad_orders (
-                    id, campaign_id, creative_id, advertiser_account_id, channel_id, slot_id,
-                    budget_cents, reserved_cents, unit_price_cents, start_at, end_at,
-                    scheduled_at, frequency_per_day, price_offer_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT cr.*, ca.advertiser_account_id AS campaign_advertiser_account_id
+                FROM creatives cr
+                JOIN campaigns ca ON ca.id = cr.campaign_id
+                WHERE cr.id = ?
                 """,
-                (
-                    order_id,
-                    campaign_id,
-                    creative_id,
-                    advertiser["id"],
-                    channel["id"],
-                    rate["slot_id"],
-                    budget_cents,
-                    budget_cents,
-                    unit_price_cents,
-                    iso(scheduled_at),
-                    iso(end_at) if end_at else None,
-                    iso(scheduled_at),
-                    frequency_per_day,
-                    price_offer_id,
-                ),
+                (material_id,),
+            ).fetchone()
+            if not material:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            material_owner_id = material["advertiser_account_id"] or material["campaign_advertiser_account_id"]
+            if material_owner_id != advertiser["id"]:
+                raise NotFound(f"广告素材不存在：{material_id}")
+            if material["advertiser_account_id"] is None:
+                conn.execute(
+                    "UPDATE creatives SET advertiser_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (advertiser["id"], material_id),
+                )
+            if material["archived_at"]:
+                raise InvalidState("广告素材已归档，请先恢复或选择其他素材")
+            if material["format_type"] not in MaterialService.SUPPORTED_FORMATS:
+                raise InvalidState("该素材形态已停用，请新建按钮插播、标准插播或定制插播素材")
+            effective_category = material["category"] or category
+            creative_id = material["id"]
+            creative_snapshot = {
+                "text": material["text"],
+                "target_url": material["target_url"],
+                "button_text": material["button_text"],
+                "format_type": material["format_type"],
+                "light_short_text": material["light_short_text"],
+                "short_text": material["short_text"],
+                "standard_text": material["standard_text"],
+                "media_file_id": material["media_file_id"],
+                "media_type": material["media_type"],
+                "material_id": material["id"],
+            }
+        else:
+            effective_category = category
+            material_format = (
+                slot_type
+                if slot_type in MaterialService.SUPPORTED_FORMATS
+                else "standard_card"
             )
-            self.ledger.reserve_budget(conn, advertiser["id"], order_id, budget_cents, rate["currency"])
-            self._snapshot(conn, order_id, None, "creative", creative_snapshot)
-            self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": unit_price_cents, "price_offer_id": price_offer_id})
-            self._snapshot(conn, order_id, None, "channel", channel)
-            return self.get_order(conn, order_id)
+            creative_id = self.materials.insert_material_in_conn(
+                conn,
+                advertiser_account_id=advertiser["id"],
+                format_type=material_format,
+                text=text or "",
+                target_url=target_url or "",
+                button_text=button_text,
+                category=category,
+                light_short_text=light_short_text,
+                campaign_id=campaign_id,
+            )
+            creative_snapshot = {
+                "text": text,
+                "target_url": target_url,
+                "button_text": button_text,
+                "format_type": material_format,
+                "light_short_text": light_short_text,
+                "short_text": light_short_text,
+                "standard_text": None,
+                "media_file_id": None,
+                "media_type": None,
+                "material_id": creative_id,
+            }
+        if config and config["category_blocklist_json"]:
+            try:
+                blocked_categories = set(json.loads(config["category_blocklist_json"] or "[]"))
+            except json.JSONDecodeError:
+                blocked_categories = set()
+            if effective_category in blocked_categories:
+                raise InvalidState(f"该频道禁投此类目广告：{effective_category}")
+        conn.execute(
+            """
+            INSERT INTO ad_orders (
+                id, campaign_id, creative_id, advertiser_account_id, publisher_account_id, channel_id, slot_id,
+                budget_cents, reserved_cents, unit_price_cents, start_at, end_at,
+                scheduled_at, frequency_per_day, price_offer_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                campaign_id,
+                creative_id,
+                advertiser["id"],
+                channel["owner_account_id"],
+                channel["id"],
+                rate["slot_id"],
+                budget_cents,
+                budget_cents,
+                unit_price_cents,
+                iso(scheduled_at),
+                iso(end_at) if end_at else None,
+                iso(scheduled_at),
+                frequency_per_day,
+                price_offer_id,
+            ),
+        )
+        self.ledger.reserve_budget(conn, advertiser["id"], order_id, budget_cents, rate["currency"])
+        self._snapshot(conn, order_id, None, "creative", creative_snapshot)
+        self._snapshot(conn, order_id, None, "rate_card", {**rate, "accepted_unit_price_cents": unit_price_cents, "price_offer_id": price_offer_id})
+        self._snapshot(conn, order_id, None, "channel", channel)
+        return self.get_order(conn, order_id)
 
     def approve_order_for_operator(
         self,
@@ -1128,8 +1187,10 @@ class OrderService:
     ) -> dict[str, Any]:
         with self.db.transaction() as conn:
             order = self.get_order(conn, order_id)
-            if order["status"] not in {"pending_review", "paused"}:
+            if order["status"] != "pending_review":
                 raise InvalidState(f"订单状态不能审核通过: {order['status']}")
+            if int(order["reserved_cents"]) <= 0 or int(order["reserved_cents"]) < int(order["unit_price_cents"]):
+                raise InvalidState("订单冻结预算不足，无法审核通过")
             conn.execute("UPDATE creatives SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (order["creative_id"],))
             conn.execute(
                 """
@@ -1232,7 +1293,9 @@ class OrderService:
                 "publisher_deletion_reported",
                 {"reason": reason},
             )
-        return self.refund_delivery(delivery_id, reason, actor_account_id, note=note)
+            delivery = self._refundable_delivery(conn, delivery_id)
+            refundable_cents = delivery["charge_cents"] - delivery["refunded_cents"]
+            return self._refund_delivery_locked(conn, delivery, reason, refundable_cents, actor_account_id, note=note)
 
     def refund_delivery_partial(
         self,
@@ -1283,10 +1346,11 @@ class OrderService:
             raise InvalidState("退款金额不合法")
         publisher_net_cents, platform_fee_cents = self._split_refund_amount(delivery, amount_cents, refundable_cents)
         full_refund = amount_cents == refundable_cents
+        publisher_account_id = order.get("publisher_account_id") or channel["owner_account_id"]
         self.ledger.refund_delivery(
             conn,
             advertiser_account_id=order["advertiser_account_id"],
-            publisher_account_id=channel["owner_account_id"],
+            publisher_account_id=publisher_account_id,
             order_id=order["id"],
             delivery_id=delivery["id"],
             gross_cents=amount_cents,
@@ -1655,10 +1719,10 @@ class OrderService:
         delivery_id = new_id("del")
         conn.execute(
             """
-            INSERT INTO deliveries (id, order_id, channel_id, creative_id, scheduled_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO deliveries (id, order_id, channel_id, creative_id, scheduled_at, tracking_token)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (delivery_id, order_id, order["channel_id"], order["creative_id"], scheduled_at),
+            (delivery_id, order_id, order["channel_id"], order["creative_id"], scheduled_at, f"trk_{delivery_id}"),
         )
         return delivery_id
 
@@ -1687,7 +1751,8 @@ class OrderService:
             return
         if slot["slot_type"] != "loop_daily" and not order["end_at"]:
             return
-        next_at = parse_iso(order["scheduled_at"]) + timedelta(days=1)
+        freq = max(1, int(order["frequency_per_day"] or 1))
+        next_at = parse_iso(order["scheduled_at"]) + timedelta(hours=24.0 / freq)
         if order["end_at"] and next_at > parse_iso(order["end_at"]):
             self.ledger.release_reserved(
                 conn,
@@ -1899,17 +1964,18 @@ class PriceOfferService:
         conn.execute(
             """
             INSERT INTO ad_orders (
-                id, campaign_id, creative_id, advertiser_account_id, channel_id, slot_id,
+                id, campaign_id, creative_id, advertiser_account_id, publisher_account_id, channel_id, slot_id,
                 status, budget_cents, reserved_cents, unit_price_cents, start_at, end_at,
                 scheduled_at, frequency_per_day, price_offer_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending_review', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
                 campaign_id,
                 creative_id,
                 offer["advertiser_account_id"],
+                channel["owner_account_id"],
                 offer["channel_id"],
                 rate["slot_id"],
                 budget_cents,

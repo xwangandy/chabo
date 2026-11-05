@@ -18,7 +18,7 @@ COPY --chown=chabo:chabo pyproject.toml README.md ./
 COPY --chown=chabo:chabo src/ ./src/
 
 USER chabo
-RUN pip install --user --no-cache-dir .
+RUN pip install --user --no-cache-dir ".[web]"
 
 ENV PATH="/home/chabo/.local/bin:$PATH" \
     CHABO_DB_PATH=/data/chabo.sqlite3 \

@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..app import ChaboApp, create_app
 from ..audit import insert_audit_log, latest_audit_hash, verify_audit_chain
@@ -55,6 +55,8 @@ from .readmodels import (
     publisher_channels,
 )
 from .plans import add_plan_items, create_plan, get_plan, list_plans, submit_plan
+from .redirect import resolve_and_record_click
+from .scheduler import create_scheduler_lifespan, run_periodic_jobs_once
 from .schemas import (
     DailyLimitRequest,
     DevSessionRequest,
@@ -69,6 +71,8 @@ from .schemas import (
     PlanSubmitRequest,
     PortalAccessUpdateRequest,
     RateRequest,
+    RebookRequest,
+    ReconcileDeliveryRequest,
     RefundDeliveryRequest,
     RejectOrderRequest,
     ResolveDisputeRequest,
@@ -113,7 +117,11 @@ def _snapshot_diff(before: dict[str, Any] | None, after: dict[str, Any] | None) 
 def create_web_api(settings: Settings | None = None, chabo: ChaboApp | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     chabo = chabo or create_app(settings)
-    api = FastAPI(title="Chabo Web API", version="0.1.0")
+    api = FastAPI(
+        title="Chabo Web API",
+        version="0.1.0",
+        lifespan=lambda _app: create_scheduler_lifespan(chabo),
+    )
     api.state.chabo = chabo
     api.add_middleware(
         CORSMiddleware,
@@ -157,11 +165,40 @@ def register_exception_handlers(api: FastAPI) -> None:
 
 
 def register_routes(api: FastAPI) -> None:
+    @api.get("/health")
     @api.get("/api/health")
     def health(chabo: ChaboApp = Depends(get_chabo_app)) -> dict[str, Any]:
         with chabo.db.transaction() as conn:
             conn.execute("SELECT 1").fetchone()
         return {"ok": True, "service": "chabo-api", "ops": ops_summary(chabo)}
+
+    @api.post("/telegram/webhook")
+    @api.post("/telegram/webhook/{path_secret}")
+    async def telegram_webhook(
+        request: Request,
+        path_secret: str | None = None,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        import hmac as _hmac
+
+        expected = (chabo.settings.webhook_secret or "").strip()
+        if expected:
+            path_ok = bool(path_secret and _hmac.compare_digest(path_secret, expected))
+            header_ok = bool(
+                x_telegram_bot_api_secret_token
+                and _hmac.compare_digest(x_telegram_bot_api_secret_token, expected)
+            )
+            if not (path_ok or header_ok):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid webhook secret")
+        try:
+            update = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid update") from exc
+        if not isinstance(update, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid update")
+        result = chabo.update_handler.handle(update)
+        return {"ok": True, "result": result}
 
     @api.get("/api/auth/config")
     def auth_config(chabo: ChaboApp = Depends(get_chabo_app)) -> dict[str, Any]:
@@ -402,6 +439,35 @@ def register_routes(api: FastAPI) -> None:
             "activation": activation,
         }
 
+    @api.post("/api/auth/activate-portal/{portal}")
+    def self_activate_portal(
+        portal: str,
+        session: dict[str, Any] = Depends(current_session),
+        chabo: ChaboApp = Depends(get_chabo_app),
+    ) -> dict[str, Any]:
+        if session.get("impersonator_account_id"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="impersonation_read_only")
+        if portal not in {"advertiser", "publisher"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_portal")
+        with chabo.db.transaction() as conn:
+            current = conn.execute(
+                "SELECT status FROM portal_access WHERE account_id = ? AND portal = ?",
+                (session["account_id"], portal),
+            ).fetchone()
+            if current and current["status"] in {"suspended", "revoked"}:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"portal_{current['status']}")
+            grant_portal(
+                conn,
+                account_id=session["account_id"],
+                portal=portal,
+                status="active",
+                reason="self_activated",
+                actor_account_id=session["account_id"],
+            )
+            portals = active_portals(conn, session["account_id"])
+            statuses = portal_statuses(conn, session["account_id"])
+        return {"ok": True, "portals": portals, "portal_statuses": statuses}
+
     @api.post("/api/auth/logout")
     def logout(
         response: Response,
@@ -425,6 +491,33 @@ def register_routes(api: FastAPI) -> None:
         session: dict[str, Any] = Depends(require_admin),
     ) -> dict[str, Any]:
         return {"metrics": ops_summary(chabo), "session": {"account_id": session["account_id"]}}
+
+    @api.post("/api/admin/dispatch-due")
+    def admin_dispatch_due(
+        limit: int = 20,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        dispatched = chabo.fulfillment.dispatch_due(limit=limit)
+        return {"dispatched": dispatched, "count": len(dispatched)}
+
+    @api.post("/api/admin/confirm-earnings")
+    def admin_confirm_earnings(
+        observation_hours: int = 24,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        confirmed = chabo.fulfillment.confirm_due_earnings(observation_hours=observation_hours)
+        return {"confirmed_deliveries": confirmed}
+
+    @api.post("/api/admin/release-holdbacks")
+    def admin_release_holdbacks(
+        holdback_days: int | None = None,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        released = chabo.fulfillment.release_due_holdbacks(holdback_days=holdback_days)
+        return {"released_deliveries": released}
 
     @api.post("/api/admin/impersonations")
     def start_admin_impersonation(
@@ -594,6 +687,20 @@ def register_routes(api: FastAPI) -> None:
         session: dict[str, Any] = Depends(require_admin_level("operator")),
     ) -> dict[str, Any]:
         return chabo.orders.report_publisher_deletion(delivery_id, actor_account_id=session["account_id"], note=payload.note)
+
+    @api.post("/api/admin/deliveries/{delivery_id}/reconcile")
+    def reconcile_admin_delivery(
+        delivery_id: str,
+        payload: ReconcileDeliveryRequest,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        return chabo.fulfillment.reconcile_delivery(
+            delivery_id,
+            resolution=payload.resolution,
+            actor_account_id=session["account_id"],
+            note=payload.note,
+        )
 
     @api.get("/api/admin/disputes")
     def list_admin_disputes(
@@ -886,6 +993,49 @@ def register_routes(api: FastAPI) -> None:
             },
         )
 
+    @api.get("/r/{token}")
+    def redirect_click(
+        token: str,
+        request: Request,
+        chabo: ChaboApp = Depends(get_chabo_app),
+    ) -> RedirectResponse:
+        client_ip = request.client.host if request.client else None
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip() or client_ip
+        result = resolve_and_record_click(
+            chabo,
+            token=token,
+            client_ip=client_ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+        return RedirectResponse(url=str(result["target_url"]), status_code=302)
+
+    @api.post("/api/admin/unpublish-due")
+    def admin_unpublish_due(
+        pin_hours: int = 24,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        _session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        count = chabo.fulfillment.unpublish_due(pin_hours=pin_hours)
+        return {"ok": True, "unpinned_count": count}
+
+    @api.post("/api/admin/sync-delivery-metrics")
+    def admin_sync_delivery_metrics(
+        checkpoint_label: str = "24h",
+        chabo: ChaboApp = Depends(get_chabo_app),
+        _session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        count = chabo.fulfillment.sync_delivery_metrics(checkpoint_label=checkpoint_label)
+        return {"ok": True, "synced_count": count}
+
+    @api.post("/api/admin/run-periodic-jobs")
+    def admin_run_periodic_jobs(
+        chabo: ChaboApp = Depends(get_chabo_app),
+        _session: dict[str, Any] = Depends(require_admin_level("operator")),
+    ) -> dict[str, Any]:
+        return {"ok": True, **run_periodic_jobs_once(chabo)}
+
     @api.get("/api/advertiser/dashboard")
     def advertiser_home(
         chabo: ChaboApp = Depends(get_chabo_app),
@@ -961,6 +1111,57 @@ def register_routes(api: FastAPI) -> None:
         session: dict[str, Any] = Depends(require_portal("advertiser")),
     ) -> dict[str, Any]:
         return advertiser_orders(chabo, telegram_user_id=session["telegram_user_id"], status=status, limit=limit)
+
+    @api.post("/api/advertiser/orders/{order_id}/pause")
+    def pause_advertiser_order(
+        order_id: str,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_portal("advertiser")),
+    ) -> dict[str, Any]:
+        return chabo.orders.advertiser_pause_order(
+            order_id=order_id,
+            advertiser_telegram_user_id=session["telegram_user_id"],
+        )
+
+    @api.get("/api/advertiser/report")
+    def get_advertiser_report(
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_portal("advertiser")),
+    ) -> dict[str, Any]:
+        tg_uid = session["telegram_user_id"]
+        rep = chabo.advertisers.report(tg_uid)
+        recs = chabo.advertisers.recommendations(tg_uid)
+        return {**rep, "recommendations": recs}
+
+    @api.post("/api/advertiser/reports/share-token")
+    def create_advertiser_report_share_token(
+        days: int = 7,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_portal("advertiser")),
+    ) -> dict[str, Any]:
+        return chabo.advertisers.create_report_share_token(
+            session["telegram_user_id"],
+            days=days,
+        )
+
+    @api.get("/api/public/reports/{share_token}")
+    def get_public_shared_report(
+        share_token: str,
+        chabo: ChaboApp = Depends(get_chabo_app),
+    ) -> dict[str, Any]:
+        return chabo.advertisers.get_shared_report(share_token)
+
+    @api.post("/api/advertiser/rebook")
+    def rebook_advertiser_order(
+        payload: RebookRequest,
+        chabo: ChaboApp = Depends(get_chabo_app),
+        session: dict[str, Any] = Depends(require_portal("advertiser")),
+    ) -> dict[str, Any]:
+        return chabo.advertisers.rebook_order(
+            advertiser_telegram_user_id=session["telegram_user_id"],
+            source_order_id=payload.source_order_id,
+            budget_cents=payload.budget_cents,
+        )
 
     @api.get("/api/advertiser/wallet")
     def advertiser_wallet(

@@ -140,13 +140,6 @@ def _ensure_demo_channels(app: ChaboApp, user_id: str, display_name: str) -> lis
 
 
 def _ensure_latest_assessment(app: ChaboApp, channel_id: str, item: dict[str, Any]) -> None:
-    with app.db.transaction() as conn:
-        existing = conn.execute(
-            "SELECT id FROM channel_pricing_assessments WHERE channel_id = ?",
-            (channel_id,),
-        ).fetchone()
-    if existing:
-        return
     app.pricing.assess_channel(
         channel_id=channel_id,
         category=item["category"],
@@ -250,6 +243,62 @@ def _ensure_demo_orders(
             session_id="dev_seed",
         )
         created.append({"id": order["id"], "channel_title": channel["title"], "status": order["status"]})
+
+    # Ensure at least one delivered & sampled order exists so the Report & Rebook panel has live demo data
+    with app.db.transaction() as conn:
+        has_sent = conn.execute(
+            """
+            SELECT d.id
+            FROM deliveries d
+            JOIN ad_orders o ON o.id = d.order_id
+            WHERE o.advertiser_account_id = ? AND d.status IN ('sent', 'confirmed')
+            LIMIT 1
+            """,
+            (account["id"],),
+        ).fetchone()
+    if not has_sent and channels:
+        ch0 = channels[0]
+        live_order = app.orders.create_order(
+            advertiser_telegram_user_id=user_id,
+            channel_token=ch0["ref_token"],
+            slot_type="standard_card",
+            material_id=material["id"],
+            budget_cents=1_200,
+            campaign_name="M6 演示已完结归因样例",
+            scheduled_at=utcnow(),
+            actor_kind="system",
+            session_id="dev_seed",
+        )
+        app.orders.approve_order(live_order["id"])
+        with app.db.transaction() as conn:
+            dlv = conn.execute("SELECT id FROM deliveries WHERE order_id = ? LIMIT 1", (live_order["id"],)).fetchone()
+            if dlv:
+                app.ledger.charge_delivery(
+                    conn,
+                    advertiser_account_id=account["id"],
+                    publisher_account_id=account["id"],
+                    order_id=live_order["id"],
+                    delivery_id=dlv["id"],
+                    gross_cents=1_200,
+                    service_fee_bps=800,
+                    currency="USD",
+                )
+                conn.execute(
+                    """
+                    UPDATE deliveries
+                    SET status = 'sent',
+                        sent_at = CURRENT_TIMESTAMP,
+                        message_id = '9001',
+                        impression_count = 18000,
+                        click_count = 42
+                    WHERE id = ?
+                    """,
+                    (dlv["id"],),
+                )
+                conn.execute(
+                    "UPDATE ad_orders SET status = 'running', spent_cents = 1200, reserved_cents = 0 WHERE id = ?",
+                    (live_order["id"],),
+                )
     return created
 
 

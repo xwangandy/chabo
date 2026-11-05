@@ -121,6 +121,16 @@ class RateRequest(BaseModel):
     unit_price_cents: int
 
 
+class RebookRequest(BaseModel):
+    source_order_id: str
+    budget_cents: int | None = None
+
+
+class ReconcileDeliveryRequest(BaseModel):
+    resolution: Literal["confirm_sent", "confirm_failed"]
+    note: str | None = None
+
+
 class AccountView(BaseModel):
     id: str
     telegram_user_id: str | None = None

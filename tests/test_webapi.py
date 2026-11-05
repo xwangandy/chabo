@@ -793,6 +793,17 @@ class WebApiFoundationTest(unittest.TestCase):
         self.assertEqual(me.json()["session_expires_at"], started.json()["session_expires_at"])
         self.assertEqual(client.get("/api/advertiser/dashboard").status_code, 200)
         self.assertEqual(client.get("/api/admin/summary").status_code, 403)
+        blocked_write = client.post(
+            "/api/advertiser/materials",
+            json={
+                "format_type": "standard_card",
+                "text": "代看期间禁止写操作",
+                "target_url": "https://example.com",
+                "button_text": "查看详情",
+            },
+        )
+        self.assertEqual(blocked_write.status_code, 403)
+        self.assertEqual(blocked_write.json()["detail"], "impersonation_read_only")
 
         stopped = client.post("/api/auth/impersonation/stop")
         self.assertEqual(stopped.status_code, 200)

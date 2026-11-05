@@ -99,6 +99,8 @@ def channel_market(app: ChaboApp, *, limit: int = 50, offset: int = 0, q: str | 
             SELECT
                 c.id, c.title, c.username, c.ref_token, c.status,
                 pa.category, pa.score, pa.risk_level,
+                pa.confidence_level, pa.verified_orders_count,
+                pa.median_24h_views, pa.subscribers,
                 MAX(CASE WHEN s.slot_type = 'standard_card' AND rc.active = 1 THEN rc.unit_price_cents END) AS standard_price_cents,
                 MAX(CASE WHEN fp.format_type = 'button_tail' THEN fp.enabled ELSE 0 END) AS button_enabled,
                 MAX(CASE WHEN fp.format_type = 'standard_card' THEN fp.enabled ELSE 0 END) AS standard_enabled,
@@ -127,6 +129,20 @@ def channel_market(app: ChaboApp, *, limit: int = 50, offset: int = 0, q: str | 
         item["button_enabled"] = bool(item["button_enabled"])
         item["standard_enabled"] = bool(item["standard_enabled"])
         item["strong_enabled"] = bool(item["strong_enabled"])
+        score_val = int(item.get("score") or 0)
+        item["grade"] = (
+            "S" if score_val >= 85 else
+            "A" if score_val >= 70 else
+            "B" if score_val >= 55 else
+            "C" if score_val >= 40 else
+            "D"
+        ) if item.get("score") is not None else None
+        conf = item.get("confidence_level") or "low"
+        item["confidence_badge"] = (
+            "💎 高置信验证" if conf == "high" else
+            "🛡️ 实单验证" if conf == "medium" else
+            "🌱 新晋测品"
+        )
         items.append(item)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 

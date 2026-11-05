@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS channel_pricing_assessments (
     risk_level TEXT NOT NULL DEFAULT 'normal',
     base_standard_price_cents INTEGER NOT NULL,
     score INTEGER NOT NULL,
+    confidence_level TEXT NOT NULL DEFAULT 'low',
+    verified_orders_count INTEGER NOT NULL DEFAULT 0,
     breakdown_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -316,6 +318,7 @@ CREATE TABLE IF NOT EXISTS ad_orders (
     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
     creative_id TEXT NOT NULL REFERENCES creatives(id),
     advertiser_account_id TEXT NOT NULL REFERENCES accounts(id),
+    publisher_account_id TEXT REFERENCES accounts(id),
     channel_id TEXT NOT NULL REFERENCES channels(id),
     slot_id TEXT NOT NULL REFERENCES ad_slots(id),
     status TEXT NOT NULL DEFAULT 'pending_review',
@@ -354,6 +357,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
     refunded_cents INTEGER NOT NULL DEFAULT 0,
     publisher_reversed_cents INTEGER NOT NULL DEFAULT 0,
     platform_fee_reversed_cents INTEGER NOT NULL DEFAULT 0,
+    holdback_released_cents INTEGER NOT NULL DEFAULT 0,
+    holdback_released_at TEXT,
+    impression_count INTEGER NOT NULL DEFAULT 0,
+    click_count INTEGER NOT NULL DEFAULT 0,
+    tracking_token TEXT,
+    unpin_at TEXT,
+    delete_at TEXT,
     error_message TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -659,6 +669,16 @@ CREATE INDEX IF NOT EXISTS idx_placement_plan_items_channel ON placement_plan_it
 """
 
 
+class _ManagedConnection(sqlite3.Connection):
+    """sqlite3.Connection subclass that guarantees close() when used as a context manager."""
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)  # type: ignore[arg-type]
+        finally:
+            self.close()
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -667,13 +687,13 @@ class Database:
         is_memory = self.path == ":memory:"
         if not is_memory:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn = sqlite3.connect(self.path, timeout=30.0, factory=_ManagedConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         if not is_memory:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def init(self) -> None:
@@ -693,7 +713,7 @@ class Database:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             target.unlink()
-        with self.connect() as source, sqlite3.connect(str(target)) as backup:
+        with self.connect() as source, sqlite3.connect(str(target), factory=_ManagedConnection) as backup:
             source.backup(backup)
         return str(target.resolve())
 
@@ -1037,6 +1057,70 @@ def _0013_disable_light_tail_format(conn: sqlite3.Connection) -> None:
     )
 
 
+def _0014_order_publisher_snapshot_and_holdbacks(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE ad_orders ADD COLUMN publisher_account_id TEXT REFERENCES accounts(id)",
+        "ALTER TABLE deliveries ADD COLUMN holdback_released_cents INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE deliveries ADD COLUMN holdback_released_at TEXT",
+    ])
+    conn.execute(
+        """
+        UPDATE ad_orders
+        SET publisher_account_id = (
+            SELECT owner_account_id FROM channels WHERE channels.id = ad_orders.channel_id
+        )
+        WHERE publisher_account_id IS NULL
+        """
+    )
+
+
+def _0015_click_events_and_delivery_metrics(conn: sqlite3.Connection) -> None:
+    _add_columns_idempotent(conn, [
+        "ALTER TABLE deliveries ADD COLUMN impression_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE deliveries ADD COLUMN click_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE deliveries ADD COLUMN tracking_token TEXT",
+        "ALTER TABLE deliveries ADD COLUMN unpin_at TEXT",
+        "ALTER TABLE deliveries ADD COLUMN delete_at TEXT",
+        "ALTER TABLE channel_pricing_assessments ADD COLUMN confidence_level TEXT NOT NULL DEFAULT 'low'",
+        "ALTER TABLE channel_pricing_assessments ADD COLUMN verified_orders_count INTEGER NOT NULL DEFAULT 0",
+    ])
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS click_events (
+            id TEXT PRIMARY KEY,
+            order_id TEXT NOT NULL REFERENCES ad_orders(id) ON DELETE CASCADE,
+            delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+            token TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            ip_hash TEXT,
+            ua_hash TEXT,
+            is_bot_prefetch INTEGER NOT NULL DEFAULT 0,
+            is_unique INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_click_events_delivery ON click_events(delivery_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_click_events_token ON click_events(token);
+
+        CREATE TABLE IF NOT EXISTS delivery_metric_snapshots (
+            id TEXT PRIMARY KEY,
+            delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+            checkpoint_label TEXT NOT NULL,
+            views_count INTEGER NOT NULL DEFAULT 0,
+            forwards_count INTEGER NOT NULL DEFAULT 0,
+            sampled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_delivery_metric_snapshots_delivery ON delivery_metric_snapshots(delivery_id);
+
+        CREATE TABLE IF NOT EXISTS report_share_tokens (
+            token TEXT PRIMARY KEY,
+            advertiser_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
 MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0001_price_offers_v2", _0001_price_offers_v2),
     ("0002_orders_price_offer_link", _0002_orders_price_offer_link),
@@ -1051,4 +1135,10 @@ MIGRATIONS: list[tuple[str, "Callable[[sqlite3.Connection], None]"]] = [
     ("0011_audit_hash_chain", _0011_audit_hash_chain),
     ("0012_audit_query_indexes", _0012_audit_query_indexes),
     ("0013_disable_light_tail_format", _0013_disable_light_tail_format),
+    ("0014_order_publisher_snapshot_and_holdbacks", _0014_order_publisher_snapshot_and_holdbacks),
+    ("0015_click_events_and_delivery_metrics", _0015_click_events_and_delivery_metrics),
+    ("0016_delivery_unpin_and_delete_schedule", lambda conn: _add_columns_idempotent(conn, [
+        "ALTER TABLE deliveries ADD COLUMN unpin_at TEXT",
+        "ALTER TABLE deliveries ADD COLUMN delete_at TEXT",
+    ])),
 ]

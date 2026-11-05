@@ -1464,7 +1464,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--webhook-secret", help="覆盖 CHABO_WEBHOOK_SECRET")
     p.set_defaults(func=cmd_run_web)
 
-    p = sub.add_parser("run-api", help="启动 React 网页端使用的 FastAPI JSON API")
+    p = sub.add_parser("run-api", aliases=["web-api"], help="启动 React 网页端使用的 FastAPI JSON API")
     p.add_argument("--host", default=None, help="默认读取 CHABO_API_HOST")
     p.add_argument("--port", type=int, default=None, help="默认读取 CHABO_API_PORT")
     p.set_defaults(func=cmd_run_api)

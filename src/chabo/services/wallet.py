@@ -432,6 +432,29 @@ class LedgerService:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def _manual_topup_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        telegram_user_id: str | int,
+        amount_cents: int,
+        *,
+        display_name: str | None = None,
+        memo: str = "人工入账",
+    ) -> dict[str, Any]:
+        if int(amount_cents) <= 0:
+            raise InvalidState("入账金额必须大于 0")
+        account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
+        conn.execute(
+            """
+            UPDATE accounts
+            SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (int(amount_cents), account["id"]),
+        )
+        self._record(conn, account["id"], "manual_topup", int(amount_cents), memo=memo)
+        return self.accounts.get(conn, account["id"])
+
     def manual_topup(
         self,
         telegram_user_id: str | int,
@@ -449,18 +472,16 @@ class LedgerService:
             "memo_preview": (memo or "")[:80],
         }
         try:
+            if int(amount_cents) <= 0:
+                raise InvalidState("入账金额必须大于 0")
             with self.db.transaction() as conn:
-                account = self.accounts.get_or_create_by_telegram(conn, telegram_user_id, "advertiser", display_name)
-                conn.execute(
-                    """
-                    UPDATE accounts
-                    SET available_balance_cents = available_balance_cents + ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (amount_cents, account["id"]),
+                result = self._manual_topup_in_tx(
+                    conn,
+                    telegram_user_id,
+                    int(amount_cents),
+                    display_name=display_name,
+                    memo=memo,
                 )
-                self._record(conn, account["id"], "manual_topup", amount_cents, memo=memo)
-                result = self.accounts.get(conn, account["id"])
         except ChaboError as exc:
             self.tool_calls.log_failure(
                 tool_name="manual_topup",
@@ -488,6 +509,8 @@ class LedgerService:
         amount_cents: int,
         telegram_charge_id: str,
     ) -> None:
+        if int(amount_cents) <= 0:
+            raise InvalidState("入账金额必须大于 0")
         self.accounts.get(conn, account_id)
         conn.execute(
             """
@@ -854,18 +877,22 @@ class LedgerService:
         delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
         if not delivery:
             raise NotFound(f"delivery not found: {delivery_id}")
+        order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (delivery["order_id"],)).fetchone()
         channel = conn.execute("SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)).fetchone()
         config = conn.execute("SELECT * FROM channel_configs WHERE channel_id = ?", (delivery["channel_id"],)).fetchone()
         if not channel or not config:
             raise NotFound("channel/config not found")
-        publisher_account_id = channel["owner_account_id"]
+        publisher_account_id = (
+            order["publisher_account_id"] if order and order["publisher_account_id"] else channel["owner_account_id"]
+        )
         net_cents = delivery["publisher_net_cents"] - delivery["publisher_reversed_cents"]
         if net_cents <= 0:
             return
         publisher = self.accounts.get(conn, publisher_account_id)
         if publisher["pending_earnings_cents"] < net_cents:
             raise InvalidState("频道主待确认收益不足")
-        releasable = net_cents - bps_amount(net_cents, config["holdback_bps"])
+        holdback_cents = bps_amount(net_cents, config["holdback_bps"])
+        releasable = net_cents - holdback_cents
         conn.execute(
             """
             UPDATE accounts
@@ -887,6 +914,67 @@ class LedgerService:
             memo="插播观察期通过，收益确认",
             metadata={"releasable_cents": releasable, "holdback_bps": config["holdback_bps"]},
         )
+
+    def release_publisher_holdback(self, conn: sqlite3.Connection, delivery_id: str) -> int:
+        delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
+        if not delivery:
+            raise NotFound(f"delivery not found: {delivery_id}")
+        if delivery["status"] != "confirmed" or delivery["holdback_released_at"] is not None:
+            return 0
+        open_dispute = conn.execute(
+            "SELECT 1 FROM disputes WHERE delivery_id = ? AND status = 'open' LIMIT 1",
+            (delivery_id,),
+        ).fetchone()
+        if open_dispute:
+            return 0
+        order = conn.execute("SELECT * FROM ad_orders WHERE id = ?", (delivery["order_id"],)).fetchone()
+        channel = conn.execute("SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)).fetchone()
+        config = conn.execute("SELECT * FROM channel_configs WHERE channel_id = ?", (delivery["channel_id"],)).fetchone()
+        if not channel or not config:
+            return 0
+        publisher_account_id = (
+            order["publisher_account_id"] if order and order["publisher_account_id"] else channel["owner_account_id"]
+        )
+        net_cents = delivery["publisher_net_cents"] - delivery["publisher_reversed_cents"]
+        if net_cents <= 0:
+            return 0
+        holdback_cents = bps_amount(net_cents, config["holdback_bps"])
+        if holdback_cents <= 0:
+            conn.execute(
+                "UPDATE deliveries SET holdback_released_cents = 0, holdback_released_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (delivery_id,),
+            )
+            return 0
+        conn.execute(
+            """
+            UPDATE accounts
+            SET releasable_earnings_cents = MIN(confirmed_earnings_cents, releasable_earnings_cents + ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (holdback_cents, publisher_account_id),
+        )
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET holdback_released_cents = ?,
+                holdback_released_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (holdback_cents, delivery_id),
+        )
+        self._record(
+            conn,
+            publisher_account_id,
+            "publisher_holdback_released",
+            holdback_cents,
+            order_id=delivery["order_id"],
+            delivery_id=delivery_id,
+            memo="插播质保期满，释放 10% 质保尾款",
+            metadata={"holdback_bps": config["holdback_bps"], "holdback_days": config["holdback_days"]},
+        )
+        return holdback_cents
 
 
 class TopupApprovalService:
@@ -1036,16 +1124,7 @@ class TopupApprovalService:
                     raise InvalidState("审批人必须与申请人是不同账号（双人复核）")
                 request_snapshot = dict(row)
                 approver_id = approver["id"]
-            self.ledger.manual_topup(
-                request_snapshot["recipient_telegram_user_id"],
-                request_snapshot["amount_cents"],
-                memo=f"人工入账：{request_snapshot['reason']}",
-                actor_telegram_user_id=approver_telegram_user_id,
-                actor_kind=actor_kind,
-                session_id=session_id,
-            )
-            with self.db.transaction() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """
                     UPDATE topup_requests
                     SET status = 'approved',
@@ -1053,10 +1132,23 @@ class TopupApprovalService:
                         approval_note = ?,
                         settled_at = CURRENT_TIMESTAMP,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'pending'
                     """,
                     (approver_id, cleaned_note, request_id),
                 )
+                if cur.rowcount != 1:
+                    raise InvalidState(f"入账请求当前状态不能审批：{row['status']}")
+                recipient = self.ledger._manual_topup_in_tx(
+                    conn,
+                    request_snapshot["recipient_telegram_user_id"],
+                    int(request_snapshot["amount_cents"]),
+                    memo=f"人工入账：{request_snapshot['reason']}",
+                )
+                if not request_snapshot.get("recipient_account_id"):
+                    conn.execute(
+                        "UPDATE topup_requests SET recipient_account_id = ? WHERE id = ?",
+                        (recipient["id"], request_id),
+                    )
                 row = conn.execute(
                     "SELECT * FROM topup_requests WHERE id = ?", (request_id,)
                 ).fetchone()
@@ -1071,6 +1163,18 @@ class TopupApprovalService:
                 error=exc,
             )
             raise
+        self.tool_calls.log_success(
+            tool_name="manual_topup",
+            actor_telegram_user_id=approver_telegram_user_id,
+            actor_kind=actor_kind,
+            session_id=session_id,
+            arguments={
+                "telegram_user_id": str(request_snapshot["recipient_telegram_user_id"]),
+                "amount_cents": request_snapshot["amount_cents"],
+                "memo_preview": f"人工入账：{request_snapshot['reason']}"[:80],
+            },
+            result_summary=f"+{request_snapshot['amount_cents']} cents to {request_snapshot['recipient_telegram_user_id']}",
+        )
         self.tool_calls.log_success(
             tool_name="topup_approve",
             actor_telegram_user_id=approver_telegram_user_id,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -17,6 +18,7 @@ from .timezones import DEFAULT_USER_TIMEZONE, TIMEZONE_ALIASES, format_timezone_
 from .webapi.auth import build_magic_link_url, issue_login_token_conn, sync_portal_access_from_activity
 
 
+logger = logging.getLogger(__name__)
 STALE_CHANNEL_POST_SECONDS = 10 * 60
 
 
@@ -151,13 +153,35 @@ class UpdateHandler:
                 delivery_id = payload.removeprefix("ad_")
                 delivery = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
                 if delivery:
+                    is_bot_user = bool(user.get("is_bot"))
+                    meta_str = json.dumps({"telegram_user_id": str(user_id)}, ensure_ascii=False)
+                    recent_start = conn.execute(
+                        """
+                        SELECT id FROM metric_snapshots
+                        WHERE delivery_id = ?
+                          AND metric_type = 'bot_start'
+                          AND metadata_json = ?
+                          AND captured_at >= datetime('now', '-5 minutes')
+                        LIMIT 1
+                        """,
+                        (delivery_id, meta_str),
+                    ).fetchone()
                     conn.execute(
                         """
                         INSERT INTO metric_snapshots (id, delivery_id, metric_type, value, metadata_json)
                         VALUES (?, ?, 'bot_start', 1, ?)
                         """,
-                        (new_id("met"), delivery_id, json.dumps({"telegram_user_id": str(user_id)}, ensure_ascii=False)),
+                        (new_id("met"), delivery_id, meta_str),
                     )
+                    if not is_bot_user and not recent_start:
+                        conn.execute(
+                            """
+                            UPDATE deliveries
+                            SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (delivery_id,),
+                        )
                     creative = conn.execute("SELECT * FROM creatives WHERE id = ?", (delivery["creative_id"],)).fetchone()
                     source_channel = conn.execute(
                         "SELECT * FROM channels WHERE id = ?", (delivery["channel_id"],)

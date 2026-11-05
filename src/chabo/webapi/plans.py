@@ -102,6 +102,7 @@ def add_plan_items(
     if frequency_per_day < 1 or frequency_per_day > 24:
         raise InvalidState("每日频率需要在 1 到 24 之间")
     slot_type = app.channels.normalize_slot_type(slot_type)
+    effective_slot_type = "pin24h" if (pin_enabled and slot_type == "standard_card") else slot_type
     starts_at = starts_at or iso()
     total = 0
     with app.db.transaction() as conn:
@@ -123,11 +124,34 @@ def add_plan_items(
             ).fetchone()
             if policy and not policy["enabled"]:
                 errors.append("该频道未开启此投放位置")
+            cfg = conn.execute(
+                "SELECT allow_pin, daily_ad_limit FROM channel_configs WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            if (pin_enabled or effective_slot_type == "pin24h") and cfg and not int(cfg["allow_pin"]):
+                errors.append("该频道已禁用置顶广告")
+            if cfg and cfg["daily_ad_limit"]:
+                day_prefix = str(starts_at)[:10]
+                day_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt FROM deliveries
+                    WHERE channel_id = ?
+                      AND status IN ('scheduled', 'sending', 'sent', 'confirmed')
+                      AND substr(scheduled_at, 1, 10) = ?
+                    """,
+                    (channel_id, day_prefix),
+                ).fetchone()["cnt"]
+                if int(day_count) + frequency_per_day > int(cfg["daily_ad_limit"]):
+                    errors.append("该频道当日排期已满（超出每日广告上限）")
             try:
-                rate = app.channels.get_rate(conn, channel_id, slot_type)
+                rate = app.channels.get_rate(conn, channel_id, effective_slot_type)
                 unit_price = int(rate["unit_price_cents"])
             except Exception:
-                errors.append("缺少有效报价")
+                try:
+                    rate = app.channels.get_rate(conn, channel_id, slot_type)
+                    unit_price = int(rate["unit_price_cents"])
+                except Exception:
+                    errors.append("缺少有效报价")
             estimate = unit_price * _estimate_occurrences(schedule_mode, starts_at, ends_at, frequency_per_day)
             total += estimate if not errors else 0
             conn.execute(
@@ -144,7 +168,7 @@ def add_plan_items(
                     new_id("pli"),
                     plan_id,
                     channel_id,
-                    slot_type,
+                    effective_slot_type,
                     slot_type,
                     schedule_mode,
                     starts_at,
@@ -217,25 +241,36 @@ def submit_plan(
         if not account or int(account["available_balance_cents"]) < total_budget:
             raise InvalidState("广告钱包余额不足，无法提交整个批量计划")
 
-    created_orders: list[dict[str, Any]] = []
-    for item in items:
-        order = app.orders.create_order(
-            advertiser_telegram_user_id=advertiser_telegram_user_id,
-            channel_token=item["ref_token"],
-            slot_type=item["slot_type"],
-            budget_cents=int(item["estimated_total_cents"]),
-            material_id=plan["creative_id"],
-            scheduled_at=_parse_optional_datetime(item["starts_at"]),
-            end_at=_parse_optional_datetime(item["ends_at"]),
-            frequency_per_day=int(item["frequency_per_day"]),
-            campaign_name=plan["title"],
-            actor_kind="human",
-            session_id=session_id,
+        campaign_id = new_id("camp")
+        conn.execute(
+            """
+            INSERT INTO campaigns (id, advertiser_account_id, name)
+            VALUES (?, ?, ?)
+            """,
+            (campaign_id, advertiser_account_id, plan["title"] or "批量投放计划"),
         )
-        created_orders.append(order)
 
-    with app.db.transaction() as conn:
-        for item, order in zip(items, created_orders, strict=True):
+        created_orders: list[dict[str, Any]] = []
+        for item in items:
+            effective_slot_type = (
+                "pin24h"
+                if (int(item["pin_enabled"] or 0) and item["slot_type"] == "standard_card")
+                else item["slot_type"]
+            )
+            order = app.orders._create_order_in_conn(
+                conn,
+                advertiser_telegram_user_id=advertiser_telegram_user_id,
+                channel_token=item["ref_token"],
+                slot_type=effective_slot_type,
+                budget_cents=int(item["estimated_total_cents"]),
+                material_id=plan["creative_id"],
+                scheduled_at=_parse_optional_datetime(item["starts_at"]),
+                end_at=_parse_optional_datetime(item["ends_at"]),
+                frequency_per_day=int(item["frequency_per_day"]),
+                campaign_name=plan["title"],
+                campaign_id=campaign_id,
+            )
+            created_orders.append(order)
             conn.execute(
                 """
                 INSERT OR IGNORE INTO placement_plan_orders (plan_id, plan_item_id, order_id)

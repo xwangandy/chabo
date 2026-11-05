@@ -90,11 +90,16 @@ def _dev_bypass_session(chabo: ChaboApp) -> dict[str, Any]:
     }
 
 
-def require_portal(portal: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    def dependency(session: dict[str, Any] = Depends(current_session)) -> dict[str, Any]:
+def require_portal(portal: str) -> Callable[..., dict[str, Any]]:
+    def dependency(
+        request: Request,
+        session: dict[str, Any] = Depends(current_session),
+    ) -> dict[str, Any]:
         portals = session.get("portals", [])
         if "admin" not in portals and portal not in portals:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"{portal}_portal_required")
+        if session.get("impersonator_account_id") and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="impersonation_read_only")
         return session
 
     return dependency

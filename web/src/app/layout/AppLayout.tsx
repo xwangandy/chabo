@@ -45,6 +45,7 @@ const workspaceNav: Record<Portal, Array<{ key: string; label: string; icon: Rea
     { key: "materials", label: "素材库", icon: <AppstoreOutlined /> },
     { key: "plans", label: "投放计划", icon: <DashboardOutlined /> },
     { key: "orders", label: "订单", icon: <FileTextOutlined /> },
+    { key: "report", label: "效果战报", icon: <ProfileOutlined /> },
     { key: "wallet", label: "钱包", icon: <WalletOutlined /> },
     { key: "settings", label: "设置", icon: <SettingOutlined /> }
   ],

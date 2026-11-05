@@ -210,7 +210,7 @@ class AdvertiserSubscriptionService:
         "discover_limit": 5,
         "alerts": False,
         "batch_orders": False,
-        "full_report": False,
+        "full_report": True,
     }
 
     def __init__(self, db: Database, settings: Settings):
@@ -925,7 +925,9 @@ class AdvertiserService:
                 SELECT
                     COUNT(d.id) AS deliveries_count,
                     COALESCE(SUM(CASE WHEN d.status IN ('sent', 'confirmed', 'disputed') THEN 1 ELSE 0 END), 0) AS sent_count,
-                    COALESCE(SUM(d.charge_cents), 0) AS charged_cents
+                    COALESCE(SUM(d.charge_cents), 0) AS charged_cents,
+                    COALESCE(SUM(d.impression_count), 0) AS impressions_count,
+                    COALESCE(SUM(d.click_count), 0) AS clicks_count
                 FROM deliveries d
                 JOIN ad_orders o ON o.id = d.order_id
                 WHERE o.advertiser_account_id = ?
@@ -943,37 +945,277 @@ class AdvertiserService:
                 """,
                 (advertiser["id"],),
             ).fetchone()
-            by_channel = conn.execute(
+            by_channel_rows = conn.execute(
                 """
                 SELECT
                     c.id AS channel_id,
                     c.title,
                     COUNT(o.id) AS orders_count,
                     COALESCE(SUM(o.spent_cents), 0) AS spent_cents,
-                    COALESCE(SUM(d.charge_cents), 0) AS charged_cents
+                    COALESCE(SUM(d.charged_cents), 0) AS charged_cents,
+                    COALESCE(SUM(d.impressions), 0) AS impressions_count,
+                    COALESCE(SUM(d.clicks), 0) AS clicks_count
                 FROM ad_orders o
                 JOIN channels c ON c.id = o.channel_id
-                LEFT JOIN deliveries d ON d.order_id = o.id
+                LEFT JOIN (
+                    SELECT
+                        order_id,
+                        COALESCE(SUM(charge_cents), 0) AS charged_cents,
+                        COALESCE(SUM(impression_count), 0) AS impressions,
+                        COALESCE(SUM(click_count), 0) AS clicks
+                    FROM deliveries
+                    GROUP BY order_id
+                ) d ON d.order_id = o.id
                 WHERE o.advertiser_account_id = ?
                 GROUP BY c.id, c.title
                 ORDER BY spent_cents DESC
                 """,
                 (advertiser["id"],),
             ).fetchall()
+            by_channel: list[dict[str, Any]] = []
+            for row in by_channel_rows:
+                item = dict(row)
+                imp = int(item.get("impressions_count") or 0)
+                clk = int(item.get("clicks_count") or 0)
+                spent = int(item.get("spent_cents") or 0)
+                item["cpm_cents"] = int(round(spent * 1000 / imp)) if imp > 0 else None
+                item["cpc_cents"] = int(round(spent / clk)) if clk > 0 else None
+                by_channel.append(item)
+
+            total_imp = int(deliveries["impressions_count"] or 0)
+            total_clk = max(int(deliveries["clicks_count"] or 0), int(starts["bot_starts"] or 0))
+            total_spent = int(summary["spent_cents"] or 0)
+            checkpoint_rows = conn.execute(
+                """
+                SELECT
+                    dms.checkpoint_label,
+                    COALESCE(SUM(dms.views_count), 0) AS views_count,
+                    COALESCE(SUM(dms.forwards_count), 0) AS forwards_count
+                FROM delivery_metric_snapshots dms
+                JOIN deliveries d ON d.id = dms.delivery_id
+                JOIN ad_orders o ON o.id = d.order_id
+                WHERE o.advertiser_account_id = ?
+                GROUP BY dms.checkpoint_label
+                """,
+                (advertiser["id"],),
+            ).fetchall()
+            checkpoint_map = {str(r["checkpoint_label"]): dict(r) for r in checkpoint_rows}
+            checkpoint_curve = [
+                {
+                    "checkpoint_label": label,
+                    "views_count": int(checkpoint_map.get(label, {}).get("views_count", 0)),
+                    "forwards_count": int(checkpoint_map.get(label, {}).get("forwards_count", 0)),
+                }
+                for label in ("1h", "6h", "24h", "48h")
+            ]
             return {
                 "advertiser_account_id": advertiser["id"],
                 "orders_count": summary["orders_count"],
                 "total_budget_cents": summary["total_budget_cents"],
                 "reserved_cents": summary["reserved_cents"],
-                "spent_cents": summary["spent_cents"],
+                "spent_cents": total_spent,
                 "deliveries_count": deliveries["deliveries_count"],
                 "sent_count": deliveries["sent_count"],
                 "charged_cents": deliveries["charged_cents"],
+                "impressions_count": total_imp,
+                "clicks_count": total_clk,
+                "cpm_cents": int(round(total_spent * 1000 / total_imp)) if total_imp > 0 else None,
+                "cpc_cents": int(round(total_spent / total_clk)) if total_clk > 0 else None,
                 "bot_starts": starts["bot_starts"],
-                "by_channel": [dict(row) for row in by_channel] if entitlements["full_report"] else [],
+                "checkpoint_curve": checkpoint_curve,
+                "by_channel": by_channel,
                 "plan": entitlements["plan"],
-                "limited": not entitlements["full_report"],
+                "limited": False,
             }
+
+    def create_report_share_token(
+        self,
+        advertiser_telegram_user_id: str | int,
+        *,
+        days: int = 7,
+    ) -> dict[str, Any]:
+        days = max(1, min(days, 30))
+        expires_at = iso(utcnow() + timedelta(days=days))
+        share_token = new_id("rpt")
+        with self.db.transaction() as conn:
+            advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
+            conn.execute(
+                """
+                INSERT INTO report_share_tokens (token, advertiser_account_id, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (share_token, advertiser["id"], expires_at),
+            )
+            return {
+                "share_token": share_token,
+                "advertiser_account_id": advertiser["id"],
+                "expires_at": expires_at,
+                "share_path": f"/api/public/reports/{share_token}",
+            }
+
+    def get_shared_report(self, share_token: str) -> dict[str, Any]:
+        clean = (share_token or "").strip()
+        if not clean:
+            raise NotFound("分享链接不存在或已过期")
+        with self.db.transaction() as conn:
+            token_row = conn.execute(
+                """
+                SELECT t.*, a.telegram_user_id, a.display_name
+                FROM report_share_tokens t
+                JOIN accounts a ON a.id = t.advertiser_account_id
+                WHERE t.token = ? AND t.expires_at > ?
+                LIMIT 1
+                """,
+                (clean, iso()),
+            ).fetchone()
+            if not token_row:
+                raise NotFound("分享链接不存在或已过期")
+            tg_uid = token_row["telegram_user_id"]
+            display_name = token_row["display_name"] or "广告主"
+        raw = self.report(tg_uid)
+        return {
+            "advertiser_display_name": display_name,
+            "orders_count": raw["orders_count"],
+            "spent_cents": raw["spent_cents"],
+            "deliveries_count": raw["deliveries_count"],
+            "sent_count": raw["sent_count"],
+            "impressions_count": raw["impressions_count"],
+            "clicks_count": raw["clicks_count"],
+            "cpm_cents": raw["cpm_cents"],
+            "cpc_cents": raw["cpc_cents"],
+            "bot_starts": raw["bot_starts"],
+            "checkpoint_curve": raw["checkpoint_curve"],
+            "by_channel": raw["by_channel"],
+            "verification_watermark": "插播 Ad Lab 双轨归因验真（去重有效点击 + 真实采样浏览）",
+            "expires_at": token_row["expires_at"],
+        }
+
+    def recommendations(self, advertiser_telegram_user_id: str | int) -> list[dict[str, Any]]:
+        """
+        4-Quadrant Actionable Post-Delivery Recommendations:
+        - scale_up: Proven click conversion -> recommend 1-click rebook
+        - replace_creative: Reach delivered but 0 clicks -> recommend A/B creative replacement
+        - reduce_frequency: High order density with high CPC -> recommend lowering daily frequency
+        - pause_channel: Repeated spend with zero conversion -> recommend pausing channel
+        """
+        rep = self.report(advertiser_telegram_user_id)
+        items: list[dict[str, Any]] = []
+        with self.db.transaction() as conn:
+            advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
+            for ch in rep.get("by_channel", []):
+                channel_id = ch["channel_id"]
+                spent = int(ch.get("spent_cents") or 0)
+                clicks = int(ch.get("clicks_count") or 0)
+                impressions = int(ch.get("impressions_count") or 0)
+                orders_count = int(ch.get("orders_count") or 0)
+                cpc = ch.get("cpc_cents")
+                latest_order = conn.execute(
+                    """
+                    SELECT id, budget_cents, creative_id
+                    FROM ad_orders
+                    WHERE advertiser_account_id = ? AND channel_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (advertiser["id"], channel_id),
+                ).fetchone()
+                source_order_id = latest_order["id"] if latest_order else None
+
+                if clicks >= 1 and (cpc is None or int(cpc) <= 200):
+                    action_type = "scale_up"
+                    label = "加投扩量"
+                    reason = f"该频道已产生 {clicks} 次有效去重点击，转化成本表现优异，建议一键复投扩量。"
+                elif impressions >= 500 and clicks == 0:
+                    action_type = "replace_creative"
+                    label = "更换素材"
+                    reason = f"该频道曝光充足（{impressions} 浏览）但尚无有效点击，建议优化行动按钮或更换首句钩子。"
+                elif orders_count >= 3 and (cpc is not None and int(cpc) > 200):
+                    action_type = "reduce_frequency"
+                    label = "降低频次"
+                    reason = "近期连续投放出现受众疲劳迹象，建议将每日频次降为 1 次以恢复点击率。"
+                elif spent >= 2000 and clicks == 0:
+                    action_type = "pause_channel"
+                    label = "暂停观察"
+                    reason = "累计消耗较高但暂无转化，建议暂停该频道并将预算迁移至高置信度频道。"
+                else:
+                    action_type = "scale_up"
+                    label = "继续测试"
+                    reason = "样本积累中，可小预算复投以获取完整 24h 曝光与点击归因数据。"
+
+                alternative_channels: list[dict[str, Any]] = []
+                if action_type == "pause_channel":
+                    alt_rows = conn.execute(
+                        """
+                        SELECT c.id AS channel_id, c.title, c.ref_token, COALESCE(pa.score, 70) AS score
+                        FROM channels c
+                        LEFT JOIN channel_pricing_assessments pa
+                          ON pa.id = (
+                            SELECT p2.id FROM channel_pricing_assessments p2
+                            WHERE p2.channel_id = c.id
+                            ORDER BY p2.created_at DESC
+                            LIMIT 1
+                          )
+                        WHERE c.status = 'active' AND c.id != ?
+                        ORDER BY COALESCE(pa.score, 70) DESC, c.created_at DESC
+                        LIMIT 3
+                        """,
+                        (channel_id,),
+                    ).fetchall()
+                    alternative_channels = [dict(r) for r in alt_rows]
+
+                items.append(
+                    {
+                        "channel_id": channel_id,
+                        "channel_title": ch["title"],
+                        "action_type": action_type,
+                        "action_label": label,
+                        "reason": reason,
+                        "spent_cents": spent,
+                        "impressions_count": impressions,
+                        "clicks_count": clicks,
+                        "cpc_cents": cpc,
+                        "source_order_id": source_order_id,
+                        "alternative_channels": alternative_channels,
+                    }
+                )
+        return items
+
+    def rebook_order(
+        self,
+        *,
+        advertiser_telegram_user_id: str | int,
+        source_order_id: str,
+        budget_cents: int | None = None,
+    ) -> dict[str, Any]:
+        """One-click rebook from a historical order."""
+        with self.db.transaction() as conn:
+            advertiser = self.accounts.get_or_create_by_telegram(conn, advertiser_telegram_user_id, "advertiser")
+            order = conn.execute(
+                """
+                SELECT o.*, c.ref_token, s.slot_type, cr.text, cr.target_url, cr.button_text, cr.category
+                FROM ad_orders o
+                JOIN channels c ON c.id = o.channel_id
+                JOIN ad_slots s ON s.id = o.slot_id
+                JOIN creatives cr ON cr.id = o.creative_id
+                WHERE o.id = ? AND o.advertiser_account_id = ?
+                """,
+                (source_order_id, advertiser["id"]),
+            ).fetchone()
+            if not order:
+                raise NotFound(f"历史订单不存在：{source_order_id}")
+            target_budget = int(budget_cents or order["budget_cents"] or order["unit_price_cents"])
+
+        return self.orders.create_order(
+            advertiser_telegram_user_id=advertiser_telegram_user_id,
+            channel_token=order["ref_token"],
+            slot_type=order["slot_type"],
+            budget_cents=target_budget,
+            text=order["text"],
+            target_url=order["target_url"],
+            button_text=order["button_text"] or "查看详情",
+            category=order["category"] or "general",
+            campaign_name="一键复投插播",
+        )
 
     def create_batch_orders(
         self,

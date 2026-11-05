@@ -388,6 +388,18 @@ class BotApiClient:
             {"chat_id": chat_id, "message_id": message_id, "disable_notification": True},
         )
 
+    def unpin_message(self, *, chat_id: str, message_id: str | int) -> None:
+        self._post(
+            "unpinChatMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+        )
+
+    def delete_message(self, *, chat_id: str, message_id: str | int) -> None:
+        self._post(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+        )
+
 
 class NullGateway:
     """Useful for local CLI runs where no Telegram token is configured."""
@@ -492,3 +504,9 @@ class NullGateway:
 
     def pin_message(self, *, chat_id: str, message_id: str | int) -> None:
         raise TelegramError("CHABO_BOT_TOKEN is not configured")
+
+    def unpin_message(self, *, chat_id: str, message_id: str | int) -> None:
+        return None
+
+    def delete_message(self, *, chat_id: str, message_id: str | int) -> None:
+        return None

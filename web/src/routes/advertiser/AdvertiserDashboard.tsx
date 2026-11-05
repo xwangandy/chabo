@@ -6,6 +6,7 @@ import { ChannelMarketGrid } from "../../features/planner/ChannelMarketGrid";
 import { MaterialsPanel } from "./MaterialsPanel";
 import { OrdersPanel } from "./OrdersPanel";
 import { PlansPanel } from "./PlansPanel";
+import { ReportPanel } from "./ReportPanel";
 import { useMe } from "../../shared/auth/session";
 import { useHashTab } from "../../shared/hooks/useHashTab";
 
@@ -48,7 +49,7 @@ interface AdvertiserWalletResponse {
   reserved_orders: ReservedOrder[];
 }
 
-const advertiserTabKeys = ["market", "materials", "plans", "orders", "wallet", "settings"] as const;
+const advertiserTabKeys = ["market", "materials", "plans", "orders", "report", "wallet", "settings"] as const;
 const walletTypeLabels: Record<string, string> = {
   manual_topup: "人工入账",
   reserve_order_budget: "冻结预算",
@@ -91,6 +92,7 @@ export function AdvertiserDashboard() {
           { key: "materials", label: "素材库", children: <MaterialsPanel /> },
           { key: "plans", label: "投放计划", children: <PlansPanel /> },
           { key: "orders", label: "订单", children: <OrdersPanel /> },
+          { key: "report", label: "效果战报", children: <ReportPanel /> },
           { key: "wallet", label: "钱包", children: <AdvertiserWalletPanel data={data} /> },
           { key: "settings", label: "设置", children: <AdvertiserSettingsPanel me={me} /> }
         ]}
